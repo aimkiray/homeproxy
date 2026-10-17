@@ -385,7 +385,7 @@ for f in firewall.sh firewall_include.sh; do
     install_file "$ROOT/usr/lib/homeproxy/$f" "$LIB/$f" 755 always
 done
 install_file "$ROOT/usr/bin/homeproxy" "$BIN/homeproxy" 755 always
-for f in clean_log.sh update_crond.sh update_resources.sh; do
+for f in clean_log.sh update_crond.sh update_resources.sh guard.sh; do
     install_file "$ROOT/etc/homeproxy/scripts/$f" "$SCR/$f" 755 always
 done
 install_file "$ROOT/etc/homeproxy/web/index.html" "$WEB/index.html" 644 always

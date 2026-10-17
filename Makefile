@@ -81,6 +81,7 @@ define Package/homeproxy/install
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/clean_log.sh $(1)/etc/homeproxy/scripts/clean_log.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/update_crond.sh $(1)/etc/homeproxy/scripts/update_crond.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/update_resources.sh $(1)/etc/homeproxy/scripts/update_resources.sh
+	$(INSTALL_BIN) ./root/etc/homeproxy/scripts/guard.sh $(1)/etc/homeproxy/scripts/guard.sh
 	$(INSTALL_BIN) ./root/etc/homeproxy/web/cgi-bin/api $(1)/etc/homeproxy/web/cgi-bin/api
 	$(INSTALL_DATA) ./root/usr/lib/homeproxy/*.lua $(1)/usr/lib/homeproxy/
 	$(INSTALL_BIN) ./root/etc/uci-defaults/homeproxy $(1)/etc/uci-defaults/homeproxy

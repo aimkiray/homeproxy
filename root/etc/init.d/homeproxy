@@ -27,6 +27,9 @@ log() {
 start_service() {
     # RUN_DIR must exist before anything can write the log file.
     mkdir -p "$RUN_DIR"
+    # A (re)start re-arms the dataplane: drop any stale fail-open marker so
+    # the guard watches this fresh attempt.
+    rm -f "$RUN_DIR/failopen.active"
 
     # Migration must run BEFORE config_load: config_get reads a snapshot
     # captured by config_load, so migrating afterwards would leave this run
@@ -167,6 +170,13 @@ start_service() {
         procd_set_param respawn ${respawn_threshold:-360} ${respawn_timeout:-5} ${respawn_retry:-5}
         procd_set_param term_timeout 15
         procd_close_instance
+
+        # fail-open guard: if sing-box-c dies permanently, restore plain
+        # DNS/routing instead of leaving the LAN black-holed.
+        procd_open_instance "guard"
+        procd_set_param command "$HP_DIR/scripts/guard.sh"
+        procd_set_param respawn
+        procd_close_instance
     fi
 
     if [ "$server_enabled" = "1" ]; then
@@ -287,6 +297,7 @@ stop_service() {
     mkdir -p "$RUN_DIR"
     sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
     rm -f "$RUN_DIR/firewall.active"
+    rm -f "$RUN_DIR/failopen.active"
 
     # remove dnsmasq DNS steering (any routing mode)
     if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
