@@ -50,6 +50,9 @@ start_service() {
 
 	mkdir -p "$RUN_DIR"
 
+	# A (re)start re-arms the dataplane: drop any stale fail-open marker.
+	rm -f "$RUN_DIR/failopen.active"
+
 	if [ "$outbound_node" != "nil" ]; then
 		# Generate/Validate client config
 		ucode -S "$HP_DIR/scripts/generate_client.uc" 2>>"$LOG_PATH"
@@ -157,6 +160,7 @@ start_service() {
 			procd_add_jail_mount "$RUN_DIR/sing-box-c.json"
 			procd_add_jail_mount_rw "$RUN_DIR/sing-box-c.log"
 			[ "$routing_mode" != "bypass_mainland_china" ] || procd_add_jail_mount_rw "$RUN_DIR/cache.db"
+			procd_add_jail_mount "$HP_DIR/ruleset/"
 			procd_add_jail_mount "$HP_DIR/certs/"
 			procd_add_jail_mount "/etc/ssl/"
 			procd_add_jail_mount "/etc/localtime"
@@ -172,6 +176,13 @@ start_service() {
 		procd_set_param stderr 1
 		procd_set_param respawn
 
+		procd_close_instance
+
+		# Fail-open guard: if sing-box-c dies permanently, restore plain
+		# DNS/routing instead of leaving the LAN black-holed.
+		procd_open_instance "guard"
+		procd_set_param command "$HP_DIR/scripts/guard.sh"
+		procd_set_param respawn
 		procd_close_instance
 	fi
 
@@ -229,6 +240,8 @@ start_service() {
 	"bypass_mainland_china")
 		# Prepare cache db
 		[ -e "$RUN_DIR/cache.db" ] || touch "$RUN_DIR/cache.db"
+		# Prepare ruleset directory
+		[ -d "$HP_DIR/ruleset" ] || mkdir -p "$HP_DIR/ruleset"
 		;;
 	"custom")
 		# Prepare ruleset directory
@@ -303,6 +316,7 @@ stop_service() {
 	echo 2>"/dev/null" > "$RUN_DIR/fw4_input.nft"
 	echo 2>"/dev/null" > "$RUN_DIR/fw4_post.nft"
 	fw4 reload >"/dev/null" 2>&1
+	rm -f "$RUN_DIR/failopen.active"
 
 	# Remove DNS hijack
 	rm -rf "$DNSMASQ_DIR/../dnsmasq-homeproxy.conf" "$DNSMASQ_DIR"
@@ -312,6 +326,12 @@ stop_service() {
 		"$RUN_DIR/sing-box-s.json" "$RUN_DIR/sing-box-s.log"
 
 	log "Service stopped."
+
+	# Re-clear after the final log write: a guard ": > marker" landing
+	# between the earlier rm and procd's instance teardown would leave a
+	# stopped service marked fail-open (update_resources.sh would then
+	# "recover"-restart a stopped service). Shrinks the window to ~ms.
+	rm -f "$RUN_DIR/failopen.active"
 }
 
 service_stopped() {
