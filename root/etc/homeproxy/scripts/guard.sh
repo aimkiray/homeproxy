@@ -31,6 +31,13 @@ log() {
 
 mkdir -p "$RUN_DIR"
 
+# No pgrep -> every probe reads "absent" -> false fail-open teardown of a
+# healthy dataplane. Disable the guard outright instead of spinning on it.
+command -v pgrep >/dev/null 2>&1 || {
+    log "pgrep unavailable, guard disabled"
+    exit 1
+}
+
 miss=0
 while true; do
     if pgrep -f "sing-box run --config $RUN_DIR/sing-box-c.json" >/dev/null 2>&1; then

@@ -339,6 +339,11 @@ stop_service() {
           "$RUN_DIR/sing-box-s.json" "$RUN_DIR/sing-box-s.log"
 
     log "Service stopped."
+    # Re-clear after the final log write: a guard ": > marker" landing between
+    # the earlier rm and procd_kill would leave a stopped service marked
+    # fail-open (update_resources.sh would then "recover"-restart a stopped
+    # service). Idempotent twin of the rm above, shrinks the window to ~ms.
+    rm -f "$RUN_DIR/failopen.active"
 }
 
 service_stopped() {

@@ -128,8 +128,13 @@ check_list_update() {
     if [ "$listtype" = "china_list" ]; then
         sed -i -e "s/full://g" -e "/:/d" "$RUN_DIR/$listname"
     fi
-    if ! mv -f "$RUN_DIR/$listname" "$destdir/$destname"; then
-        rm -f "$RUN_DIR/$listname"
+    # Two-step install: the cross-fs mv into a hidden temp name in destdir is
+    # copy+unlink (an interrupt leaves only a ".*.tmp" stub that no reader
+    # matches, e.g. not <tag>.srs); the second mv is a same-dir rename -- the
+    # actually atomic step.  Same "if ! { a && b; }" shape as the .ver write.
+    if ! { mv -f "$RUN_DIR/$listname" "$destdir/.$destname.tmp" &&
+        mv -f "$destdir/.$destname.tmp" "$destdir/$destname"; }; then
+        rm -f "$RUN_DIR/$listname" "$destdir/.$destname.tmp"
         log "[$(to_upper "$listtype")] Update failed: could not install the list."
         return 1
     fi

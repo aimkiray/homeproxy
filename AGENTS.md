@@ -18,7 +18,7 @@ Target environment verified on a Xiaomi router (OpenWrt 18.06 base, kernel 5.4, 
 - `root/etc/init.d/homeproxy` — procd service: runs lua generators, sets tproxy routing table, starts sing-box, applies firewall.
 - `root/etc/config/homeproxy` — UCI default config.
 - `root/etc/homeproxy/resources/` — geodata/lists (`china_ip4/6.txt`, `china_list.txt`, `gfw_list.txt`).
-- `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh` (uses `lua+luci.json` instead of `jsonfilter`); `boot_restore.sh` (post-boot restorer: recreates volatile `/etc` bits on MiWiFi).
+- `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh` (uses `lua+luci.json` instead of `jsonfilter`); `boot_restore.sh` (post-boot restorer: recreates volatile `/etc` bits on MiWiFi); `guard.sh` (fail-open watchdog: tears down DNS/firewall steering if the sing-box client stays dead).
 - `root/etc/homeproxy/web/` — standalone uhttpd web UI (`index.html` + `cgi-bin/api`), no auth, LAN-bound `:8910`.
 - `install.sh` — router-side `curl | sh` installer/upgrader (fresh + in-place upgrade with 30s auto-rollback).
 
