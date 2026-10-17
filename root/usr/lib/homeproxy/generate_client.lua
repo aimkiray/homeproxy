@@ -821,15 +821,35 @@ if not isEmpty(main_node) then
             rules = { { domain_suffix = proxy_domain_list } } })
     end
     if routing_mode == "bypass_mainland_china" then
-        push(config.route.rule_set, { type = "remote", tag = "geoip-cn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs",
-            download_detour = "main-out" })
-        push(config.route.rule_set, { type = "remote", tag = "geosite-cn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs",
-            download_detour = "main-out" })
-        push(config.route.rule_set, { type = "remote", tag = "geosite-noncn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs",
-            download_detour = "main-out" })
+        -- Prefer pre-downloaded local rule sets: a remote fetch goes through
+        -- the proxy node (download_detour=main-out), whose REALITY/TLS
+        -- handshake fails while the RTC-less clock is still stale at boot --
+        -- a chicken-and-egg deadlock that FATALs sing-box at init. A file
+        -- passing the 3-byte "SRS" magic check is used as type=local; absent
+        -- or invalid files fall back to the upstream remote source.
+        for _, rs in ipairs({
+            { tag = "geoip-cn",
+              url = "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs" },
+            { tag = "geosite-cn",
+              url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs" },
+            { tag = "geosite-noncn",
+              url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs" },
+        }) do
+            local rs_path = hp.HP_DIR .. "/ruleset/" .. rs.tag .. ".srs"
+            local rs_ok
+            local rf = io.open(rs_path, "rb")
+            if rf then
+                rs_ok = (rf:read(3) == "SRS")
+                rf:close()
+            end
+            if rs_ok then
+                push(config.route.rule_set, { type = "local", tag = rs.tag,
+                    format = "binary", path = rs_path })
+            else
+                push(config.route.rule_set, { type = "remote", tag = rs.tag,
+                    format = "binary", url = rs.url, download_detour = "main-out" })
+            end
+        end
     end
 elseif not isEmpty(default_outbound) then
     config.route.default_domain_resolver = { action = "resolve", server = get_resolver(default_outbound_dns) }

@@ -8,7 +8,7 @@
 #   generate                           regenerate sing-box configs
 #   migrate                             apply config defaults/migration
 #   subscribe                          update subscriptions now
-#   update-resources [all|china_ip4|china_ip6|gfw_list|china_list]
+#   update-resources [all|china_ip4|china_ip6|gfw_list|china_list|geoip-cn|geosite-cn|geosite-noncn]
 #   nodes                              list proxy nodes
 #   node <name>                         show one node
 #   main-node [name|urltest|nil]        get/set main node
@@ -223,7 +223,7 @@ subscribe) lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"; lua "$LUA_
 update-resources)
     shift
     if [ -z "$1" ] || [ "$1" = "all" ]; then
-        for i in china_ip4 china_ip6 gfw_list china_list; do "$HP_DIR/scripts/update_resources.sh" "$i"; done
+        for i in china_ip4 china_ip6 gfw_list china_list geoip-cn geosite-cn geosite-noncn; do "$HP_DIR/scripts/update_resources.sh" "$i"; done
     else "$HP_DIR/scripts/update_resources.sh" "$1"; fi
     ;;
 nodes) cmd_nodes ;;

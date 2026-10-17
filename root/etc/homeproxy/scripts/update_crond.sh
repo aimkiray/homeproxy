@@ -8,7 +8,7 @@ SCRIPTS_DIR="/etc/homeproxy/scripts"
 LUA_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
 export HP_LUAPATH="$LUA_DIR"
 
-for i in "china_ip4" "china_ip6" "gfw_list" "china_list"; do
+for i in "china_ip4" "china_ip6" "gfw_list" "china_list" "geoip-cn" "geosite-cn" "geosite-noncn"; do
     "$SCRIPTS_DIR"/update_resources.sh "$i"
 done
 
