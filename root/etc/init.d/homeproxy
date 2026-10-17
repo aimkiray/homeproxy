@@ -53,6 +53,11 @@ start_service() {
 	# A (re)start re-arms the dataplane: drop any stale fail-open marker.
 	rm -f "$RUN_DIR/failopen.active"
 
+	# The client jail bind-mounts this dir in every non-custom routing
+	# mode; ensure it exists unconditionally so a missing source cannot
+	# fail the mount and keep sing-box-c from starting.
+	[ -d "$HP_DIR/ruleset" ] || mkdir -p "$HP_DIR/ruleset"
+
 	if [ "$outbound_node" != "nil" ]; then
 		# Generate/Validate client config
 		ucode -S "$HP_DIR/scripts/generate_client.uc" 2>>"$LOG_PATH"
