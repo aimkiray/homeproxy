@@ -389,6 +389,18 @@ function get_ruleset(cfg) {
 		push(rules, isEmpty(i) ? null : 'cfg-' + i + '-rule');
 	return rules;
 }
+
+function local_ruleset_path(tag) {
+	const path = HP_DIR + '/ruleset/' + tag + '.srs';
+	/* Prefer a pre-downloaded local copy: remote rule sets are fetched
+	   through download_detour 'main-out' -- i.e. through the proxy node
+	   itself, which cannot come up while it is still waiting for these
+	   very rule sets (cold-start deadlock). A file passing the 3-byte
+	   "SRS" magic check is used as type 'local'; a missing, short or
+	   invalid file (readfile() returns null/garbage) falls back to the
+	   upstream remote source unchanged. */
+	return (readfile(path, 3) === 'SRS') ? path : null;
+}
 /* Config helper end */
 
 const config = {};
@@ -844,27 +856,35 @@ if (!isEmpty(main_node)) {
 		});
 
 	if (routing_mode === 'bypass_mainland_china') {
-		push(config.route.rule_set, {
-			type: 'remote',
-			tag: 'geoip-cn',
-			format: 'binary',
-			url: 'https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs',
-			download_detour: 'main-out'
-		});
-		push(config.route.rule_set, {
-			type: 'remote',
-			tag: 'geosite-cn',
-			format: 'binary',
-			url: 'https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs',
-			download_detour: 'main-out'
-		});
-		push(config.route.rule_set, {
-			type: 'remote',
-			tag: 'geosite-noncn',
-			format: 'binary',
-			url: 'https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs',
-			download_detour: 'main-out'
-		});
+		for (let rs in [
+			{
+				tag: 'geoip-cn',
+				url: 'https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs'
+			},
+			{
+				tag: 'geosite-cn',
+				url: 'https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs'
+			},
+			{
+				tag: 'geosite-noncn',
+				url: 'https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs'
+			}
+		]) {
+			let local_path = local_ruleset_path(rs.tag);
+
+			push(config.route.rule_set, local_path ? {
+				type: 'local',
+				tag: rs.tag,
+				format: 'binary',
+				path: local_path
+			} : {
+				type: 'remote',
+				tag: rs.tag,
+				format: 'binary',
+				url: rs.url,
+				download_detour: 'main-out'
+			});
+		}
 	}
 
 	if (isEmpty(config.route.rule_set))
