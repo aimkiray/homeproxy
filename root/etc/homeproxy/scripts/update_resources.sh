@@ -8,6 +8,9 @@ NAME="homeproxy"
 RESOURCES_DIR="/etc/$NAME/resources"
 mkdir -p "$RESOURCES_DIR"
 
+RULESET_DIR="/etc/$NAME/ruleset"
+mkdir -p "$RULESET_DIR"
+
 RUN_DIR="/var/run/$NAME"
 LOG_PATH="$RUN_DIR/$NAME.log"
 mkdir -p "$RUN_DIR"
@@ -25,6 +28,8 @@ check_list_update() {
 	local listrepo="$2"
 	local listref="$3"
 	local listname="$4"
+	local destdir="${5:-$RESOURCES_DIR}"
+	local destname="${6:-$listtype.${listname##*.}}"
 	local lock="$RUN_DIR/update_resources-$listtype.lock"
 	local github_token="$(uci -q get homeproxy.config.github_token)"
 	local wget="wget --timeout=10 -q"
@@ -59,10 +64,47 @@ check_list_update() {
 		return 1
 	fi
 
-	mv -f "$RUN_DIR/$listname" "$RESOURCES_DIR/$listtype.${listname##*.}"
-	echo -e "$list_ver" > "$RESOURCES_DIR/$listtype.ver"
+	# .srs payloads must carry the SRS magic; a truncated body or an HTML
+	# error page must never be installed as a ruleset.
+	case "$destname" in
+	*.srs)
+		if [ "$(dd if="$RUN_DIR/$listname" bs=3 count=1 2>/dev/null)" != "SRS" ]; then
+			rm -f "$RUN_DIR/$listname"
+			log "[$(to_upper "$listtype")] Update failed: not an SRS binary."
+			return 1
+		fi
+		;;
+	esac
+
+	# china_list upstream ships "full:domain.tld" tags; normalize BEFORE
+	# install so the restart below never lands on the unsanitized file.
+	if [ "$listtype" = "china_list" ]; then
+		sed -i -e "s/full://g" -e "/:/d" "$RUN_DIR/$listname"
+	fi
+
+	# Two-step install: cross-fs mv into a hidden temp name, then same-dir
+	# rename -- the actually atomic step. An interrupted first mv leaves
+	# only a ".*.tmp" stub that no reader matches.
+	if ! { mv -f "$RUN_DIR/$listname" "$destdir/.$destname.tmp" && \
+		mv -f "$destdir/.$destname.tmp" "$destdir/$destname"; }; then
+		rm -f "$RUN_DIR/$listname" "$destdir/.$destname.tmp"
+		log "[$(to_upper "$listtype")] Update failed: could not install the list."
+		return 1
+	fi
+	# Atomic .ver write, after the data file actually landed.
+	if ! { echo -e "$list_ver" > "$RESOURCES_DIR/.$listtype.ver.tmp" && \
+		mv -f "$RESOURCES_DIR/.$listtype.ver.tmp" "$RESOURCES_DIR/$listtype.ver"; }; then
+		log "[$(to_upper "$listtype")] WARNING: version file write failed; the update will be retried next run."
+	fi
 	log "[$(to_upper "$listtype")] Successfully updated."
 
+	# New resources only take effect after a service restart. Only restart
+	# when the proxy is actually running or the fail-open marker is set
+	# (a restart also serves as the recovery re-arm path then).
+	if pgrep -f "sing-box run --config" >/dev/null 2>&1 || [ -f "$RUN_DIR/failopen.active" ]; then
+		/etc/init.d/"$NAME" restart >/dev/null 2>&1 && \
+			log "[$(to_upper "$listtype")] Service restarted to apply new resources."
+	fi
 	return 0
 }
 
@@ -77,11 +119,19 @@ case "$1" in
 	check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "gfw.txt"
 	;;
 "china_list")
-	check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "direct-list.txt" && \
-		sed -i -e "s/full://g" -e "/:/d" "$RESOURCES_DIR/china_list.txt"
+	check_list_update "$1" "Loyalsoldier/v2ray-rules-dat" "release" "direct-list.txt"
+	;;
+"geoip-cn")
+	check_list_update "$1" "1715173329/IPCIDR-CHINA" "rule-set" "cn.srs" "$RULESET_DIR" "geoip-cn.srs"
+	;;
+"geosite-cn")
+	check_list_update "$1" "1715173329/sing-geosite" "rule-set-unstable" "geosite-geolocation-cn.srs" "$RULESET_DIR" "geosite-cn.srs"
+	;;
+"geosite-noncn")
+	check_list_update "$1" "1715173329/sing-geosite" "rule-set-unstable" "geosite-geolocation-!cn.srs" "$RULESET_DIR" "geosite-noncn.srs"
 	;;
 *)
-	echo -e "Usage: $0 <china_ip4 / china_ip6 / gfw_list / china_list>"
+	echo -e "Usage: $0 <china_ip4 / china_ip6 / gfw_list / china_list / geoip-cn / geosite-cn / geosite-noncn>"
 	exit 1
 	;;
 esac
