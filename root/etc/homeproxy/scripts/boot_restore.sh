@@ -87,7 +87,26 @@ fi
 #    If the scripts already existed (normal runtime), do nothing -- respecting
 #    any intentional stop the user made via the web UI / CLI.
 if [ "$need_start" = 1 ]; then
-	log "starting homeproxy + homeproxy-web."
-	"$INITD/homeproxy" start >/dev/null 2>&1 || log "homeproxy start returned $?"
+	# Honor the same falsy vocabulary as config_get_bool (0|off|false|no|
+	# disabled): a bare '= 0' test would restart the service even when the
+	# user wrote 'off' (W3-1b).
+	case "$(uci -q get homeproxy.config.enabled 2>/dev/null)" in
+		0|false|no|off|disabled)
+		# G5: master switch off -- restore the init scripts but leave the
+		# service down. 'homeproxy enable' + 'homeproxy start' brings it back.
+		log "homeproxy disabled (config.enabled falsy) -- init scripts restored, service NOT started."
+		;;
+		*)
+		log "starting homeproxy + homeproxy-web."
+		"$INITD/homeproxy" start >/dev/null 2>&1 || {
+			rc=$?
+			# rc=2 = "nothing to run" (nil outbound / enabled=0): a defined
+			# no-op per G9, not a failure worth logging. rc=1 IS a real
+			# failure -- only rc=2 stays silent (W3-1).
+			[ "$rc" != "0" ] && [ "$rc" != "2" ] && log "homeproxy start returned $rc"
+		}
+		;;
+	esac
+	# homeproxy-web is NOT gated on config.enabled: it is the recovery channel.
 	"$INITD/homeproxy-web" start >/dev/null 2>&1 || log "homeproxy-web start returned $?"
 fi

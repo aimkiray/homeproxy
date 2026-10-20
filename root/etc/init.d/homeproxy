@@ -23,6 +23,45 @@ log() {
     printf '%s\n' "$(date "+%Y-%m-%d %H:%M:%S") [DAEMON] $*" >> "$LOG_PATH"
 }
 
+# Resolve firewall.sh through a fallback chain (spec 3.2): env.sh-provided
+# HP_LUA_DIR first, then the MiWiFi persistent layout, then the standard
+# package path. A broken /etc/homeproxy symlink leaves HP_LUA_DIR at the
+# /usr/lib default, which does not exist on MiWiFi -- without the fallback
+# the whole teardown would be skipped (G2).
+resolve_fw() {
+    local f
+    for f in "$HP_LUA_DIR/firewall.sh" \
+             /data/other_vol/homeproxy/lib/firewall.sh \
+             /usr/lib/homeproxy/firewall.sh; do
+        [ -f "$f" ] && { printf '%s\n' "$f"; return 0; }
+    done
+    return 1
+}
+
+# Run firewall.sh with its output captured into a variable first, then
+# best-effort appended to the log: a redirection failure (RUN_DIR absent,
+# LOG_PATH unwritable) must never abort the teardown itself (G1).
+run_fw() {   # $1 = start|stop|...
+    local fw out rc=0
+    if ! fw=$(resolve_fw); then
+        log "WARN: firewall.sh not found in any known path; skipping '$1'."
+        return 1
+    fi
+    out=$(sh "$fw" "$1" 2>&1) || rc=$?
+    [ -n "$out" ] && printf '%s\n' "$out" >>"$LOG_PATH" 2>/dev/null
+    return $rc
+}
+
+# Drop stale dnsmasq steering confs; restart dnsmasq only when something
+# was actually removed (spec 4.2). Shared by stop_service, the nil/enabled
+# early returns, and the "do not write" arm of the DNS block (G3).
+drop_dnsmasq_confs() {
+    if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
+        rm -f /tmp/dnsmasq.d/homeproxy_*.conf
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    fi
+}
+
 # File-type rule-providers (spec 4.7) resolve their `path` relative to the
 # meow home dir (-d $RUN_DIR), so the generated config references
 # providers/<list>.txt. The canonical lists live in $HP_DIR/resources; the
@@ -127,6 +166,35 @@ start_service() {
 
     config_load "$CONF"
 
+    # G5 master switch (spec 7.2): honor config.enabled before anything is
+    # generated. The teardown is defensive -- a takeover applied by a
+    # previous run must not outlive the switch being turned off -- and
+    # rc=2 reports a "defined no-op" (same convention as
+    # generate_server.lua), not a failure.
+    local enabled
+    config_get_bool enabled "config" "enabled" "1"
+    if [ "$enabled" != "1" ]; then
+        log "config.enabled=0 -- disabled; ensuring teardown and skipping start."
+        rm -f "$RUN_DIR/firewall.active"
+        # run_fw failure means firewall.sh is missing or died mid-stop, so
+        # its drain never ran: repeat the best-effort policy-routing +
+        # legacy-tun sweep stop_service performs (spec 6.6.3/6.6.4). A
+        # successful stop already drains these -- re-running is pointless.
+        if ! run_fw stop; then
+            local table_mark tproxy_mark
+            config_get table_mark "infra" "table_mark" "100"
+            config_get tproxy_mark "infra" "tproxy_mark" "101"
+            while ip rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
+            while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
+            ip route del local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
+            ip route flush table "$table_mark" 2>/dev/null
+            ip -6 route flush table "$table_mark" 2>/dev/null
+            cleanup_legacy_tun
+        fi
+        drop_dnsmasq_confs
+        return 2
+    fi
+
     local routing_mode proxy_mode
     config_get routing_mode "config" "routing_mode" "bypass_mainland_china"
     config_get proxy_mode "config" "proxy_mode" "redirect_tproxy"
@@ -155,7 +223,18 @@ start_service() {
     [ "$server_enabled" = "1" ] || config_foreach server_enabled_probe server
 
     if [ "$outbound_node" = "nil" ] && [ "$server_enabled" = "0" ]; then
-        return 1
+        # Defensive takeover teardown, same order as the enabled=0 arm
+        # (spec 3.3): a running service whose UCI was switched to nil and
+        # then bare-started must not leave the flag + jump points behind
+        # as a LAN blackhole.
+        rm -f "$RUN_DIR/firewall.active"
+        run_fw stop
+        # G3 (spec 4.2): a previous run's dnsmasq conf must not linger --
+        # nothing here will answer on the meow DNS port, so a stale conf
+        # turns every LAN query into a SERVFAIL.
+        drop_dnsmasq_confs
+        # G9 (spec 5.1): "nothing to run" is a defined skip, not an error.
+        return 2
     fi
 
     if [ "$outbound_node" != "nil" ]; then
@@ -246,10 +325,20 @@ start_service() {
         # stop_service drain below stays as the belt-and-suspenders sweep.
     fi
 
+    # Watchdog cron line (spec 2.2): guaranteed present on every start that
+    # gets this far -- the script self-gates at runtime (enabled flag,
+    # meow-c expectation, takeover stakes), and the inline [ -x ] guard
+    # keeps early-boot ticks silent while /etc/homeproxy is not yet
+    # re-linked by boot_restore. stop_service removes the line again.
+    if ! grep -q "#${CONF}_watchdog" /etc/crontabs/root 2>/dev/null; then
+        echo "* * * * * [ -x $HP_DIR/scripts/watchdog.sh ] && $HP_DIR/scripts/watchdog.sh #${CONF}_watchdog" >> "/etc/crontabs/root"
+        /etc/init.d/cron restart >/dev/null 2>&1
+    fi
+
     # firewall (iptables+ipset). The flag gates the fw3 include: it must be
     # set whenever start succeeded -- even with lan_proxy_mode=disabled, the
     # server filter accepts it installs must survive a firewall reload.
-    if sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"; then
+    if run_fw start; then
         : > "$RUN_DIR/firewall.active"
     else
         log "Error: firewall.sh failed; firewall rules not applied."
@@ -303,16 +392,22 @@ start_service() {
     # registers the instances above -- the actual spawn happens when
     # start_service returns, so for a brief window dnsmasq may forward to a
     # not-yet-listening meow DNS port; that transient is accepted.
-    # infra.dns_redirect=0 disables the whole arm: drop stale confs first
-    # (a previous run's directives must not linger), then skip the block.
-    local dns_redirect
+    # infra.dns_redirect=0 disables the whole arm; lan_proxy_mode=disabled
+    # joins it under G3 (spec 4.1): with the steering arm uninstalled no
+    # ipsets exist, so a redirect conf would only hand LAN DNS to meow for
+    # zero gain -- and meow dying would then take LAN DNS down with it.
+    # Every "do not write" case drops stale confs first (a previous run's
+    # directives must not linger), then skips the block -- including
+    # outbound_node=nil (pure-server deployment): with no meow-c running
+    # nothing answers on the meow DNS port, so a leftover conf would
+    # SERVFAIL every LAN query (spec 4.1 truth table, nil row).
+    local dns_redirect lan_proxy_mode
     config_get_bool dns_redirect "infra" "dns_redirect" "1"
-    if [ "$dns_redirect" != "1" ]; then
-        if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
-            rm -f /tmp/dnsmasq.d/homeproxy_*.conf
-            /etc/init.d/dnsmasq restart >/dev/null 2>&1
-        fi
-    elif [ "$outbound_node" != "nil" ]; then
+    config_get lan_proxy_mode "control" "lan_proxy_mode" "disabled"
+    if [ "$dns_redirect" != "1" ] || [ "$lan_proxy_mode" = "disabled" ] \
+        || [ "$outbound_node" = "nil" ]; then
+        drop_dnsmasq_confs
+    else
         local hp_dns_port
         config_get hp_dns_port "infra" "dns_port" "5333"
         mkdir -p /tmp/dnsmasq.d
@@ -375,28 +470,41 @@ start_service() {
     fi
 
     log "HomeProxy started (meow: $("$PROG" --version 2>/dev/null | head -1))."
+    # Explicit success rc: callers distinguish 0 (running) / 2 (defined
+    # no-op) / 1 (real error) -- a failed log append must not flip a
+    # completed start into a phantom rc=1.
+    return 0
 }
 
 stop_service() {
-    # Only remove the cron entry if it actually exists (avoid unnecessary cron restart).
+    # Only remove the cron entries if they actually exist (avoid unnecessary
+    # cron restart).
     if grep -q "#${CONF}_autosetup" /etc/crontabs/root 2>/dev/null; then
         sed -i "/#${CONF}_autosetup/d" "/etc/crontabs/root" 2>/dev/null
         /etc/init.d/cron restart >/dev/null 2>&1
     fi
+    if grep -q "#${CONF}_watchdog" /etc/crontabs/root 2>/dev/null; then
+        sed -i "/#${CONF}_watchdog/d" "/etc/crontabs/root" 2>/dev/null
+        /etc/init.d/cron restart >/dev/null 2>&1
+    fi
 
-    # The 2>> redirect below fails (and silently skips the whole teardown)
-    # when RUN_DIR is absent, e.g. after an unexpected /var/run cleanup.
     mkdir -p "$RUN_DIR"
-    # spec 6.6.1-4: chain jumps + chains, ipsets, policy rules/routes and the
-    # legacy tun device are all torn down inside firewall.sh stop.
-    sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
+    # Teardown order is contractual (spec 3.3): the flag gates the fw3
+    # include (firewall_include.sh only acts while it exists), so it must
+    # go FIRST -- deleting it after firewall.sh stop would leave a window
+    # where a concurrent fw3 reload re-installs rules on top of a
+    # half-torn-down chain set and orphans the jumps (G2 race).
     rm -f "$RUN_DIR/firewall.active"
+    # spec 6.6.1-4: chain jumps + chains, ipsets, policy rules/routes and the
+    # legacy tun device are all torn down inside firewall.sh stop. run_fw
+    # captures the output before logging it, so an absent RUN_DIR /
+    # unwritable LOG_PATH can no longer skip the teardown (G1), and
+    # resolve_fw still finds the script via the MiWiFi persistent path when
+    # env.sh is unreachable (G2).
+    run_fw stop
 
     # remove dnsmasq DNS steering (any routing mode) -- spec 6.6.5
-    if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
-        rm -f /tmp/dnsmasq.d/homeproxy_*.conf
-        /etc/init.d/dnsmasq restart >/dev/null 2>&1
-    fi
+    drop_dnsmasq_confs
 
     # Drain the policy routing init.d installs for the UDP-TPROXY arm
     # (spec 6.6.3). firewall.sh stop already drains it; repeating here is
@@ -421,6 +529,10 @@ stop_service() {
     cleanup_legacy_tun
 
     log "Service stopped."
+    # Explicit success rc: a failed log append (absent RUN_DIR /
+    # unwritable LOG_PATH) must not flip a completed teardown into a
+    # phantom rc=1.
+    return 0
 }
 
 service_stopped() {

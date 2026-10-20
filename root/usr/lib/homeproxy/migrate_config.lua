@@ -51,6 +51,8 @@ if uci:get_all(CFG, "infra") then
     ensure("infra", "tproxy_mark", "101")
     ensure("infra", "table_mark", "100")
     ensure("infra", "ntp_server", "nil")
+    -- G0 opt-out: watchdog enabled by default (spec-recovery-hardening 7.1)
+    ensure("infra", "watchdog", "1")
     -- udp_timeout feeds listeners[].udp-timeout (integer seconds). Accept
     -- the same set the generator's secs() accepts: bare seconds or an
     -- Ns/Nm/Nh/Nd suffix, with optional surrounding whitespace; normalize
@@ -128,6 +130,8 @@ end
 
 -- ensure main config defaults
 if uci:get_all(CFG, "config") then
+    -- G5 master switch, default on (spec-recovery-hardening 7.1)
+    ensure("config", "enabled", "1")
     ensure("config", "routing_mode", "bypass_mainland_china")
     ensure("config", "proxy_mode", "redirect_tproxy")
     ensure("config", "ipv6_support", "1")

@@ -154,7 +154,17 @@ valid_mode() {
 }
 
 # restart the PROXY only (the web UI init is separate, so this never kills uhttpd)
-do_restart() { "$INIT" restart >/dev/null 2>&1 || "$INIT" start >/dev/null 2>&1; }
+# rc=2 = "nothing to run" (nil outbound / enabled=0): a defined no-op, not a
+# failure (recovery spec §5.1); the start fallback is judged by the same codes.
+do_restart() {
+	"$INIT" restart >/dev/null 2>&1
+	local rc=$?
+	if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then
+		"$INIT" start >/dev/null 2>&1
+		rc=$?
+	fi
+	[ "$rc" = "0" ] || [ "$rc" = "2" ]
+}
 
 # CSRF hardening for an unauthenticated LAN API. uhttpd exposes only a fixed
 # header whitelist to CGI (host/origin/referer/user-agent/content-type/
@@ -216,8 +226,11 @@ state|status)
 	proxy_mode=$(uci -q get $CONF.config.proxy_mode 2>/dev/null)
 	case "$proxy_mode" in redirect|tproxy|redirect_tproxy) ;; *) proxy_mode=redirect_tproxy ;; esac
 	lan_proxy=$(uci -q get $CONF.control.lan_proxy_mode 2>/dev/null); lan_proxy=${lan_proxy:-disabled}
-	json_ok "$(printf '{"ok":true,"running":%s,"version":"%s","main_node":"%s","routing_mode":"%s","proxy_mode":"%s","lan_proxy_mode":"%s"}' \
-		"$running" "$(jesc "$version")" "$(jesc "$main_node")" "$(jesc "$routing_mode")" "$(jesc "$proxy_mode")" "$(jesc "$lan_proxy")")"
+	# config.enabled is the read-only master switch (CLI/UCI only, G5): the UI
+	# shows "disabled" instead of a bare "stopped".
+	enabled=$(uci -q get $CONF.config.enabled 2>/dev/null); enabled=${enabled:-1}
+	json_ok "$(printf '{"ok":true,"running":%s,"version":"%s","main_node":"%s","routing_mode":"%s","proxy_mode":"%s","lan_proxy_mode":"%s","enabled":"%s"}' \
+		"$running" "$(jesc "$version")" "$(jesc "$main_node")" "$(jesc "$routing_mode")" "$(jesc "$proxy_mode")" "$(jesc "$lan_proxy")" "$(jesc "$enabled")")"
 	;;
 
 config|settings)
@@ -233,7 +246,7 @@ config|settings)
 		uci:load("homeproxy")
 		local KEEP = {
 			config = { main_node=1, main_udp_node=1, routing_mode=1, proxy_mode=1,
-				ipv6_support=1, dns_server=1, china_dns_server=1, routing_port=1 },
+				enabled=1, ipv6_support=1, dns_server=1, china_dns_server=1, routing_port=1 },
 			subscription = { subscription_url=1, update_via_proxy=1, user_agent=1,
 				packet_encoding=1, filter_nodes=1, filter_keywords=1, allow_insecure=1 },
 			control = { lan_proxy_mode=1, lan_proxy_ipv4_ips=1, lan_proxy_ipv6_ips=1,

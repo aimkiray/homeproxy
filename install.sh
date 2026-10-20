@@ -16,7 +16,14 @@
 #        HP_MEOW_URL         meow tar URL (default: v0.24.0 aarch64 musl;
 #                            file:///abs/path also accepted for local push)
 #        HP_MEOW_SHA256      sha256 of the meow tarball (verified if set)
-#        HP_CONFIRM_TIMEOUT  verify window before auto-rollback (default 30)
+#        HP_CONFIRM_TIMEOUT  seconds per verify window before auto-rollback
+#                            (default 30). When meow is expected there are TWO
+#                            windows: process start, then proxied connectivity
+#                            -- worst-case verify time is TIMEOUT x2.
+#        HP_INSTALL_SKIP_CONN  1 -> skip the through-proxy connectivity probe
+#                              (restores the old process-only verification)
+#        HP_PROBE_URL        connectivity probe URL fetched via the mixed port
+#                            (default http://www.gstatic.com/generate_204)
 #        HP_FORCE_CONFIG     non-empty -> overwrite existing UCI config too
 #
 # Fresh install and in-place upgrade are both supported. Persistent files live
@@ -441,7 +448,7 @@ for f in firewall.sh firewall_include.sh; do
     install_file "$ROOT/usr/lib/homeproxy/$f" "$LIB/$f" 755 always
 done
 install_file "$ROOT/usr/bin/homeproxy" "$BIN/homeproxy" 755 always
-for f in clean_log.sh update_crond.sh update_resources.sh; do
+for f in clean_log.sh update_crond.sh update_resources.sh watchdog.sh; do
     install_file "$ROOT/etc/homeproxy/scripts/$f" "$SCR/$f" 755 always
 done
 install_file "$ROOT/etc/homeproxy/web/index.html" "$WEB/index.html" 644 always
@@ -516,7 +523,23 @@ proc_running() {
         ps w 2>/dev/null | grep -q "$1"
     fi
 }
-ok=0; i=0
+
+# Stage-2 probe (meow_expected=1 only): an end-to-end fetch through the mixed
+# port proves "meow + node + upstream" all work -- a process that starts but
+# whose outbound is black must still trigger rollback/cleanup (G10). The URL
+# is overridable via HP_PROBE_URL (https:// works too: CONNECT via mixed).
+PROBE_URL=${HP_PROBE_URL:-http://www.gstatic.com/generate_204}
+mixed_port=$(uci -q get homeproxy.infra.mixed_port 2>/dev/null); mixed_port=${mixed_port:-5330}
+# UCI may hold a dirty value (e.g. "abc", "53 30") -- fall back to default.
+case "$mixed_port" in ''|*[!0-9]*) mixed_port=5330 ;; esac
+conn_probe() {
+    command -v curl >/dev/null 2>&1 || return 1
+    code=$(curl -s -o /dev/null --max-time 8 -x "http://127.0.0.1:$mixed_port" \
+        -w '%{http_code}' "$PROBE_URL" 2>/dev/null) || return 1
+    case "$code" in 2[0-9][0-9]|3[0-9][0-9]) return 0 ;; *) return 1 ;; esac
+}
+
+ok=0; i=0; fail_reason=""
 if [ "$meow_expected" = 0 ]; then
     log "no node/server configured -- verifying web UI instead of meow..."
     while [ "$i" -lt "$TIMEOUT" ]; do
@@ -525,11 +548,36 @@ if [ "$meow_expected" = 0 ]; then
     done
     [ "$ok" = 1 ] && log "installed (unconfigured): web UI up, add a node to start proxying."
 else
+    # Stage 1: wait for the meow process (unchanged semantics).
     log "verifying meow start (${TIMEOUT}s)..."
     while [ "$i" -lt "$TIMEOUT" ]; do
         if proc_running '[m]eow -f /var/run/homeproxy/meow-'; then ok=1; break; fi
         sleep 1; i=$((i+1))
     done
+    if [ "$ok" != 1 ]; then
+        fail_reason="process never appeared"
+    elif [ "${HP_INSTALL_SKIP_CONN:-}" = "1" ]; then
+        log "meow process up; HP_INSTALL_SKIP_CONN=1 -- skipping connectivity probe."
+    elif ! command -v curl >/dev/null 2>&1; then
+        # +curl is in DEPENDS so this should never happen; fail closed
+        # rather than silently trusting an unverified outbound.
+        log "WARN: curl not found -- connectivity probe impossible."
+        ok=0; fail_reason="up but no proxied connectivity (${PROBE_URL})"
+    else
+        # Stage 2: fresh TIMEOUT window, probe through the mixed port every
+        # 2s. A mid-window process death does NOT fail early -- procd may
+        # respawn it and the probe can still pass before the window ends.
+        # The window is wall-clock (date +%s deadline), NOT iteration-counted:
+        # a single conn_probe may take up to --max-time 8s, which must count
+        # against the window so worst-case verify stays within TIMEOUT (W5-1).
+        log "meow process up -- probing proxied connectivity via 127.0.0.1:$mixed_port (${TIMEOUT}s)..."
+        ok=0; end=$(( $(date +%s) + TIMEOUT ))
+        while [ "$(date +%s)" -lt "$end" ]; do
+            if conn_probe; then ok=1; break; fi
+            sleep 2
+        done
+        [ "$ok" = 1 ] || fail_reason="up but no proxied connectivity (${PROBE_URL})"
+    fi
 fi
 
 if [ "$ok" = 1 ]; then
@@ -549,7 +597,7 @@ if [ "$ok" = 1 ]; then
 fi
 
 if [ "$meow_expected" = 1 ]; then
-    log "FAILED: meow did not start within ${TIMEOUT}s."
+    log "FAILED: meow ${fail_reason:-did not start within ${TIMEOUT}s}."
 else
     log "FAILED: web UI did not come up within ${TIMEOUT}s."
 fi

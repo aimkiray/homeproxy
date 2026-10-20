@@ -4,7 +4,11 @@
 # homeproxy CLI -- manage HomeProxy on LuCI-less routers (MiWiFi).
 # Usage: homeproxy <command> [args]
 #   start|stop|restart|reload|status   service control
-#   enable|disable                     boot autostart
+#   enable|disable                     boot autostart (writes UCI config.enabled;
+#                                      disable also stops the service now)
+#   firewall-stop                      tear down the firewall/DNS takeover ONLY
+#                                      (meow keeps running; 'homeproxy restart'
+#                                      restores it)
 #   generate                           regenerate meow configs
 #   check                              validate generated meow-*.yaml (meow -t)
 #   migrate                            apply config defaults/migration
@@ -82,10 +86,14 @@ quarantine_names() {
 node_quarantined() { quarantine_names | grep -qxF "$1"; }
 
 cmd_status() {
-    local st=stopped mb ver
+    local st=stopped mb ver enabled
     # spec 8.4 unified probe: procd runs "meow -f /var/run/homeproxy/meow-{c,s}.yaml".
     pgrep -f "meow -f $RUN_DIR/meow-" >/dev/null 2>&1 && st=running
     echo "$st"
+    # Unset means enabled (same default as the api's ${enabled:-1} and
+    # init.d's config_get_bool ... "1").
+    enabled=$(uci_get config.enabled)
+    echo "enabled: ${enabled:-1}"
     mb="$(meow_bin)"
     ver=""
     [ -n "$mb" ] && ver="$("$mb" --version 2>/dev/null | sed -n '1p')"
@@ -238,10 +246,58 @@ cmd_set() {
 cmd_get() { [ -n "$1" ] || die "usage: homeproxy get <section.option>"; uci_get "$1"; }
 
 case "${1:-}" in
-start|stop|restart|reload) "$INIT" "$@" ;;
+stop|reload) "$INIT" "$@" ;;
+start|restart)
+    "$INIT" "$@"
+    rc=$?
+    # rc=2 = "nothing to run" (nil outbound / enabled=0): a defined no-op, not
+    # a failure (spec G9). Surface it so the CLI exit code is not mistaken.
+    [ "$rc" = "2" ] && echo "nothing to run (no outbound/server) -- config saved"
+    exit "$rc"
+    ;;
 status) cmd_status ;;
-enable) "$INIT" enable && echo "Enabled $CONF at boot." ;;
-disable) "$INIT" disable && echo "Disabled $CONF at boot." ;;
+# The real autostart switch is UCI config.enabled (read by init.d start and
+# boot_restore.sh on MiWiFi); the rc.d symlink toggles are kept so standard
+# package installs behave the same as before.
+enable)
+    "$INIT" enable 2>/dev/null          # rc.d links (standard installs still use them)
+    uci_set "config.enabled" "1" || die "uci set failed"
+    echo "Enabled $CONF at boot (run 'homeproxy start' to start now)." ;;
+disable)
+    "$INIT" disable 2>/dev/null
+    uci_set "config.enabled" "0" || die "uci set failed"
+    "$INIT" stop >/dev/null 2>&1        # stop the bleeding now; rc.d alone is inert on MiWiFi
+    echo "Disabled $CONF (boot_restore will not restart it)." ;;
+firewall-stop)
+    # Withdraw the takeover without touching the procd instance or UCI: if meow
+    # is still alive, the mixed/API ports stay usable for diagnosis.
+    WD=""
+    for f in /etc/homeproxy/scripts/watchdog.sh \
+             /data/other_vol/homeproxy/scripts/watchdog.sh; do
+        [ -f "$f" ] && { WD="$f"; break; }
+    done
+    if [ -n "$WD" ]; then
+        sh "$WD" degrade
+    else
+        # Inline same-order fallback (§3.3 contract): "script missing" must
+        # never turn into "cannot tear down". mkdir first: ':' is a POSIX
+        # special builtin, so a redirection failure on the marker below
+        # would abort the whole script when RUN_DIR is absent (W3-2).
+        mkdir -p "$RUN_DIR" 2>/dev/null
+        rm -f "$RUN_DIR/firewall.active"
+        for f in "$LUA_DIR/firewall.sh" \
+                 /data/other_vol/homeproxy/lib/firewall.sh \
+                 /usr/lib/homeproxy/firewall.sh; do
+            [ -f "$f" ] && { sh "$f" stop; break; }
+        done
+        if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
+            rm -f /tmp/dnsmasq.d/homeproxy_*.conf
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        fi
+        : > "$RUN_DIR/hp_watchdog.degraded" || true
+    fi
+    echo "firewall teardown done (service untouched). 'homeproxy restart' to restore."
+    ;;
 generate)
     mkdir -p "$RUN_DIR"
     lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
@@ -387,6 +443,6 @@ log)
         done
         if [ "$shown" = "0" ]; then echo "no log yet"; fi
     fi ;;
-""|-h|--help|help) sed -n '4,27p' "$0" 2>/dev/null ;;
+""|-h|--help|help) sed -n '4,31p' "$0" 2>/dev/null ;;
 *) die "unknown command '${1:-}' (try: homeproxy help)" ;;
 esac
