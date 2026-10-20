@@ -5,12 +5,17 @@
 #
 #   curl -fsSL <URL>/install.sh | sh
 #   sh install.sh [SRC] [--force] [--rollback]
-#       SRC   local path/dir or URL of a tarball holding the repo root/ tree.
-#             Overrides HP_SRC_URL. Required if no HP_SRC_URL env.
+#       SRC        local path/dir or URL of a tarball holding the repo root/ tree.
+#                  Overrides HP_SRC_URL. Required if no HP_SRC_URL env.
+#       --rollback restore the previous install from backup. ONLY for
+#                  recovering an interrupted/failed install -- NOT a general
+#                  downgrade mechanism (the backup only captures the install
+#                  immediately before this one).
 #   env: HP_SRC_URL          tarball URL (github release / own host)
 #        HP_DOWNLOAD_SHA256  sha256 of the source tarball (verified if set)
-#        HP_SINGBOX_URL      sing-box tar URL (default: 1.13.15 linux arm64)
-#        HP_SINGBOX_SHA256   sha256 of the sing-box tarball (verified if set)
+#        HP_MEOW_URL         meow tar URL (default: v0.24.0 aarch64 musl;
+#                            file:///abs/path also accepted for local push)
+#        HP_MEOW_SHA256      sha256 of the meow tarball (verified if set)
 #        HP_CONFIRM_TIMEOUT  verify window before auto-rollback (default 30)
 #        HP_FORCE_CONFIG     non-empty -> overwrite existing UCI config too
 #
@@ -29,20 +34,25 @@ SCR=$HP_BASE/scripts
 BIN=$HP_BASE/bin
 WEB=$HP_BASE/web
 INITD_PERSIST=$HP_BASE/init.d
-SINGBOX_DIR=/data/other_vol/bin
-SINGBOX=$SINGBOX_DIR/sing-box
+MEOW_DIR=/data/other_vol/bin
+MEOW_BIN=$MEOW_DIR/meow
 BACKUP_TAR=/data/other_vol/.hp_install_backup.tar.gz
 BACKUP_META=/data/other_vol/.hp_install_meta.sh
-# The sing-box binary is NOT in BACKUP_TAR (too large for ubifs); keep its
+# The meow binary is NOT in BACKUP_TAR (too large for ubifs); keep its
 # previous copy on tmpfs for the duration of the install so a failed swap
 # can be undone.
-SB_BACKUP=/tmp/.hp_singbox_prev
+MEOW_BACKUP=/tmp/.hp_meow_prev
 CONFIRM_FILE=/tmp/hp_install_confirmed
 LOG=/var/run/homeproxy/homeproxy.log
 
-SINGBOX_VER=1.13.15
-SINGBOX_SHA256=""  # If set, sing-box download is verified against this hash.
-SINGBOX_URL_DEFAULT="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VER}/sing-box-${SINGBOX_VER}-linux-arm64.tar.gz"
+MEOW_VER=0.24.0
+MEOW_SHA256=""  # If set, meow download is verified against this hash.
+# NOTE: the upstream release binary at this URL does NOT include the
+# `listener-shadowsocks` feature, so a Shadowsocks SERVER listener will not
+# work with it (client side is unaffected). Server(SS) deployments must point
+# HP_MEOW_URL at a contract-built artifact (full + listener-shadowsocks) --
+# e.g. push a locally built binary/tarball and use file:///abs/path.
+MEOW_URL_DEFAULT="https://github.com/meow-rs/meow-rs/releases/download/v${MEOW_VER}/meow-v${MEOW_VER}-aarch64-unknown-linux-musl.tar.gz"
 TIMEOUT=${HP_CONFIRM_TIMEOUT:-30}
 
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin:$PATH
@@ -62,8 +72,15 @@ trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 fetch() {
     url=$1; out=$2
     # Reject non-HTTPS URLs to prevent MITM on cleartext downloads (C5).
+    # file:// is the local-push path (e.g. a scp'd meow tarball).
     case "$url" in
         https://*) ;;
+        file://*)
+            _src=${url#file://}
+            [ -f "$_src" ] || die "local file not found: $_src"
+            cp -f "$_src" "$out" || die "copy failed: $_src -> $out"
+            return 0
+            ;;
         *) die "refusing non-HTTPS URL (security policy): $url" ;;
     esac
     if command -v curl >/dev/null 2>&1; then
@@ -81,8 +98,9 @@ verify_checksum() {
     _file=$1; _expected=$2
     [ -n "$_expected" ] || return 0  # no hash specified — skip
     if ! command -v sha256sum >/dev/null 2>&1; then
-        log "WARN: sha256sum not available — skipping checksum verification."
-        return 0
+        # Fail closed: a caller that supplied a checksum expects the download
+        # to be verified -- silently skipping would defeat the MITM check (C2).
+        die "sha256sum not available but a checksum was provided -- refusing to install unverified $_file"
     fi
     local actual
     actual=$(sha256sum "$_file" 2>/dev/null | awk '{print $1}')
@@ -163,8 +181,8 @@ do_rollback() {
     else
         log "no backup -- clean removal done (fresh install)"
     fi
-    # Restore the previous sing-box binary if this install replaced it.
-    restore_singbox
+    # Restore the previous meow binary if this install replaced it.
+    restore_meow
     # Pre-initialize vars to avoid set -u abort on partial BACKUP_META (M from review).
     HP_FW_INC=""; HP_FW_PATH=""; HP_WAS_RUNNING="no"
     if [ -f "$BACKUP_META" ]; then
@@ -195,13 +213,13 @@ do_rollback() {
     rm -f "$CONFIRM_FILE" "$BACKUP_META" "$BACKUP_TAR"
 }
 
-# Restore the pre-install sing-box binary if we stashed one.
-restore_singbox() {
-    if [ -f "$SB_BACKUP" ]; then
-        cp -f "$SB_BACKUP" "$SINGBOX" 2>/dev/null && chmod 755 "$SINGBOX" \
-            && log "sing-box binary restored." \
-            || log "WARN: could not restore sing-box binary."
-        rm -f "$SB_BACKUP"
+# Restore the pre-install meow binary if we stashed one.
+restore_meow() {
+    if [ -f "$MEOW_BACKUP" ]; then
+        cp -f "$MEOW_BACKUP" "$MEOW_BIN" 2>/dev/null && chmod 755 "$MEOW_BIN" \
+            && log "meow binary restored." \
+            || log "WARN: could not restore meow binary."
+        rm -f "$MEOW_BACKUP"
     fi
 }
 
@@ -209,7 +227,7 @@ restore_singbox() {
 cleanup_volatile() {
     /etc/init.d/homeproxy stop 2>/dev/null
     /etc/init.d/homeproxy-web stop 2>/dev/null
-    restore_singbox
+    restore_meow
     rm -f /etc/init.d/homeproxy /etc/init.d/homeproxy-web /etc/profile.d/homeproxy.sh
     rm -rf /etc/homeproxy
     uci -q delete firewall.homeproxy 2>/dev/null; uci -q commit firewall
@@ -232,7 +250,15 @@ log "mode: $([ "$UPGRADE" = 1 ] && echo upgrade || echo fresh-install)"
 
 HP_FW_INC=$(uci -q get firewall.homeproxy 2>/dev/null || echo "")
 HP_FW_PATH=$(uci -q get firewall.homeproxy.path 2>/dev/null || echo "")
-ps w 2>/dev/null | grep -q '[s]ing-box run --config' && HP_WAS_RUNNING=yes || HP_WAS_RUNNING=no
+# Probe for a running proxy BEFORE the swap: meow (current) OR a legacy
+# sing-box left over from a pre-meow install (U8-1) -- otherwise an upgrade
+# that later rolls back would not restart the still-running old service.
+if ps w 2>/dev/null | grep -q '[m]eow -f /var/run/homeproxy/meow-' \
+    || ps w 2>/dev/null | grep -q '[s]ing-box run'; then
+    HP_WAS_RUNNING=yes
+else
+    HP_WAS_RUNNING=no
+fi
 
 # backup code+config+symlinks only. We list the code subdirs explicitly so
 # the bulky resources/ (geodata) is NEVER captured -- avoids doubling ubifs use
@@ -265,50 +291,71 @@ EOF
 mv "$BACKUP_META.tmp" "$BACKUP_META"
 log "backup saved: $BACKUP_TAR"
 
-# -- sing-box (install missing / upgrade to the pinned version) --------------
-sb_want=0
-sb_cur=""
-if [ ! -x "$SINGBOX" ]; then
-    sb_want=1
-elif [ -n "${HP_SINGBOX_URL:-}" ]; then
-    sb_want=1   # explicit URL -> always (re)install
-else
-    # "sing-box version" first line: "sing-box version 1.13.15"
-    sb_cur=$("$SINGBOX" version 2>/dev/null | sed -n 's/^sing-box version //p' | head -n1)
-    [ -n "$sb_cur" ] && [ "$sb_cur" != "$SINGBOX_VER" ] && sb_want=1
-fi
-if [ "$sb_want" = 1 ]; then
-    log "installing sing-box v${SINGBOX_VER} (current: ${sb_cur:-none})..."
-    mkdir -p "$SINGBOX_DIR" /tmp/hp_sb
-    url=${HP_SINGBOX_URL:-$SINGBOX_URL_DEFAULT}
-    fetch "$url" /tmp/hp_sb/sb.tar.gz
-    verify_checksum /tmp/hp_sb/sb.tar.gz "${HP_SINGBOX_SHA256:-$SINGBOX_SHA256}"
-    safe_extract /tmp/hp_sb/sb.tar.gz /tmp/hp_sb
-    sb=$(find /tmp/hp_sb -type f -name sing-box | head -n1)
-    [ -n "$sb" ] || die "sing-box binary not found in archive"
-    chmod 755 "$sb"
+# -- meow (install missing / upgrade to the pinned version) ------------------
+# Install when: HP_MEOW_URL explicitly requests it, no meow binary resolves
+# (neither $MEOW_BIN nor `command -v meow`), or the resolved binary is not the
+# pinned 0.24 series. Sets meow_cur for the caller's log line.
+need_meow() {
+    meow_cur=""
+    # Always probe the installed version FIRST so the caller's log line can
+    # report it ("current: X") even on a forced HP_MEOW_URL reinstall (U8-12).
+    if [ -x "$MEOW_BIN" ]; then
+        # "meow --version" first line looks like "meow 0.24.0" (clap).
+        meow_cur=$("$MEOW_BIN" --version 2>/dev/null | sed -n 's/^meow //p' | head -n1)
+    elif command -v meow >/dev/null 2>&1; then
+        meow_cur=$(meow --version 2>/dev/null | sed -n 's/^meow //p' | head -n1)
+    else
+        return 0   # `command -v meow` finds nothing -> install
+    fi
+    [ -n "${HP_MEOW_URL:-}" ] && return 0   # explicit URL -> always (re)install
+    case "$meow_cur" in
+        0.24*) return 1 ;;   # pinned series already present -> skip
+    esac
+    return 0
+}
+if need_meow; then
+    log "installing meow v${MEOW_VER} (current: ${meow_cur:-none})..."
+    mkdir -p "$MEOW_DIR" /tmp/hp_meow
+    url=${HP_MEOW_URL:-$MEOW_URL_DEFAULT}
+    # Fetch under a neutral name: the payload may be a tarball OR a bare
+    # executable (file:// push of a locally built meow binary, U8-4).
+    fetch "$url" /tmp/hp_meow/meow.dl
+    verify_checksum /tmp/hp_meow/meow.dl "${HP_MEOW_SHA256:-$MEOW_SHA256}"
+    if tar_members /tmp/hp_meow/meow.dl >/dev/null 2>&1; then
+        safe_extract /tmp/hp_meow/meow.dl /tmp/hp_meow
+        m=$(find /tmp/hp_meow -type f -name meow | head -n1)
+        [ -n "$m" ] || die "meow binary not found in archive"
+    else
+        # Non-tar input -> the downloaded file IS the meow binary; it still
+        # goes through the same --version smoke test before the swap below.
+        m=/tmp/hp_meow/meow.dl
+    fi
+    chmod 755 "$m"
     # Sanity-run before swapping: a truncated/corrupt download must never
     # replace a working binary (mv below is a cross-device copy, not atomic).
-    "$sb" version >/dev/null 2>&1 || die "downloaded sing-box fails to execute -- keeping existing binary"
+    "$m" --version >/dev/null 2>&1 || die "downloaded meow fails to execute -- keeping existing binary"
     # Keep the working binary on tmpfs so rollback can restore it -- the
     # backup tarball deliberately excludes it (too large for ubifs).
-    [ -x "$SINGBOX" ] && cp -f "$SINGBOX" "$SB_BACKUP" 2>/dev/null
-    mv -f "$sb" "$SINGBOX" || die "failed to install sing-box binary"
-    chmod 755 "$SINGBOX"
-    "$SINGBOX" version >/dev/null 2>&1 || {
-        restore_singbox
-        die "installed sing-box fails to execute -- restored previous binary"
+    [ -x "$MEOW_BIN" ] && cp -f "$MEOW_BIN" "$MEOW_BACKUP" 2>/dev/null
+    # mv is a cross-device copy (/tmp tmpfs -> /data ubifs), NOT atomic: a
+    # partial copy would leave a truncated binary in place, so on failure
+    # restore the stashed previous binary immediately (U8-3).
+    mv -f "$m" "$MEOW_BIN" || { restore_meow; die "failed to install meow binary"; }
+    chmod 755 "$MEOW_BIN"
+    "$MEOW_BIN" --version >/dev/null 2>&1 || {
+        restore_meow
+        die "installed meow fails to execute -- restored previous binary"
     }
-    rm -rf /tmp/hp_sb
-    log "sing-box installed: $SINGBOX"
+    rm -rf /tmp/hp_meow
+    log "meow installed: $MEOW_BIN"
 fi
 
 # -- fetch + extract homeproxy source ---------------------------------------
 [ -n "$SRC" ] || die "no source: pass a URL/path arg or set HP_SRC_URL"
 WORK=/tmp/hp_install_src
-rm -rf "$WORK" /tmp/hp_sb; mkdir -p "$WORK"
+rm -rf "$WORK" /tmp/hp_meow; mkdir -p "$WORK"
 # EXIT trap: clean temp dirs always; trigger rollback if upgrade failed mid-way (C4).
-trap 'rm -rf "$WORK" /tmp/hp_sb 2>/dev/null; [ "$DONE" = 0 ] && [ "${UPGRADE:-0}" = 1 ] && do_rollback; rmdir "$LOCK" 2>/dev/null' EXIT
+trap 'rm -rf "$WORK" /tmp/hp_meow 2>/dev/null; [ "$DONE" = 0 ] && [ "${UPGRADE:-0}" = 1 ] && do_rollback; rmdir "$LOCK" 2>/dev/null' EXIT
 case "$SRC" in
     https://*)
         log "downloading source: $SRC"
@@ -344,14 +391,23 @@ log "source root: $ROOT"
 # No deploy-time patching: scripts source /etc/homeproxy/env.sh (-> $HP_BASE
 # via the symlink) and fall back to /usr/lib/homeproxy on a standard build.
 mkdir -p "$HP_BASE"
+# HP_MEOW_BIN records the ACTUAL binary path: the persistent copy this
+# installer manages, or a PATH-resolved one (standard-package /usr/bin/meow).
+if [ -x "$MEOW_BIN" ]; then
+    meow_bin=$MEOW_BIN
+else
+    meow_bin=$(command -v meow 2>/dev/null || echo "$MEOW_BIN")
+fi
 log "writing env.sh (persistent path overrides)..."
+# Every var is EXPORTED: sourcing shells must pass them to lua children --
+# os.getenv("HP_MEOW_BIN") etc. only see exported env, not shell-locals (U8-10).
 cat > "$HP_BASE/env.sh.tmp" <<EOF
 # generated by install.sh -- MiWiFi persistent layout overrides
-HP_LIB_DIR=$LIB
-HP_RES_DIR=$RES
-HP_BIN_DIR=$BIN
-HP_SINGBOX=$SINGBOX
-HP_WEBUI_PORT=${HP_WEBUI_PORT:-8910}
+export HP_LIB_DIR=$LIB
+export HP_RES_DIR=$RES
+export HP_BIN_DIR=$BIN
+export HP_MEOW_BIN=$meow_bin
+export HP_WEBUI_PORT=${HP_WEBUI_PORT:-8910}
 EOF
 mv "$HP_BASE/env.sh.tmp" "$HP_BASE/env.sh"
 chmod 644 "$HP_BASE/env.sh"
@@ -433,45 +489,55 @@ log "starting services..."
 /etc/init.d/homeproxy-web start >>"$LOG" 2>&1
 
 # -- verify within TIMEOUT seconds -----------------------------------------
-# A stock-config install legitimately runs no sing-box instance (no node
+# A stock-config install legitimately runs no meow instance (no node
 # configured, server disabled) -- "installed, awaiting configuration" is a
 # success state, so verify the web UI instead of a process that will never
 # exist. Mirrors the start conditions in init.d/homeproxy.
-need_singbox=0
+meow_expected=0
 if [ "$(uci -q get homeproxy.server.enabled 2>/dev/null)" = "1" ]; then
-    need_singbox=1
+    meow_expected=1
 elif [ "$(uci -q get homeproxy.config.routing_mode 2>/dev/null)" = "custom" ]; then
     _o=$(uci -q get homeproxy.routing.default_outbound 2>/dev/null)
-    [ -n "$_o" ] && [ "$_o" != "nil" ] && need_singbox=1
+    [ -n "$_o" ] && [ "$_o" != "nil" ] && meow_expected=1
 else
     _o=$(uci -q get homeproxy.config.main_node 2>/dev/null)
-    [ -n "$_o" ] && [ "$_o" != "nil" ] && need_singbox=1
+    [ -n "$_o" ] && [ "$_o" != "nil" ] && meow_expected=1
 fi
-# Upgrades: a previously running sing-box must come back regardless.
-[ "$HP_WAS_RUNNING" = "yes" ] && need_singbox=1
+# Upgrades: a previously running meow must come back regardless.
+[ "$HP_WAS_RUNNING" = "yes" ] && meow_expected=1
 
+# Process probe: prefer pgrep -f; busybox builds may ship without it, so fall
+# back to `ps w | grep` (the bracket patterns below keep grep from matching
+# its own command line in the ps output). (U8-5)
+proc_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$1" >/dev/null 2>&1
+    else
+        ps w 2>/dev/null | grep -q "$1"
+    fi
+}
 ok=0; i=0
-if [ "$need_singbox" = 0 ]; then
-    log "no node/server configured -- verifying web UI instead of sing-box..."
+if [ "$meow_expected" = 0 ]; then
+    log "no node/server configured -- verifying web UI instead of meow..."
     while [ "$i" -lt "$TIMEOUT" ]; do
-        if pgrep -f 'uhttpd.*homeproxy' >/dev/null 2>&1; then ok=1; break; fi
+        if proc_running '[u]httpd.*homeproxy'; then ok=1; break; fi
         sleep 1; i=$((i+1))
     done
     [ "$ok" = 1 ] && log "installed (unconfigured): web UI up, add a node to start proxying."
 else
-    log "verifying sing-box start (${TIMEOUT}s)..."
+    log "verifying meow start (${TIMEOUT}s)..."
     while [ "$i" -lt "$TIMEOUT" ]; do
-        if pgrep -f 'sing-box run --config' >/dev/null 2>&1; then ok=1; break; fi
+        if proc_running '[m]eow -f /var/run/homeproxy/meow-'; then ok=1; break; fi
         sleep 1; i=$((i+1))
     done
 fi
 
 if [ "$ok" = 1 ]; then
     touch "$CONFIRM_FILE"
-    rm -f "$BACKUP_TAR" "$BACKUP_META" "$SB_BACKUP"
+    rm -f "$BACKUP_TAR" "$BACKUP_META" "$MEOW_BACKUP"
     lip=$(uci -q get network.lan.ipaddr 2>/dev/null || echo 192.168.31.1)
-    if [ "$need_singbox" = 1 ]; then
-        log "OK sing-box running. install/upgrade complete."
+    if [ "$meow_expected" = 1 ]; then
+        log "OK meow running. install/upgrade complete."
     else
         log "OK install complete (proxy starts once a node is configured)."
     fi
@@ -482,8 +548,8 @@ if [ "$ok" = 1 ]; then
     exit 0
 fi
 
-if [ "$need_singbox" = 1 ]; then
-    log "FAILED: sing-box did not start within ${TIMEOUT}s."
+if [ "$meow_expected" = 1 ]; then
+    log "FAILED: meow did not start within ${TIMEOUT}s."
 else
     log "FAILED: web UI did not come up within ${TIMEOUT}s."
 fi

@@ -1,7 +1,7 @@
 #!/bin/sh /etc/rc.common
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# HomeProxy init script (MiWiFi port): runs sing-box via procd, generates
+# HomeProxy init script (MiWiFi port): runs meow via procd, generates
 # configs with the on-device lua, and steers traffic with iptables+ipset.
 
 USE_PROCD=1
@@ -17,11 +17,100 @@ export HP_LUAPATH="$HP_LUA_DIR"
 RUN_DIR="/var/run/homeproxy"
 LOG_PATH="$RUN_DIR/homeproxy.log"
 
-PROG="${HP_SINGBOX:-$(command -v sing-box 2>/dev/null)}"
-[ -n "$PROG" ] || PROG="/usr/bin/sing-box"
+PROG="${HP_MEOW_BIN:-/usr/bin/meow}"
 
 log() {
-    echo -e "$(date "+%Y-%m-%d %H:%M:%S") [DAEMON] $*" >> "$LOG_PATH"
+    printf '%s\n' "$(date "+%Y-%m-%d %H:%M:%S") [DAEMON] $*" >> "$LOG_PATH"
+}
+
+# File-type rule-providers (spec 4.7) resolve their `path` relative to the
+# meow home dir (-d $RUN_DIR), so the generated config references
+# providers/<list>.txt. The canonical lists live in $HP_DIR/resources; the
+# generator does NOT copy them -- sync the ones the current routing_mode can
+# reference into providers/ and drop stale copies this function installed.
+sync_rule_files() {
+    local prov_dir="$RUN_DIR/providers" f want=""
+    mkdir -p "$prov_dir" || return 0
+    # china-domain/gfw-domain and the CN ipcidr lists may be referenced in
+    # any routing_mode (rules and nameserver-policy); direct/proxy-domain
+    # exist only while the user ships those lists; direct-ip/proxy-ip are
+    # custom-mode only.
+    want="china_list.txt gfw_list.txt china_ip4.txt china_ip6.txt"
+    for f in direct_list.txt proxy_list.txt; do
+        [ -s "$HP_DIR/resources/$f" ] && want="$want $f"
+    done
+    if [ "$1" = "custom" ]; then
+        for f in direct_ip.txt proxy_ip.txt; do
+            [ -s "$HP_DIR/resources/$f" ] && want="$want $f"
+        done
+    fi
+    for f in $want; do
+        if [ -f "$HP_DIR/resources/$f" ]; then
+            cp -f "$HP_DIR/resources/$f" "$prov_dir/$f" 2>/dev/null
+        else
+            # A provider whose backing list vanished would fail `meow -t`;
+            # drop the stale copy so the failure is one consistent error.
+            rm -f "$prov_dir/$f"
+            log "Warning: resource $f missing -- rule-providers referencing it will fail."
+        fi
+    done
+    # Prune stale copies of the known resource names (e.g. after a custom ->
+    # bypass mode switch shrank the want set). Unknown files in providers/
+    # (generator/user-placed) are left alone.
+    for f in china_list.txt gfw_list.txt china_ip4.txt china_ip6.txt \
+             direct_list.txt proxy_list.txt direct_ip.txt proxy_ip.txt; do
+        case " $want " in
+            *" $f "*) ;;
+            *) rm -f "$prov_dir/$f" ;;
+        esac
+    done
+}
+
+# One-shot cleanup of the removed TUN arm (spec 3.5/6.6). migrate_config
+# records the old infra.tun_name AND tun_mark as "name mark" in
+# legacy-tun-name before deleting the UCI keys (files written by older
+# revisions carry the name alone); absent pieces fall back to the
+# historical singtun0/102. firewall.sh stop performs the same cleanup --
+# this covers stops where that script was absent or never ran. Everything
+# is best-effort and a no-op once clean.
+cleanup_legacy_tun() {
+    local tfile="$RUN_DIR/legacy-tun-name" tname="" tmark_file="" tmark ttable table_mark _t _n
+    if [ -s "$tfile" ]; then
+        set -- $(cat "$tfile" 2>/dev/null)
+        tname=${1:-}
+        tmark_file=${2:-}
+    fi
+    config_load "$CONF"
+    config_get tmark "infra" "tun_mark" "${tmark_file:-102}"
+    config_get ttable "infra" "tun_table" "102"
+    config_get table_mark "infra" "table_mark" "100"
+    # Drain tun fwmark rules from BOTH tables: older revisions shared
+    # table_mark for tun and tproxy rules before tun_table existed.
+    for _t in "$ttable" "$table_mark"; do
+        while ip rule del fwmark "$tmark" lookup "$_t" 2>/dev/null; do :; done
+        while ip -6 rule del fwmark "$tmark" lookup "$_t" 2>/dev/null; do :; done
+    done
+    for _n in $tname singtun0; do
+        [ -n "$_n" ] || continue
+        ip link show "$_n" >/dev/null 2>&1 || continue
+        ip route del default dev "$_n" table "$ttable" 2>/dev/null
+        ip route del default dev "$_n" table "$table_mark" 2>/dev/null
+        ip -6 route del default dev "$_n" table "$ttable" 2>/dev/null
+        ip -6 route del default dev "$_n" table "$table_mark" 2>/dev/null
+        ip link set "$_n" down 2>/dev/null
+        ip tuntap del mode tun name "$_n" 2>/dev/null || ip link del "$_n" 2>/dev/null
+    done
+    rm -f "$tfile"
+}
+
+# config_foreach callback for the server probe below: flags ANY enabled
+# `config server` section. server_enabled is assigned through dynamic
+# scope, so the caller must declare it before invoking config_foreach.
+server_enabled_probe() {
+    local _en
+    config_get_bool _en "$1" "enabled" "0"
+    [ "$_en" = "1" ] && server_enabled=1
+    return 0
 }
 
 start_service() {
@@ -30,18 +119,26 @@ start_service() {
 
     # Migration must run BEFORE config_load: config_get reads a snapshot
     # captured by config_load, so migrating afterwards would leave this run
-    # using pre-migration values (e.g. an ipv6_support default the migrator
-    # just rewrote) while the generators see the migrated ones.
+    # using pre-migration values (e.g. a legacy proxy_mode or tun_* option
+    # the migrator just rewrote) while the generators see the migrated ones.
     if ! lua "$HP_LUA_DIR/migrate_config.lua" 2>>"$LOG_PATH"; then
         log "Warning: config migration failed (continuing with current config)."
     fi
 
     config_load "$CONF"
 
-    local routing_mode proxy_mode lan_proxy_mode
+    local routing_mode proxy_mode
     config_get routing_mode "config" "routing_mode" "bypass_mainland_china"
     config_get proxy_mode "config" "proxy_mode" "redirect_tproxy"
-    config_get lan_proxy_mode "control" "lan_proxy_mode" "disabled"
+    # Defensive normalization (mirrors firewall.sh): legacy TUN modes and
+    # unknown values degrade to redirect_tproxy, the strongest surviving
+    # combination. migrate_config already rewrote them; this is a fallback.
+    case "$proxy_mode" in
+        redirect|tproxy|redirect_tproxy) ;;
+        *)
+            log "Warning: unknown/legacy proxy_mode='$proxy_mode' -- treating as redirect_tproxy."
+            proxy_mode="redirect_tproxy" ;;
+    esac
 
     local outbound_node
     if [ "$routing_mode" != "custom" ]; then
@@ -50,49 +147,81 @@ start_service() {
         config_get outbound_node "routing" "default_outbound" "nil"
     fi
 
+    # meow-s runs when the master switch (the 'server' settings section) is
+    # on OR any `config server` section is enabled -- the old probe read
+    # only the named section and missed per-section enables entirely.
     local server_enabled
     config_get_bool server_enabled "server" "enabled" "0"
+    [ "$server_enabled" = "1" ] || config_foreach server_enabled_probe server
 
     if [ "$outbound_node" = "nil" ] && [ "$server_enabled" = "0" ]; then
         return 1
     fi
 
     if [ "$outbound_node" != "nil" ]; then
+        # spec 4.7: file rule-providers read their lists from
+        # $RUN_DIR/providers/ -- sync before generation/validation.
+        sync_rule_files "$routing_mode"
+
+        # Keep the last-known-good yaml: on final validation failure the
+        # previous file is restored (spec 8.1: abort keeps the old yaml).
+        local cprev=""
+        if [ -e "$RUN_DIR/meow-c.yaml" ]; then
+            cp -f "$RUN_DIR/meow-c.yaml" "$RUN_DIR/meow-c.yaml.hp-prev" 2>/dev/null && cprev=1
+        fi
         lua "$HP_LUA_DIR/generate_client.lua" 2>>"$LOG_PATH"
-        if [ ! -e "$RUN_DIR/sing-box-c.json" ]; then
+        if [ ! -e "$RUN_DIR/meow-c.yaml" ]; then
             log "Error: failed to generate client configuration."
+            [ "$cprev" = "1" ] && mv -f "$RUN_DIR/meow-c.yaml.hp-prev" "$RUN_DIR/meow-c.yaml"
             return 1
-        elif ! "$PROG" check --config "$RUN_DIR/sing-box-c.json" 2>>"$LOG_PATH"; then
-            # A bad *unused* node (now materialized as a probe outbound for the
+        elif ! "$PROG" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR" 2>>"$LOG_PATH"; then
+            # A bad *unused* node (materialized as a probe outbound for the
             # web UI per-node ping) can fail the whole-config check. Retry
             # without the probe outbounds so a single malformed node never
             # blocks startup; ping-all is simply unavailable for that run.
             log "Config check failed; retrying without per-node probe outbounds..."
             HP_MATERIALIZE_ALL_NODES=0 lua "$HP_LUA_DIR/generate_client.lua" 2>>"$LOG_PATH"
-            if [ ! -e "$RUN_DIR/sing-box-c.json" ] || ! "$PROG" check --config "$RUN_DIR/sing-box-c.json" 2>>"$LOG_PATH"; then
+            if [ ! -e "$RUN_DIR/meow-c.yaml" ] || ! "$PROG" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR" 2>>"$LOG_PATH"; then
                 log "Error: wrong client configuration detected."
+                [ "$cprev" = "1" ] && mv -f "$RUN_DIR/meow-c.yaml.hp-prev" "$RUN_DIR/meow-c.yaml"
                 return 1
             fi
             log "Config OK after disabling per-node probe outbounds (ping-all unavailable this run)."
         fi
+        rm -f "$RUN_DIR/meow-c.yaml.hp-prev"
     fi
 
-    # Generate + validate server config (H9: both configs must be validated
-    # BEFORE any routing/tun/cron/firewall state mutation so a failure in
-    # either doesn't leave the system half-applied.  Outside the client block
-    # so server-only mode also works.)
+    # Generate + validate server config (both configs must be validated
+    # BEFORE any routing/firewall state mutation so a failure in either
+    # doesn't leave the system half-applied. Outside the client block so
+    # server-only mode also works.)
     if [ "$server_enabled" = "1" ]; then
+        local sprev=""
+        if [ -e "$RUN_DIR/meow-s.yaml" ]; then
+            cp -f "$RUN_DIR/meow-s.yaml" "$RUN_DIR/meow-s.yaml.hp-prev" 2>/dev/null && sprev=1
+        fi
         lua "$HP_LUA_DIR/generate_server.lua" 2>>"$LOG_PATH"
-        if [ ! -e "$RUN_DIR/sing-box-s.json" ]; then
+        local src=$?
+        if [ "$src" = "2" ]; then
+            # Zero usable server sections (every enabled one quarantined):
+            # the generator exits 2 instead of writing a listener-less
+            # yaml. Not a start failure -- continue with the client and
+            # simply do not run meow-s.
+            log "generate_server: no usable server sections -- meow-s skipped."
+            server_enabled=0
+        elif [ "$src" != "0" ] || [ ! -e "$RUN_DIR/meow-s.yaml" ]; then
             log "Error: failed to generate server configuration."
+            [ "$sprev" = "1" ] && mv -f "$RUN_DIR/meow-s.yaml.hp-prev" "$RUN_DIR/meow-s.yaml"
             return 1
-        elif ! "$PROG" check --config "$RUN_DIR/sing-box-s.json" 2>>"$LOG_PATH"; then
+        elif ! "$PROG" -f "$RUN_DIR/meow-s.yaml" -t -d "$RUN_DIR" 2>>"$LOG_PATH"; then
             log "Error: wrong server configuration detected."
+            [ "$sprev" = "1" ] && mv -f "$RUN_DIR/meow-s.yaml.hp-prev" "$RUN_DIR/meow-s.yaml"
             return 1
         fi
+        rm -f "$RUN_DIR/meow-s.yaml.hp-prev"
     fi
 
-    # All configs validated — now safe to mutate routing/firewall state (H9).
+    # All configs validated -- now safe to mutate routing/firewall state.
     if [ "$outbound_node" != "nil" ]; then
         # auto subscription update
         local auto_update auto_update_time
@@ -111,75 +240,44 @@ start_service() {
             /etc/init.d/cron restart >/dev/null 2>&1
         fi
 
-        # routing table for tproxy / tun
-        local table_mark
-        config_get table_mark "infra" "table_mark" "100"
-        local ipv6_support
-        config_get_bool ipv6_support "config" "ipv6_support" "0"
-        # tproxy and tun are independent arms (a case would make the tun arm
-        # unreachable for tproxy_tun): tproxy_tun needs BOTH the fwmark/lo
-        # routing for TPROXYed traffic AND the tun device/rules for the rest.
-        if echo "$proxy_mode" | grep -q tproxy; then
-            local outbound_udp_node tproxy_mark
-            config_get outbound_udp_node "config" "main_udp_node" "nil"
-            config_get tproxy_mark "infra" "tproxy_mark" "101"
-            # fwmark rule + lo local route: needed for UDP tproxy, and also
-            # for TCP tproxy in modes without a redirect inbound.
-            if [ "$outbound_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ] \
-                || ! echo "$proxy_mode" | grep -q redirect; then
-                ip rule add fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null
-                ip route add local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
-                if [ "$ipv6_support" = "1" ]; then
-                    ip -6 rule add fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null
-                    ip -6 route add local ::/0 dev lo table "$table_mark" 2>/dev/null
-                fi
-            fi
-        fi
-        if echo "$proxy_mode" | grep -q tun; then
-            local tun_name tun_mark tun_table
-            config_get tun_name "infra" "tun_name" "singtun0"
-            config_get tun_mark "infra" "tun_mark" "102"
-            # TUN-marked traffic needs a default route via the tun device;
-            # tproxy-marked traffic needs a local/lo route. They must not
-            # share a table: a single table can only hold one of the two.
-            config_get tun_table "infra" "tun_table" "102"
-            ip tuntap add mode tun user root name "$tun_name" 2>/dev/null
-            sleep 1
-            ip link set "$tun_name" up 2>/dev/null
-            ip route replace default dev "$tun_name" table "$tun_table" 2>/dev/null
-            ip rule add fwmark "$tun_mark" lookup "$tun_table" 2>/dev/null
-            [ "$ipv6_support" = "1" ] && {
-                ip -6 route replace default dev "$tun_name" table "$tun_table" 2>/dev/null
-                ip -6 rule add fwmark "$tun_mark" lookup "$tun_table" 2>/dev/null
-            }
-        fi
+        # Policy routing for the UDP-TPROXY arm (spec 6.2) is installed by
+        # firewall.sh -- the single owner -- right before its marking rules.
+        # Do NOT add it here: stop_fw already drains any leftovers, and the
+        # stop_service drain below stays as the belt-and-suspenders sweep.
+    fi
 
-        # sing-box (client)
-        [ -e "$RUN_DIR/sing-box-c.log" ] && : > "$RUN_DIR/sing-box-c.log"
-        procd_open_instance "sing-box-c"
-        procd_set_param command "$PROG"
-        procd_append_param command run --config "$RUN_DIR/sing-box-c.json"
-        uname -r | grep -Eq "^6\.6" && procd_set_param env "QUIC_GO_DISABLE_GSO"="true"
-        procd_set_param limits core="unlimited"
-        procd_set_param limits nofile="1000000 1000000"
-        procd_set_param stderr 1
-        procd_set_param stdout 1
-        procd_set_param respawn ${respawn_threshold:-360} ${respawn_timeout:-5} ${respawn_retry:-5}
+    # firewall (iptables+ipset). The flag gates the fw3 include: it must be
+    # set whenever start succeeded -- even with lan_proxy_mode=disabled, the
+    # server filter accepts it installs must survive a firewall reload.
+    if sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"; then
+        : > "$RUN_DIR/firewall.active"
+    else
+        log "Error: firewall.sh failed; firewall rules not applied."
+    fi
+
+    if [ "$outbound_node" != "nil" ]; then
+        # meow (client). Old procd cannot point stdout/stderr at a file, so
+        # the command runs under `sh -c` with a redirection into meow-c.log;
+        # `exec` keeps meow the tracked process and preserves the argv
+        # pattern the process probes match ("meow -f /var/run/homeproxy/meow-").
+        [ -e "$RUN_DIR/meow-c.log" ] && : > "$RUN_DIR/meow-c.log"
+        procd_open_instance "meow-c"
+        procd_set_param command /bin/sh -c "exec $PROG -f $RUN_DIR/meow-c.yaml -d $RUN_DIR --no-external-plugins >>$RUN_DIR/meow-c.log 2>&1"
+        [ -n "${HP_MATERIALIZE_ALL_NODES:-}" ] && procd_set_param env "HP_MATERIALIZE_ALL_NODES=$HP_MATERIALIZE_ALL_NODES"
+        procd_set_param limits core="unlimited" nofile="1000000 1000000"
+        procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
         procd_set_param term_timeout 15
         procd_close_instance
     fi
 
     if [ "$server_enabled" = "1" ]; then
-        [ -e "$RUN_DIR/sing-box-s.log" ] && : > "$RUN_DIR/sing-box-s.log"
-        procd_open_instance "sing-box-s"
-        procd_set_param command "$PROG"
-        procd_append_param command run --config "$RUN_DIR/sing-box-s.json"
-        uname -r | grep -Eq "^6\.6" && procd_set_param env "QUIC_GO_DISABLE_GSO"="true"
-        procd_set_param limits core="unlimited"
-        procd_set_param limits nofile="1000000 1000000"
-        procd_set_param stderr 1
-        procd_set_param stdout 1
-        procd_set_param respawn ${respawn_threshold:-360} ${respawn_timeout:-5} ${respawn_retry:-5}
+        # meow (server) -- same sh -c redirection rationale as the client.
+        [ -e "$RUN_DIR/meow-s.log" ] && : > "$RUN_DIR/meow-s.log"
+        procd_open_instance "meow-s"
+        procd_set_param command /bin/sh -c "exec $PROG -f $RUN_DIR/meow-s.yaml -d $RUN_DIR --no-external-plugins >>$RUN_DIR/meow-s.log 2>&1"
+        [ -n "${HP_MATERIALIZE_ALL_NODES:-}" ] && procd_set_param env "HP_MATERIALIZE_ALL_NODES=$HP_MATERIALIZE_ALL_NODES"
+        procd_set_param limits core="unlimited" nofile="1000000 1000000"
+        procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
         procd_set_param term_timeout 15
         procd_close_instance
     fi
@@ -190,27 +288,31 @@ start_service() {
     procd_set_param respawn
     procd_close_instance
 
-    case "$routing_mode" in
-    "bypass_mainland_china") [ -e "$RUN_DIR/cache.db" ] || touch "$RUN_DIR/cache.db" ;;
-    "custom") [ -d "$HP_DIR/ruleset" ] || mkdir -p "$HP_DIR/ruleset" ;;
-    esac
+    # File-type rule-providers resolve `path` relative to the meow home dir
+    # (-d $RUN_DIR): usable lists must live inside $RUN_DIR -- the
+    # convention is providers/<list>.txt, synced by sync_rule_files above.
+    # No $HP_DIR/ruleset dir is created: paths outside $RUN_DIR never
+    # resolve, so the old mkdir was a dead convention.
 
     [ "$server_enabled" = "1" ] && mkdir -p "$HP_DIR/certs"
 
-    # firewall (iptables+ipset). The flag gates the fw3 include: it must be
-    # set whenever start succeeded -- even with lan_proxy_mode=disabled, the
-    # server/tun filter accepts it installs must survive a firewall reload.
-    if sh "$HP_LUA_DIR/firewall.sh" start 2>>"$LOG_PATH"; then
-        : > "$RUN_DIR/firewall.active"
-    else
-        log "Error: firewall.sh failed; firewall rules not applied."
-    fi
-
     # DNS steering via dnsmasq conf-dir (mirrors upstream init.homeproxy):
-    # dnsmasq forwards selected domains to sing-box DNS (infra.dns_port) and,
+    # dnsmasq forwards selected domains to meow DNS (infra.dns_port) and,
     # where needed, populates an ipset the firewall matches against. The
-    # firewall.sh run above already created those ipsets.
-    if [ "$outbound_node" != "nil" ]; then
+    # firewall.sh run above already created those ipsets. NOTE: procd only
+    # registers the instances above -- the actual spawn happens when
+    # start_service returns, so for a brief window dnsmasq may forward to a
+    # not-yet-listening meow DNS port; that transient is accepted.
+    # infra.dns_redirect=0 disables the whole arm: drop stale confs first
+    # (a previous run's directives must not linger), then skip the block.
+    local dns_redirect
+    config_get_bool dns_redirect "infra" "dns_redirect" "1"
+    if [ "$dns_redirect" != "1" ]; then
+        if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
+            rm -f /tmp/dnsmasq.d/homeproxy_*.conf
+            /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        fi
+    elif [ "$outbound_node" != "nil" ]; then
         local hp_dns_port
         config_get hp_dns_port "infra" "dns_port" "5333"
         mkdir -p /tmp/dnsmasq.d
@@ -233,7 +335,7 @@ start_service() {
         done
         case "$routing_mode" in
         "bypass_mainland_china"|"custom"|"global")
-            # forward ALL queries to sing-box DNS; sing-box splits CN/non-CN.
+            # forward ALL queries to meow DNS; meow splits CN/non-CN.
             printf 'no-poll\nno-resolv\nserver=127.0.0.1#%s\n' "$hp_dns_port" > /tmp/dnsmasq.d/homeproxy_redirect_dns.conf
             ;;
         "gfwlist")
@@ -255,7 +357,7 @@ start_service() {
             fi
             ;;
         esac
-        # proxy_list.txt: always-proxy domains -> sing-box DNS + wan_proxy ipset.
+        # proxy_list.txt: always-proxy domains -> meow DNS + wan_proxy ipset.
         if [ "$routing_mode" != "custom" ] && [ -s "$HP_DIR/resources/proxy_list.txt" ]; then
             awk -v dp="$hp_dns_port" -v st="$wan_sets" \
                 '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"")} !NF||/^#/||$0!~/^[A-Za-z0-9._-]+$/ {next} {print "server=/"$0"/127.0.0.1#"dp; if (length(st)) print "ipset=/"$0"/"st}' \
@@ -272,7 +374,7 @@ start_service() {
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
 
-    log "HomeProxy started (sing-box: $("$PROG" version -n 2>/dev/null | head -1))."
+    log "HomeProxy started (meow: $("$PROG" --version 2>/dev/null | head -1))."
 }
 
 stop_service() {
@@ -285,57 +387,47 @@ stop_service() {
     # The 2>> redirect below fails (and silently skips the whole teardown)
     # when RUN_DIR is absent, e.g. after an unexpected /var/run cleanup.
     mkdir -p "$RUN_DIR"
+    # spec 6.6.1-4: chain jumps + chains, ipsets, policy rules/routes and the
+    # legacy tun device are all torn down inside firewall.sh stop.
     sh "$HP_LUA_DIR/firewall.sh" stop 2>>"$LOG_PATH"
     rm -f "$RUN_DIR/firewall.active"
 
-    # remove dnsmasq DNS steering (any routing mode)
+    # remove dnsmasq DNS steering (any routing mode) -- spec 6.6.5
     if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
         rm -f /tmp/dnsmasq.d/homeproxy_*.conf
         /etc/init.d/dnsmasq restart >/dev/null 2>&1
     fi
 
-    local table_mark tun_table
+    # Drain the policy routing init.d installs for the UDP-TPROXY arm
+    # (spec 6.6.3). firewall.sh stop already drains it; repeating here is
+    # idempotent and also covers rules installed without a pref by older
+    # revisions of this script.
+    local table_mark tproxy_mark
     config_load "$CONF"
     config_get table_mark "infra" "table_mark" "100"
-    config_get tun_table "infra" "tun_table" "102"
-    local tproxy_mark tun_mark
     config_get tproxy_mark "infra" "tproxy_mark" "101"
-    config_get tun_mark "infra" "tun_mark" "102"
-    # Drain duplicate ip rules (from race conditions / double-start).
     while ip rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
-    ip route del local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
     while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
-    ip -6 route del local ::/0 dev lo table "$table_mark" 2>/dev/null
-    # tun rules live in tun_table now; also drain table_mark to clean up
-    # rules written by versions that shared one table for both marks.
-    for _t in "$tun_table" "$table_mark"; do
-        while ip rule del fwmark "$tun_mark" lookup "$_t" 2>/dev/null; do :; done
-        while ip -6 rule del fwmark "$tun_mark" lookup "$_t" 2>/dev/null; do :; done
-    done
+    ip route del local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
+    ip route flush table "$table_mark" 2>/dev/null
+    ip -6 route flush table "$table_mark" 2>/dev/null
 
-    # Tear down the tun device (H10: was only in service_stopped, which is not
-    # called from reload_service's stop).
-    local tun_name
-    config_get tun_name "infra" "tun_name" "singtun0"
-    ip route del default dev "$tun_name" table "$tun_table" 2>/dev/null
-    ip route del default dev "$tun_name" table "$table_mark" 2>/dev/null
-    ip -6 route del default dev "$tun_name" table "$tun_table" 2>/dev/null
-    ip -6 route del default dev "$tun_name" table "$table_mark" 2>/dev/null
-    ip link set "$tun_name" down 2>/dev/null
-    ip tuntap del mode tun name "$tun_name" 2>/dev/null
+    # spec 6.6.6: generated artifacts go; logs stay.
+    rm -f "$RUN_DIR/meow-c.yaml" "$RUN_DIR/meow-c.yaml.hp-prev" \
+          "$RUN_DIR/meow-s.yaml" "$RUN_DIR/meow-s.yaml.hp-prev" \
+          "$RUN_DIR/unsupported-nodes.json"
 
-    rm -f "$RUN_DIR/sing-box-c.json" "$RUN_DIR/sing-box-c.log" \
-          "$RUN_DIR/sing-box-s.json" "$RUN_DIR/sing-box-s.log"
+    # spec 3.5/6.6.4: one-shot removal of the pre-meow TUN device + its rules.
+    cleanup_legacy_tun
 
     log "Service stopped."
 }
 
 service_stopped() {
-    config_load "$CONF"
-    local tun_name
-    config_get tun_name "infra" "tun_name" "singtun0"
-    ip link set "$tun_name" down 2>/dev/null
-    ip tuntap del mode tun name "$tun_name" 2>/dev/null
+    # procd hook after all instances are down. NOTE: 18.06's procd never
+    # invokes service_stopped -- this is an idempotent safety net only
+    # (same one-shot legacy-TUN sweep as stop_service).
+    cleanup_legacy_tun
 }
 
 reload_service() {

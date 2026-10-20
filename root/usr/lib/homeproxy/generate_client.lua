@@ -1,20 +1,25 @@
 #!/usr/bin/lua
 -- SPDX-License-Identifier: GPL-2.0-only
--- HomeProxy client config generator (Lua port of generate_client.uc).
--- Reads /etc/config/homeproxy via the uci Lua binding and emits the
--- sing-box client JSON to /var/run/homeproxy/sing-box-c.json.
+-- HomeProxy client config generator for meow-rs (mihomo schema).
+-- Reads /etc/config/homeproxy via the uci Lua binding and emits the client
+-- config to /var/run/homeproxy/meow-c.yaml. The payload is JSON text, which
+-- is also valid YAML 1.2, so the existing luci.json encoder is reused.
 
 package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
 
 local hp   = require("homeproxy")
+local sp   = require("subscription_parser")
 local uci  = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 
 local UCICONFIG = "homeproxy"
 uci:load(UCICONFIG)
 
 -- Remove any stale output up front: an error()/os.exit mid-generation must
--- not leave a previous JSON that init.d's existence check would then pass.
-os.remove(hp.RUN_DIR .. "/sing-box-c.json")
+-- not leave a previous file that init.d's existence check would then pass.
+-- unsupported-nodes.json is deliberately NOT pre-deleted: it is a shared
+-- file partitioned by `role` (see flush_unsupported at the bottom); this
+-- run only replaces the role="client" partition on a successful write.
+os.remove(hp.RUN_DIR .. "/meow-c.yaml")
 
 local UCIINFRA = "infra"
 local UCIMAIN  = "config"
@@ -28,892 +33,1378 @@ local UCIROUTINGRULE = "routing_rule"
 local UCINODE = "node"
 local UCIRULESET = "ruleset"
 
+local MEOW_FILE = hp.RUN_DIR .. "/meow-c.yaml"
+local UNSUPPORTED_FILE = hp.RUN_DIR .. "/unsupported-nodes.json"
+
 local function uget(sec, opt) return uci:get(UCICONFIG, sec, opt) end
 local function isEmpty(v) return hp.isEmpty(v) end
 local function strToBool(v) return hp.strToBool(v) end
 local function strToInt(v) return hp.strToInt(v) end
-local function strToTime(v) return hp.strToTime(v) end
 local function push(t, v) t[#t + 1] = v end
-local function map(arr, fn)
-    if not arr then return nil end
-    if type(arr) ~= "table" then arr = { arr } end
-    local out = {}
-    -- Skip nil results: writing fn(v) at index i leaves a sparse table that
-    -- clean() then encodes as a JSON *object* where sing-box needs an array.
-    for _, v in ipairs(arr) do
-        local r = fn(v)
-        if r ~= nil then out[#out + 1] = r end
-    end
-    return out
-end
 local function filter(arr, fn)
-    if not arr then return {} end
-    if type(arr) ~= "table" then arr = { arr } end
-    local out = {}
-    for _, v in ipairs(arr) do if fn(v) then out[#out + 1] = v end end
-    return out
+	if not arr then return {} end
+	if type(arr) ~= "table" then arr = { arr } end
+	local out = {}
+	for _, v in ipairs(arr) do if fn(v) then out[#out + 1] = v end end
+	return out
 end
 local function contains(arr, val)
-    if not arr then return false end
-    if type(arr) ~= "table" then arr = { arr } end
-    for _, v in ipairs(arr) do if v == val then return true end end
-    return false
+	if not arr then return false end
+	if type(arr) ~= "table" then arr = { arr } end
+	for _, v in ipairs(arr) do if v == val then return true end end
+	return false
+end
+local function warn(fmt, ...)
+	local msg = select("#", ...) > 0 and string.format(fmt, ...) or fmt
+	io.stderr:write("homeproxy: WARNING: " .. msg .. "\n")
+end
+
+-- Normalize "60"/"60s"/"2m"/"1h"/"1d" to integer seconds; meow wants u64.
+local function secs(v)
+	if isEmpty(v) then return nil end
+	if type(v) == "number" then return math.floor(v) end
+	local n, unit = tostring(v):match("^%s*(%d+)%s*([smhd]?)%s*$")
+	if not n then return nil end
+	n = tonumber(n)
+	if unit == "m" then n = n * 60
+	elseif unit == "h" then n = n * 3600
+	elseif unit == "d" then n = n * 86400 end
+	return n
+end
+
+-- Comma string or UCI list -> array of trimmed strings.
+local function str_list(v)
+	if type(v) ~= "table" then
+		if isEmpty(v) then return nil end
+		v = { v }
+	end
+	local out = {}
+	for _, item in ipairs(v) do
+		for part in tostring(item):gmatch("[^,]+") do
+			part = part:match("^%s*(.-)%s*$")
+			if part ~= "" then out[#out + 1] = part end
+		end
+	end
+	return out
 end
 
 local function get_wan_dns()
-    -- Reject loopback/unspecified resolvers: they point back at the local
-    -- dnsmasq, which forwards right into sing-box -- a resolution loop.
-    -- A UCI "dns" list is a table; take its first entry.
-    local function valid_ns(ns)
-        if type(ns) == "table" then ns = ns[1] end
-        if type(ns) ~= "string" or ns == "" then return nil end
-        if ns:match("^127%.") or ns == "::1" or ns == "0.0.0.0" or ns == "::" then return nil end
-        return hp.validation("ipaddr", ns) and ns or nil
-    end
-    for _, p in ipairs({ "/tmp/resolv.conf.auto", "/tmp/resolv.conf.d/resolv.conf.auto",
-                        "/tmp/resolv.conf" }) do
-        local f = io.open(p, "r")
-        if f then
-            for line in f:lines() do
-                local ns = valid_ns(line:match("^%s*nameserver%s+([%d%.:%a]+)"))
-                if ns then f:close(); return ns end
-            end
-            f:close()
-        end
-    end
-    return valid_ns(uci:get("network", "wan", "dns"))
+	local function valid_ns(ns)
+		if isEmpty(ns) or
+			ns == "0.0.0.0" or ns == "127.0.0.1" or ns == "::" or ns == "::1" or
+			ns:match("^127%.") then
+			return false
+		end
+		return true
+	end
+	local wan_dns
+	local f = {"/tmp/resolv.conf.auto", "/tmp/resolv.conf.d/resolv.conf.auto", "/tmp/resolv.conf"}
+	for _, file in ipairs(f) do
+		local resolv = hp.readfile(file)
+		if resolv then
+			for ns in resolv:gmatch("nameserver%s+([%x:%.%x]+)") do
+				if valid_ns(ns) then
+					wan_dns = ns
+					break
+				end
+			end
+		end
+		if wan_dns then break end
+	end
+	if not wan_dns then
+		local net_dump = uci:get_all("network", "wan") or {}
+		local uci_dns = net_dump.dns
+		if type(uci_dns) ~= "table" then uci_dns = uci_dns and { uci_dns } or {} end
+		for _, ns in ipairs(uci_dns) do
+			if valid_ns(ns) then
+				wan_dns = ns
+				break
+			end
+		end
+	end
+	return wan_dns
 end
 
+---------------------------------------------------------------------------
+-- Quarantine bookkeeping (spec §4.6): every rejected node/provider is warned
+-- once on stderr and accumulated for unsupported-nodes.json.
+---------------------------------------------------------------------------
+local unsupported_nodes = {}
+local quarantined = {}          -- section name -> true
+local function quarantine(name, type_, reason)
+	if not quarantined[name] then
+		quarantined[name] = true
+		push(unsupported_nodes, { name = name, type = type_, reason = reason,
+			source = "uci", role = "client" })
+	end
+	warn("node '%s' (%s) quarantined: %s", tostring(name), tostring(type_), tostring(reason))
+end
+
+---------------------------------------------------------------------------
+-- Config extraction (same UCI reads as the sing-box generator; only the
+-- semantics of the emitted fields changed).
+---------------------------------------------------------------------------
 local routing_mode = uget(UCIMAIN, "routing_mode") or "bypass_mainland_china"
+if not contains({ "bypass_mainland_china", "proxy_mainland_china", "gfwlist", "global", "custom" }, routing_mode) then
+	warn("unknown routing_mode '%s' -- using bypass_mainland_china.", tostring(routing_mode))
+	routing_mode = "bypass_mainland_china"
+end
 
 local wan_dns = get_wan_dns()
 if isEmpty(wan_dns) then
-    wan_dns = (routing_mode == "proxy_mainland_china" or routing_mode == "global")
-        and "8.8.8.8" or "223.5.5.5"
+	wan_dns = (routing_mode == "proxy_mainland_china" or routing_mode == "global")
+		and "8.8.8.8" or "223.5.5.5"
 end
 
-local dns_port = uget(UCIINFRA, "dns_port") or "5333"
-local ntp_server = uget(UCIINFRA, "ntp_server") or "time.apple.com"
+local dns_port = strToInt(uget(UCIINFRA, "dns_port")) or 5333
 local ipv6_support = uget(UCIMAIN, "ipv6_support") or "0"
 
-local main_node, main_udp_node, dedicated_udp_node, default_outbound, default_outbound_dns,
-      domain_strategy, dns_server, dns_server_proto, china_dns_server, dns_default_strategy,
-      dns_default_server, dns_disable_cache, dns_disable_cache_expire, dns_independent_cache,
-      dns_client_subnet, cache_file_store_rdrc, cache_file_rdrc_timeout,
+local main_node, main_udp_node, dedicated_udp_node, default_outbound,
+      dns_server, china_dns_server,
       direct_domain_list, proxy_domain_list
 
 if routing_mode ~= "custom" then
-    main_node = uget(UCIMAIN, "main_node") or "nil"
-    main_udp_node = uget(UCIMAIN, "main_udp_node") or "nil"
+	main_node = uget(UCIMAIN, "main_node") or "nil"
+	main_udp_node = uget(UCIMAIN, "main_udp_node") or "nil"
 
-    -- A main_node/main_udp_node pointing at a deleted section would emit
-    -- route.final="main-out" / a udp rule with no such outbound -> sing-box
-    -- check fails and the whole service refuses to start. Fall back instead.
-    local function node_exists(name)
-        local s = not isEmpty(name) and uci:get_all(UCICONFIG, name) or nil
-        return type(s) == "table" and s[".type"] == "node"
-    end
-    if main_node ~= "urltest" and not isEmpty(main_node) and not node_exists(main_node) then
-        io.stderr:write("homeproxy: WARNING: main_node '" .. tostring(main_node)
-            .. "' does not exist -- falling back to direct.\n")
-        main_node = "nil"
-    end
+	-- A main_node/main_udp_node pointing at a deleted section would emit a
+	-- dangling target; fall back to direct instead of breaking the config.
+	local function node_exists(name)
+		local s = not isEmpty(name) and uci:get_all(UCICONFIG, name) or nil
+		return type(s) == "table" and s[".type"] == UCINODE
+	end
+	if main_node ~= "urltest" and not isEmpty(main_node) and not node_exists(main_node) then
+		warn("main_node '%s' does not exist -- falling back to direct.", tostring(main_node))
+		main_node = "nil"
+	end
 
-    -- main_udp_node="urltest" names an independent group even when main_node
-    -- is also "urltest" -- the plain ~= comparison would treat them as one
-    -- node and never route UDP to main-udp-out.
-    dedicated_udp_node = not isEmpty(main_udp_node)
-        and main_udp_node ~= "same"
-        and (main_udp_node == "urltest" or main_udp_node ~= main_node)
-    if dedicated_udp_node and main_udp_node ~= "urltest" and not node_exists(main_udp_node) then
-        io.stderr:write("homeproxy: WARNING: main_udp_node '" .. tostring(main_udp_node)
-            .. "' does not exist -- UDP falls back to the main node.\n")
-        main_udp_node = "same"
-        dedicated_udp_node = false
-    end
+	-- main_udp_node="urltest" names an independent group even when main_node
+	-- is also "urltest"; the plain ~= comparison would treat them as one.
+	dedicated_udp_node = not isEmpty(main_udp_node)
+		and main_udp_node ~= "same"
+		and (main_udp_node == "urltest" or main_udp_node ~= main_node)
+	if dedicated_udp_node and main_udp_node ~= "urltest" and not node_exists(main_udp_node) then
+		warn("main_udp_node '%s' does not exist -- UDP falls back to the main node.", tostring(main_udp_node))
+		main_udp_node = "same"
+		dedicated_udp_node = false
+	end
 
-    dns_server = uget(UCIMAIN, "dns_server")
-    -- Bare "wan"/unset means the ISP resolver -- plain UDP; DoH would fail.
-    -- An explicit bare IP keeps the deliberate DoH upgrade (see main-dns).
-    dns_server_proto = "https"
-    if isEmpty(dns_server) or dns_server == "wan" then
-        dns_server = wan_dns
-        dns_server_proto = "udp"
-    end
+	dns_server = uget(UCIMAIN, "dns_server")
+	if isEmpty(dns_server) or dns_server == "wan" then
+		dns_server = wan_dns
+	end
+	if routing_mode == "bypass_mainland_china" then
+		china_dns_server = uget(UCIMAIN, "china_dns_server")
+		if isEmpty(china_dns_server) or type(china_dns_server) ~= "string" or china_dns_server == "wan" then
+			china_dns_server = wan_dns
+		end
+	else
+		china_dns_server = wan_dns
+	end
 
-    if routing_mode == "bypass_mainland_china" then
-        china_dns_server = uget(UCIMAIN, "china_dns_server")
-        if isEmpty(china_dns_server) or type(china_dns_server) ~= "string" or china_dns_server == "wan" then
-            china_dns_server = wan_dns
-        end
-    end
-    dns_default_strategy = (ipv6_support ~= "1") and "ipv4_only" or nil
-
-    local function load_list(name)
-        local d = hp.readfile(hp.HP_DIR .. "/resources/" .. name)
-        if not d then return nil end
-        local cl = {}
-        for v in (d .. "\n"):gmatch("([^\r\n]*)") do
-            v = v:match("^%s*(.-)%s*$")
-            if v ~= "" and not v:match("^#") and v:match("^[A-Za-z0-9._-]+$") then
-                cl[#cl + 1] = v
-            end
-        end
-        return next(cl) ~= nil and cl or nil
-    end
-    direct_domain_list = load_list("direct_list.txt")
-    proxy_domain_list  = load_list("proxy_list.txt")
-
+	local function load_list(name)
+		local d = hp.readfile(hp.HP_DIR .. "/resources/" .. name)
+		if not d then return nil end
+		local cl = {}
+		for v in (d .. "\n"):gmatch("([^\r\n]*)") do
+			v = v:match("^%s*(.-)%s*$")
+			if v ~= "" and not v:match("^#") and v:match("^[A-Za-z0-9._-]+$") then
+				cl[#cl + 1] = v
+			end
+		end
+		return next(cl) ~= nil and cl or nil
+	end
+	direct_domain_list = load_list("direct_list.txt")
+	proxy_domain_list  = load_list("proxy_list.txt")
 else
-    dns_default_strategy  = uget(UCIDNS, "default_strategy") or uget(UCIDNS, "dns_strategy")
-    dns_default_server     = uget(UCIDNS, "default_server")
-    -- default_server must resolve to an *enabled* dns_server section (or a
-    -- builtin tag); a dangling or disabled name becomes a cfg-*-dns tag that
-    -- is never emitted, and sing-box rejects the config.
-    if not isEmpty(dns_default_server)
-        and dns_default_server ~= "default-dns" and dns_default_server ~= "system-dns" then
-        local sec = uci:get_all(UCICONFIG, dns_default_server)
-        if not sec or sec.enabled ~= "1" then
-            io.stderr:write("homeproxy: WARNING: dns.default_server '" .. tostring(dns_default_server)
-                .. "' is not an enabled dns_server section -- falling back to system-dns.\n")
-            dns_default_server = "system-dns"
-        end
-    end
-    dns_disable_cache      = uget(UCIDNS, "disable_cache")
-    dns_disable_cache_expire = uget(UCIDNS, "disable_cache_expire")
-    dns_independent_cache  = uget(UCIDNS, "independent_cache")
-    dns_client_subnet      = uget(UCIDNS, "client_subnet")
-    cache_file_store_rdrc  = uget(UCIDNS, "cache_file_store_rdrc")
-    cache_file_rdrc_timeout = uget(UCIDNS, "cache_file_rdrc_timeout")
-
-    default_outbound       = uget(UCIROUTING, "default_outbound") or "nil"
-    default_outbound_dns   = uget(UCIROUTING, "default_outbound_dns") or "default-dns"
-    domain_strategy        = uget(UCIROUTING, "domain_strategy")
+	-- custom mode: routing defaults resolve routing_node / dns_server names.
+	default_outbound = uget(UCIROUTING, "default_outbound") or "nil"
 end
 
 local proxy_mode = uget(UCIMAIN, "proxy_mode") or "redirect_tproxy"
-local default_interface = uget(UCICONTROL, "bind_interface")
-local mixed_port = uget(UCIINFRA, "mixed_port") or "5330"
-
-local self_mark, redirect_port, tproxy_port, tun_name,
-      tun_addr4, tun_addr6, tun_mtu, tcpip_stack,
-      endpoint_independent_nat, udp_timeout
-
-if routing_mode == "custom" then
-    udp_timeout = uget(UCIROUTING, "udp_timeout")
-else
-    udp_timeout = uget(UCIINFRA, "udp_timeout")
+-- Same {redirect,tproxy,redirect_tproxy} vocabulary as init.d /
+-- firewall.sh / the web API: legacy TUN modes and unknown values degrade
+-- to redirect_tproxy (migrate_config already rewrote them; defensive only).
+if not contains({ "redirect", "tproxy", "redirect_tproxy" }, proxy_mode) then
+	warn("unknown/legacy proxy_mode '%s' -- treating as redirect_tproxy.", tostring(proxy_mode))
+	proxy_mode = "redirect_tproxy"
 end
-
--- self_mark must exist in EVERY mode, not just redirect: all outbounds carry
--- it as routing_mark so sing-box egress escapes the firewall's own OUTPUT
--- steering. Without it, tproxy/tun-only modes loop traffic back into sing-box.
-self_mark = uget(UCIINFRA, "self_mark") or "100"
-if not tostring(self_mark):match("^%d+$") then
-    io.stderr:write("homeproxy: WARNING: self_mark '" .. tostring(self_mark)
-        .. "' is not numeric -- using 100.\n")
-    self_mark = "100"
-end
-if proxy_mode:find("redirect") then
-    redirect_port = uget(UCIINFRA, "redirect_port") or "5331"
-end
-if proxy_mode:find("tproxy") then
-    tproxy_port = uget(UCIINFRA, "tproxy_port") or "5332"
-end
-if proxy_mode:find("tun") then
-    tun_name = uget(UCIINFRA, "tun_name") or "singtun0"
-    tun_addr4 = uget(UCIINFRA, "tun_addr4") or "172.19.0.1/30"
-    tun_addr6 = uget(UCIINFRA, "tun_addr6") or "fdfe:dcba:9876::1/126"
-    tun_mtu = uget(UCIINFRA, "tun_mtu") or "9000"
-    tcpip_stack = "system"
-    if routing_mode == "custom" then
-        tcpip_stack = uget(UCIROUTING, "tcpip_stack") or "system"
-        endpoint_independent_nat = uget(UCIROUTING, "endpoint_independent_nat")
-    end
-end
+local mixed_port = strToInt(uget(UCIINFRA, "mixed_port")) or 5330
+local self_mark = strToInt(uget(UCIINFRA, "self_mark")) or 100
+local redirect_port = strToInt(uget(UCIINFRA, "redirect_port")) or 5331
+local v6_port = strToInt(uget(UCIINFRA, "v6_port")) or 5334
+local udp_timeout = (routing_mode == "custom")
+	and uget(UCIROUTING, "udp_timeout") or uget(UCIINFRA, "udp_timeout")
+udp_timeout = secs(udp_timeout) or 60
+if udp_timeout < 1 then udp_timeout = 1 elseif udp_timeout > 86400 then udp_timeout = 86400 end
 
 local log_level = uget(UCIMAIN, "log_level") or "warn"
+-- meow's level whitelist is {debug,info,warning,warn,error,silent}: trace
+-- has no equivalent and degrades to debug; fatal/panic degrade to error
+-- (same mapping as generate_server.lua).
+if log_level == "trace" then log_level = "debug" end
+if log_level == "fatal" or log_level == "panic" then log_level = "error" end
 
--- config helpers
-local function parse_port(strport)
-    if type(strport) ~= "table" or isEmpty(strport) then return nil end
-    return map(strport, function(i)
-        local n = strToInt(i)
-        return (n and n >= 0 and n <= 65535) and n or nil
-    end)
+---------------------------------------------------------------------------
+-- Node -> proxies[] entry. Returns the meow table or nil after quarantine.
+-- Legality precheck is shared with the subscription parser (§4.4).
+---------------------------------------------------------------------------
+local function build_smux(node, mtype)
+	if node.multiplex ~= "1" then return nil end
+	local proto = not isEmpty(node.multiplex_protocol) and node.multiplex_protocol or nil
+	if proto == "muxcool" and mtype ~= "vless" and mtype ~= "vmess" then
+		return nil, "mux protocol 'muxcool' is VLESS/VMess-only on meow"
+	end
+	if mtype == "vless" and node.vless_flow == "xtls-rprx-vision" and proto ~= "muxcool" then
+		return nil, "vless flow xtls-rprx-vision requires muxcool (or no) multiplexing"
+	end
+	local padding = strToBool(node.multiplex_padding)
+	if proto == "muxcool" and padding then
+		return nil, "smux 'padding' is sing-mux only; muxcool has no padding layer"
+	end
+	-- statistic/brutal-opts are parsed-but-unsupported upstream: drop silently.
+	return {
+		enabled = true,
+		protocol = proto,
+		["max-connections"] = strToInt(node.multiplex_max_connections),
+		["min-streams"] = strToInt(node.multiplex_min_streams),
+		["max-streams"] = strToInt(node.multiplex_max_streams),
+		padding = padding,
+		["only-tcp"] = strToBool(node.multiplex_only_tcp),
+	}
 end
 
-local function parse_dnsserver(server_addr, default_protocol)
-    if isEmpty(server_addr) then return nil end
-    if not tostring(server_addr):find("://") then
-        server_addr = (default_protocol or "udp") .. "://"
-            .. (hp.validation("ip6addr", server_addr) and ("[" .. server_addr .. "]") or server_addr)
-    end
-    server_addr = hp.parseURL(server_addr)
-    if not server_addr then return nil end
-    return {
-        type = server_addr.protocol,
-        server = server_addr.hostname,
-        server_port = strToInt(server_addr.port),
-        path = (server_addr.pathname ~= "/") and server_addr.pathname or nil,
-    }
+local function apply_transport(p, node)
+	local t = node.transport
+	if isEmpty(t) or t == "tcp" then return end
+	p.network = t
+	if t == "ws" then
+		p["ws-opts"] = {
+			path = node.ws_path,
+			headers = not isEmpty(node.ws_host) and { Host = node.ws_host } or nil,
+			["max-early-data"] = strToInt(node.websocket_early_data),
+			["early-data-header-name"] = node.websocket_early_data_header,
+		}
+	elseif t == "grpc" then
+		p["grpc-opts"] = { ["grpc-service-name"] = node.grpc_servicename }
+	elseif t == "h2" then
+		p["h2-opts"] = {
+			host = str_list(node.http_host),
+			path = (type(node.http_path) == "table") and node.http_path[1] or node.http_path,
+			["idle-timeout"] = secs(node.http_idle_timeout),
+			["ping-timeout"] = secs(node.http_ping_timeout),
+		}
+	elseif t == "httpupgrade" then
+		p["http-upgrade-opts"] = {
+			host = node.httpupgrade_host,
+			path = (type(node.http_path) == "table") and node.http_path[1] or node.http_path,
+		}
+	end
+	-- xhttp carries no extra UCI fields; meow xhttp-opts defaults apply.
 end
 
-local function parse_dnsquery(strquery)
-    if type(strquery) ~= "table" or isEmpty(strquery) then return nil end
-    local out = {}
-    for _, i in ipairs(strquery) do
-        local n = tonumber(i)
-        out[#out + 1] = n or i
-    end
-    return out
+-- Returns proxy map or nil,reason.
+local function build_proxy(node, tag)
+	local ok, err = sp.validate_node(hp, node, nil)
+	if not ok then return nil, err end
+
+	local t = node.type
+	local mtype = sp.SUPPORTED_TYPES[t]
+	local p = { name = tag, type = mtype, server = node.address, port = strToInt(node.port) }
+
+	if t == "shadowsocks" then
+		p.cipher = node.shadowsocks_encrypt_method
+		p.password = node.password
+		p.udp = true
+		p["client-fingerprint"] = node.tls_utls
+		if not isEmpty(node.shadowsocks_plugin) then
+			p.plugin = node.shadowsocks_plugin
+			p["plugin-opts"] = node.shadowsocks_plugin_opts
+		end
+	elseif t == "vmess" then
+		p.uuid = node.uuid
+		p.alterId = strToInt(node.vmess_alterid) or 0
+		if node.vmess_encrypt == "zero" then
+			return nil, "vmess cipher 'zero' is rejected by meow (security gap)"
+		end
+		p.cipher = not isEmpty(node.vmess_encrypt) and node.vmess_encrypt or nil
+		p.udp = true
+		p.tls = strToBool(node.tls)
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+		p.servername = node.tls_sni
+		p.alpn = str_list(node.tls_alpn)
+		p["client-fingerprint"] = node.tls_utls
+		if node.tls_reality == "1" then
+			return nil, "vmess over REALITY is not supported by meow"
+		end
+		apply_transport(p, node)
+	elseif t == "vless" then
+		p.uuid = node.uuid
+		p.udp = true
+		p.tls = strToBool(node.tls)
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+		p.servername = node.tls_sni
+		p.alpn = str_list(node.tls_alpn)
+		p["client-fingerprint"] = node.tls_utls
+		p.flow = not isEmpty(node.vless_flow) and node.vless_flow or nil
+		p.encryption = not isEmpty(node.vless_encryption) and node.vless_encryption or nil
+		if node.tls_reality == "1" then
+			p["reality-opts"] = {
+				["public-key"] = node.tls_reality_public_key,
+				["short-id"] = node.tls_reality_short_id,
+			}
+		end
+		apply_transport(p, node)
+		if p.flow == "xtls-rprx-vision" and p.network and p.network ~= "tcp" then
+			return nil, "vless flow xtls-rprx-vision only works over network tcp"
+		end
+	elseif t == "trojan" then
+		p.password = node.password
+		p.udp = true
+		p.sni = node.tls_sni
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+	elseif t == "hysteria2" then
+		p.password = node.password
+		p.udp = true
+		local ports = node.hysteria_hopping_port
+		if type(ports) == "table" then ports = table.concat(ports, ",") end
+		p.ports = not isEmpty(ports) and tostring(ports) or nil
+		if not isEmpty(node.hysteria_hop_interval) then
+			-- meow accepts a bare u64 or one "start-end" range (Q6 probe).
+			local hi = tostring(node.hysteria_hop_interval):match("^%s*(.-)%s*$")
+			if hi:match("^%d+s?$") then
+				p["hop-interval"] = tonumber(hi:match("^(%d+)"))
+			elseif hi:match("^%d+%-%d+$") then
+				p["hop-interval"] = hi
+			else
+				return nil, "hysteria2 hop-interval '" .. hi .. "' is not a number or range"
+			end
+		end
+		local function bw(v, field)
+			if isEmpty(v) then return nil end
+			v = tostring(v):match("^%s*(.-)%s*$")
+			-- meow accepts integer Mbps, "N Mbps", or <num>[KMGT]?bps.
+			if v:match("^%d+$") then return v .. " Mbps" end
+			if v:match("^%d+%s*[KMGTkmgt]?[Bb]ps$") then return v end
+			return nil, "hysteria2 " .. field .. " '" .. v .. "' is not a valid bandwidth"
+		end
+		local berr
+		p.up, berr = bw(node.hysteria_up_mbps, "up")
+		if berr then return nil, berr end
+		p.down, berr = bw(node.hysteria_down_mbps, "down")
+		if berr then return nil, berr end
+		if node.hysteria_obfs_type == "salamander" then
+			p.obfs = "salamander"
+			p["obfs-password"] = node.hysteria_obfs_password
+		end
+		local alpn = str_list(node.tls_alpn)
+		if alpn then
+			for _, a in ipairs(alpn) do
+				if a ~= "h3" then
+					return nil, "hysteria2 alpn '" .. a .. "' invalid (h3 only)"
+				end
+			end
+			p.alpn = alpn
+		end
+		p.sni = node.tls_sni
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+		p["fast-open"] = strToBool(node.tcp_fast_open)
+		-- port may be absent when `ports` hopping is configured (meow derives
+		-- it); port=0 with no ports is a hard error, so normalize it away.
+		if p.port == 0 then p.port = nil end
+		if not p.port and not p.ports then
+			return nil, "hysteria2 requires port or ports"
+		end
+	elseif t == "anytls" then
+		-- meow's anytls surface is server/port/password/sni/skip-cert-verify/udp
+		-- only (proxy_parser.rs); idle-session-* keys are silently ignored.
+		p.password = node.password
+		p.udp = true
+		p.sni = node.tls_sni
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+	elseif t == "snell" then
+		p.psk = not isEmpty(node.snell_psk) and node.snell_psk or node.password
+		local sv = not isEmpty(node.snell_version) and node.snell_version or node.version
+		p.version = strToInt(sv) or tonumber(tostring(sv or ""):gsub("^%s*[vV]", ""))
+		-- The reference v0.24.0 build implements v3/v4/v5/v6 (SnellVersion::V6
+		-- + v6-only `mode`); keep the generator-side gate aligned with the
+		-- subscription parser's {3..6} precheck so a bad UCI value quarantines
+		-- instead of hard-erroring `meow -t`.
+		if p.version and not contains({ 3, 4, 5, 6 }, p.version) then
+			return nil, "snell version '" .. p.version .. "' is not supported by meow (v3-v6)"
+		end
+		p.udp = true
+		local om = node.snell_obfs_mode or node.obfs_mode
+		if not isEmpty(om) then
+			-- v6 servers carry no obfs: meow hard-errors obfs-opts on
+			-- version 6 ("obfs-opts is not supported by snell v6").
+			if p.version == 6 then
+				return nil, "snell v6 does not support obfs-opts (v3-v5 only)"
+			end
+			p["obfs-opts"] = {
+				mode = om,
+				host = node.snell_obfs_host or node.obfs_host,
+				path = node.snell_obfs_path or node.obfs_path,
+			}
+		end
+		p.reuse = strToBool(node.snell_reuse)
+	elseif t == "socks" then
+		p.username = node.username
+		p.password = node.password
+		p.udp = true
+		p.tls = strToBool(node.tls)
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+	elseif t == "http" then
+		p.username = node.username
+		p.password = node.password
+		p.tls = strToBool(node.tls)
+		p["skip-cert-verify"] = strToBool(node.tls_insecure)
+		p.sni = node.tls_sni
+	end
+
+	-- meow parses smux only on ss/trojan/vless/vmess (pp.rs call sites).
+	if mtype == "ss" or mtype == "trojan" or mtype == "vless" or mtype == "vmess" then
+		local smux, serr = build_smux(node, mtype)
+		if serr then return nil, serr end
+		p.smux = smux
+	end
+
+	if t ~= "hysteria2" then
+		if isEmpty(p.server) then return nil, "missing server/address" end
+		-- port 0 is truthy in Lua but a hard error for meow (required_port).
+		if not p.port or p.port == 0 then return nil, "missing or invalid port" end
+	elseif isEmpty(p.server) then
+		return nil, "missing server/address"
+	end
+	return p
 end
 
-local function generate_endpoint(node)
-    if type(node) ~= "table" or isEmpty(node) then return nil end
-    return {
-        type = node.type,
-        tag = "cfg-" .. node[".name"] .. "-out",
-        address = node.wireguard_local_address,
-        mtu = strToInt(node.wireguard_mtu),
-        private_key = node.wireguard_private_key,
-        peers = (node.type == "wireguard") and {
-            {
-                address = node.address,
-                port = strToInt(node.port),
-                allowed_ips = { "0.0.0.0/0", "::/0" },
-                persistent_keepalive_interval = strToInt(node.wireguard_persistent_keepalive_interval),
-                public_key = node.wireguard_peer_public_key,
-                pre_shared_key = node.wireguard_pre_shared_key,
-                reserved = parse_port(node.wireguard_reserved),
-            }
-        } or nil,
-        system = (node.type == "wireguard") and false or nil,
-        -- DialerOptions field: without it the wg handshake egresses unmarked
-        -- and the OUTPUT steering hook recaptures it -> handshake loop.
-        routing_mark = strToInt(self_mark),
-        tcp_fast_open = strToBool(node.tcp_fast_open),
-        tcp_multi_path = strToBool(node.tcp_multi_path),
-        udp_fragment = strToBool(node.udp_fragment),
-    }
+---------------------------------------------------------------------------
+-- Emission state. `emitted[tag]` marks proxies/groups already written under
+-- that name; `pseudo_targets[section]` maps routing_node/node sections that
+-- resolve to meow builtins (DIRECT/REJECT) instead of a cfg-*-out entry.
+---------------------------------------------------------------------------
+local proxies, groups, rule_providers = {}, {}, {}
+local emitted = {}
+local pseudo_targets = {}
+local expanding = {}
+local member_tag            -- forward decl: emit_node_group <-> member_tag recurse
+local emit_node_proxy       -- forward decl: used by member_tag/emit_as below
+
+local function emit_node_group(sec_name, sec, name_override)
+	local gname = name_override or ("cfg-" .. sec_name .. "-out")
+	if emitted[gname] then return true end
+	if expanding[sec_name] then
+		warn("cyclic urltest/selector membership at node '%s' -- dropped.", tostring(sec_name))
+		return false
+	end
+	expanding[sec_name] = true
+	local gtype = (sec.type == "selector") and "select" or "url-test"
+	local members = sec.urltest_nodes or sec.selector_nodes
+	if type(members) ~= "table" then members = members and { members } or {} end
+	local tags = {}
+	for _, m in ipairs(members) do
+		if m ~= sec_name and not expanding[m] then
+			local tag = member_tag(m, "group " .. gname)
+			if tag then push(tags, tag) end
+		else
+			warn("cyclic urltest/selector membership at node '%s' -- dropped.", tostring(m))
+		end
+	end
+	expanding[sec_name] = nil
+	if #tags == 0 then
+		warn("group node '%s' has no usable members -- skipped.", tostring(sec_name))
+		return false
+	end
+	push(groups, {
+		name = gname,
+		type = gtype,
+		proxies = tags,
+		url = not isEmpty(sec.urltest_url) and sec.urltest_url or "http://www.gstatic.com/generate_204",
+		interval = secs(sec.urltest_interval) or 300,
+		tolerance = strToInt(sec.urltest_tolerance) or 50,
+		lazy = true,
+	})
+	emitted[gname] = true
+	return true
 end
 
-local function generate_outbound(node)
-    if type(node) ~= "table" or isEmpty(node) then return nil end
-    return {
-        type = node.type,
-        tag = "cfg-" .. node[".name"] .. "-out",
-        routing_mark = strToInt(self_mark),
-        server = node.address,
-        server_port = strToInt(node.port),
-        server_ports = node.hysteria_hopping_port,
-        username = (node.type ~= "ssh") and node.username or nil,
-        user = (node.type == "ssh") and node.username or nil,
-        password = node.password,
-        override_address = node.override_address,
-        override_port = strToInt(node.override_port),
-        proxy_protocol = strToInt(node.proxy_protocol),
-        idle_session_check_interval = strToTime(node.anytls_idle_session_check_interval),
-        idle_session_timeout = strToTime(node.anytls_idle_session_timeout),
-        min_idle_session = strToInt(node.anytls_min_idle_session),
-        hop_interval = strToTime(node.hysteria_hop_interval),
-        up_mbps = strToInt(node.hysteria_up_mbps),
-        down_mbps = strToInt(node.hysteria_down_mbps),
-        obfs = node.hysteria_obfs_type and {
-            type = node.hysteria_obfs_type,
-            password = node.hysteria_obfs_password,
-        } or node.hysteria_obfs_password,
-        auth = (node.hysteria_auth_type == "base64") and node.hysteria_auth_payload or nil,
-        auth_str = (node.hysteria_auth_type == "string") and node.hysteria_auth_payload or nil,
-        recv_window_conn = strToInt(node.hysteria_recv_window_conn),
-        recv_window = strToInt(node.hysteria_revc_window),
-        disable_mtu_discovery = strToBool(node.hysteria_disable_mtu_discovery),
-        method = node.shadowsocks_encrypt_method,
-        plugin = node.shadowsocks_plugin,
-        plugin_opts = node.shadowsocks_plugin_opts,
-        version = (node.type == "shadowtls") and strToInt(node.shadowtls_version)
-            or ((node.type == "socks") and node.socks_version or nil),
-        client_version = node.ssh_client_version,
-        host_key = node.ssh_host_key,
-        host_key_algorithms = node.ssh_host_key_algo,
-        private_key = node.ssh_priv_key,
-        private_key_passphrase = node.ssh_priv_key_pp,
-        uuid = node.uuid,
-        congestion_control = node.tuic_congestion_control,
-        udp_relay_mode = node.tuic_udp_relay_mode,
-        udp_over_stream = strToBool(node.tuic_udp_over_stream),
-        zero_rtt_handshake = strToBool(node.tuic_enable_zero_rtt),
-        heartbeat = strToTime(node.tuic_heartbeat),
-        flow = node.vless_flow,
-        alter_id = strToInt(node.vmess_alterid),
-        security = node.vmess_encrypt,
-        global_padding = strToBool(node.vmess_global_padding),
-        authenticated_length = strToBool(node.vmess_authenticated_length),
-        packet_encoding = node.packet_encoding,
-        multiplex = (node.multiplex == "1") and {
-            enabled = true,
-            protocol = node.multiplex_protocol,
-            max_connections = strToInt(node.multiplex_max_connections),
-            min_streams = strToInt(node.multiplex_min_streams),
-            max_streams = strToInt(node.multiplex_max_streams),
-            padding = strToBool(node.multiplex_padding),
-            brutal = (node.multiplex_brutal == "1") and {
-                enabled = true,
-                up_mbps = strToInt(node.multiplex_brutal_up),
-                down_mbps = strToInt(node.multiplex_brutal_down),
-            } or nil,
-        } or nil,
-        tls = (node.tls == "1") and {
-            enabled = true,
-            server_name = node.tls_sni,
-            insecure = strToBool(node.tls_insecure),
-            alpn = node.tls_alpn,
-            min_version = node.tls_min_version,
-            max_version = node.tls_max_version,
-            cipher_suites = node.tls_cipher_suites,
-            certificate_path = node.tls_cert_path,
-            ech = (node.tls_ech == "1") and {
-                enabled = true,
-                config = node.tls_ech_config,
-                config_path = node.tls_ech_config_path,
-            } or nil,
-            utls = not isEmpty(node.tls_utls) and {
-                enabled = true,
-                fingerprint = node.tls_utls,
-            } or nil,
-            reality = (node.tls_reality == "1") and {
-                enabled = true,
-                public_key = node.tls_reality_public_key,
-                short_id = node.tls_reality_short_id,
-            } or nil,
-        } or nil,
-        transport = not isEmpty(node.transport) and {
-            type = node.transport,
-            host = node.http_host or node.httpupgrade_host,
-            path = node.http_path or node.ws_path,
-            headers = node.ws_host and { Host = node.ws_host } or nil,
-            method = node.http_method,
-            max_early_data = strToInt(node.websocket_early_data),
-            early_data_header_name = node.websocket_early_data_header,
-            service_name = node.grpc_servicename,
-            idle_timeout = strToTime(node.http_idle_timeout),
-            ping_timeout = strToTime(node.http_ping_timeout),
-            permit_without_stream = strToBool(node.grpc_permit_without_stream),
-        } or nil,
-        udp_over_tcp = (node.udp_over_tcp == "1") and {
-            enabled = true,
-            version = strToInt(node.udp_over_tcp_version),
-        } or nil,
-        tcp_fast_open = strToBool(node.tcp_fast_open),
-        tcp_multi_path = strToBool(node.tcp_multi_path),
-        udp_fragment = strToBool(node.udp_fragment),
-    }
+-- url-test/select group; members is a list of node-section names. Pseudo
+-- members map to builtins; nested urltest/selector sections expand to their
+-- own cfg-<name>-out group (guarded against cycles).
+member_tag = function(name, owner)
+	local sec = uci:get_all(UCICONFIG, name)
+	if type(sec) ~= "table" or sec[".type"] ~= UCINODE then
+		warn("%s references missing node '%s' -- dropped.", owner, tostring(name))
+		return nil
+	end
+	if quarantined[name] then
+		warn("%s member '%s' is quarantined -- dropped.", owner, tostring(name))
+		return nil
+	end
+	local t = sec.type
+	if t == "direct" then return "DIRECT" end
+	if t == "block" then return "REJECT" end
+	if t == "dns" then
+		warn("%s member '%s' is a dns pseudo node -- dropped.", owner, tostring(name))
+		return nil
+	end
+	if t == "urltest" or t == "selector" then
+		if not emit_node_group(name, sec) then return nil end
+	elseif not emit_node_proxy(name, "cfg-" .. name .. "-out") then
+		return nil
+	end
+	return "cfg-" .. name .. "-out"
 end
 
-local function get_outbound(cfg)
-    if isEmpty(cfg) then return nil end
-    if type(cfg) == "table" then
-        if contains(cfg, "any-out") then return "any" end
-        return map(cfg, function(i) return get_outbound(i) end)
-    else
-        if cfg == "block-out" or cfg == "direct-out" then return cfg end
-        -- cfg names a routing_node section.  The outbound it produces is
-        -- tagged with the routing_node's own name, not the underlying
-        -- node's: two routing_nodes may share one node while carrying
-        -- different bind_interface/detour, so node-name tags would collide.
-        local rn = uci:get_all(UCICONFIG, cfg)
-        if type(rn) ~= "table" or rn[".type"] ~= UCIROUTINGNODE or isEmpty(rn.node) then
-            error(cfg .. " is not a valid routing node, please check your configuration.")
-        end
-        return "cfg-" .. cfg .. "-out"
-    end
+-- Emit a url-test/select group under an arbitrary name from an explicit
+-- member list + flat opts {url,interval,tolerance}.
+local function emit_named_group(gname, gtype, members, opts, owner)
+	if emitted[gname] then return true end
+	local tags = {}
+	for _, m in ipairs(members or {}) do
+		local tag = member_tag(m, owner)
+		if tag then push(tags, tag) end
+	end
+	if #tags == 0 then return false end
+	push(groups, {
+		name = gname,
+		type = gtype,
+		proxies = tags,
+		url = not isEmpty(opts.url) and opts.url or "http://www.gstatic.com/generate_204",
+		interval = secs(opts.interval) or 300,
+		tolerance = strToInt(opts.tolerance) or 50,
+		lazy = true,
+	})
+	emitted[gname] = true
+	return true
 end
 
-local function get_resolver(cfg)
-    if isEmpty(cfg) then return nil end
-    if cfg == "default-dns" or cfg == "system-dns" then return cfg end
-    return "cfg-" .. cfg .. "-dns"
+emit_node_proxy = function(sec_name, tag, dialer)
+	if emitted[tag] then return true end
+	local node = uci:get_all(UCICONFIG, sec_name)
+	if type(node) ~= "table" or node[".type"] ~= UCINODE then
+		warn("node section '%s' does not exist -- skipped.", tostring(sec_name))
+		return false
+	end
+	local p, err = build_proxy(node, tag)
+	if not p then
+		quarantine(node[".name"], node.type, err or "generation failed")
+		return false
+	end
+	if dialer then p["dialer-proxy"] = dialer end
+	push(proxies, p)
+	emitted[tag] = true
+	return true
 end
 
-local function get_ruleset(cfg)
-    if isEmpty(cfg) then return nil end
-    if type(cfg) ~= "table" then cfg = { cfg } end
-    return map(cfg, function(i) return isEmpty(i) and nil or ("cfg-" .. i .. "-rule") end)
+---------------------------------------------------------------------------
+-- Outbound-name resolution (custom mode + dns_rule outbound fields).
+--   direct-out -> DIRECT, block-out -> REJECT, pseudo nodes -> builtins,
+--   routing_node/node name -> cfg-<name>-out (must have been emitted).
+---------------------------------------------------------------------------
+local function resolve_outbound(name)
+	if type(name) == "table" then
+		if #name > 1 then
+			warn("outbound list of %d entries has no meow equivalent -- using the first.", #name)
+		end
+		name = name[1]
+	end
+	if isEmpty(name) or name == "nil" then return "DIRECT" end
+	if name == "direct-out" or name == "direct" then return "DIRECT" end
+	if name == "block-out" or name == "block" then return "REJECT" end
+	if name == "any-out" or name == "any" then
+		warn("outbound 'any-out' has no meow equivalent -- using DIRECT.")
+		return "DIRECT"
+	end
+	if pseudo_targets[name] then return pseudo_targets[name] end
+	local sec = uci:get_all(UCICONFIG, name)
+	if type(sec) ~= "table" then
+		warn("outbound target '%s' does not exist -- using DIRECT.", tostring(name))
+		return "DIRECT"
+	end
+	local tag = "cfg-" .. name .. "-out"
+	if sec[".type"] == UCIROUTINGNODE then
+		if sec.enabled ~= "1" or not emitted[tag] then
+			warn("outbound target routing_node '%s' was not emitted -- using DIRECT.", tostring(name))
+			return "DIRECT"
+		end
+		return tag
+	end
+	if sec[".type"] == UCINODE then
+		if quarantined[name] then
+			warn("outbound target node '%s' is quarantined -- using DIRECT.", tostring(name))
+			return "DIRECT"
+		end
+		if sec.type == "direct" then return "DIRECT" end
+		if sec.type == "block" then return "REJECT" end
+		if sec.type == "dns" then
+			warn("outbound target '%s' is a dns pseudo node -- using DIRECT.", tostring(name))
+			return "DIRECT"
+		end
+		if not emitted[tag] then
+			if sec.type == "urltest" or sec.type == "selector" then
+				emit_node_group(name, sec)
+			else
+				emit_node_proxy(name, tag)
+			end
+		end
+		return emitted[tag] and tag or "DIRECT"
+	end
+	warn("outbound target '%s' is a %s section -- using DIRECT.", tostring(name), tostring(sec[".type"]))
+	return "DIRECT"
 end
 
-local function get_first(t)
-    local first
-    uci:foreach(UCICONFIG, t, function(s) first = s[".name"]; return false end)
-    return first
+---------------------------------------------------------------------------
+-- ruleset sections -> rule-providers (spec §4.7/§4.9).
+---------------------------------------------------------------------------
+local MEOW_RP_FORMAT = { text = true, yaml = true, mrs = true }
+local function ruleset_provider(sec)
+	-- Returns provider name or nil (warned inside).
+	local name = "cfg-" .. sec[".name"] .. "-rule"
+	local t = sec.type
+	local p = { behavior = "domain", format = "text" }
+	if not isEmpty(sec.format) then
+		if not MEOW_RP_FORMAT[sec.format] then
+			warn("ruleset '%s': sing-box format '%s' cannot be read by meow (text/yaml/mrs only) -- skipped.",
+				tostring(sec[".name"]), tostring(sec.format))
+			return nil
+		end
+		p.format = sec.format
+	end
+	if not isEmpty(sec.behavior) then
+		if not contains({ "domain", "ipcidr", "classical" }, sec.behavior) then
+			warn("ruleset '%s': unknown behavior '%s' -- skipped.", tostring(sec[".name"]), tostring(sec.behavior))
+			return nil
+		end
+		p.behavior = sec.behavior
+	end
+	if t == "local" or t == "file" then
+		if isEmpty(sec.path) then
+			warn("ruleset '%s': file provider requires a path -- skipped.", tostring(sec[".name"]))
+			return nil
+		end
+		p.type, p.path = "file", sec.path
+	elseif t == "remote" or t == "http" then
+		if isEmpty(sec.url) then
+			warn("ruleset '%s': http provider requires a url -- skipped.", tostring(sec[".name"]))
+			return nil
+		end
+		p.type, p.url = "http", sec.url
+		p.interval = secs(sec.update_interval)
+		local detour = resolve_outbound(sec.outbound)
+		if detour == "REJECT" then
+			-- A reject detour cannot carry provider fetches (every fetch
+			-- would die); same nil-handling as DIRECT.
+			warn("ruleset '%s': outbound detour resolves to REJECT -- dropped (fetches go direct).",
+				tostring(sec[".name"]))
+			detour = "DIRECT"
+		end
+		if detour ~= "DIRECT" then p.proxy = detour end
+	elseif t == "inline" then
+		local payload = sec.payload
+		if type(payload) ~= "table" or isEmpty(payload) then
+			warn("ruleset '%s': inline provider requires a payload list -- skipped.", tostring(sec[".name"]))
+			return nil
+		end
+		p.type, p.payload = "inline", payload
+	else
+		warn("ruleset '%s': type '%s' unsupported by meow -- skipped.", tostring(sec[".name"]), tostring(t))
+		return nil
+	end
+	rule_providers[name] = p
+	return name, p
 end
 
--- build config
-local config = {}
-config.log = {
-    disabled = false,
-    level = log_level,
-    output = hp.RUN_DIR .. "/sing-box-c.log",
-    timestamp = true,
-}
-if not isEmpty(ntp_server) and ntp_server ~= "nil" then
-    config.ntp = {
-        enabled = true,
-        server = ntp_server,
-        detour = "direct-out",
-        domain_resolver = "default-dns",
-    }
+local function provider_name_for(ruleset_name)
+	-- Resolve a UCI ruleset reference to an emitted provider (or emit it now).
+	for pname, p in pairs(rule_providers) do
+		if pname == "cfg-" .. ruleset_name .. "-rule" or pname == ruleset_name then
+			return pname, p
+		end
+	end
+	local sec = uci:get_all(UCICONFIG, ruleset_name)
+	if type(sec) == "table" and sec[".type"] == UCIRULESET and sec.enabled == "1" then
+		return ruleset_provider(sec)
+	end
+	warn("rule_set '%s' does not name an enabled ruleset section -- dropped.", tostring(ruleset_name))
+	return nil
 end
 
--- DNS
-config.dns = {
-    servers = {
-        { tag = "default-dns", type = "udp", server = wan_dns,
-          detour = "direct-out" },
-        { tag = "system-dns", type = "local",
-          detour = "direct-out" },
-    },
-    rules = {},
-    strategy = dns_default_strategy,
-    disable_cache = strToBool(dns_disable_cache),
-    disable_expire = strToBool(dns_disable_cache_expire),
-    independent_cache = strToBool(dns_independent_cache),
-    client_subnet = dns_client_subnet,
-}
-
-if not isEmpty(main_node) then
-    local main_dns = {
-        tag = "main-dns",
-        domain_resolver = { server = "default-dns",
-            strategy = (ipv6_support ~= "1") and "ipv4_only" or nil },
-        detour = "main-out",
-    }
-    -- DoH (HTTPS) instead of plain TCP: HTTP/2 multiplexes queries over a
-    -- single tunnel connection with builtired reconnection, eliminating the
-    -- "read response: EOF" errors when the proxy link's TCP connection is
-    -- closed by any layer (anytls idle reaping, server NAT, carrier).
-    local dns_parsed = parse_dnsserver(dns_server, dns_server_proto)
-    if not dns_parsed then
-        -- An unparseable dns_server would emit a server entry without
-        -- type/server and fail sing-box check; degrade to the WAN resolver
-        -- so the service still starts.
-        io.stderr:write("homeproxy: WARNING: dns_server '" .. tostring(dns_server)
-            .. "' is not parseable -- falling back to udp://" .. tostring(wan_dns) .. ".\n")
-        dns_parsed = parse_dnsserver(wan_dns, "udp")
-    end
-    for k, v in pairs(dns_parsed or {}) do main_dns[k] = v end
-    push(config.dns.servers, main_dns)
-    config.dns.final = "main-dns"
-
-    if direct_domain_list and #direct_domain_list > 0 then
-        push(config.dns.rules, {
-            rule_set = "direct-domain", action = "route",
-            server = (routing_mode == "bypass_mainland_china") and "china-dns" or "default-dns",
-        })
-    end
-    if routing_mode == "gfwlist" or (proxy_domain_list and #proxy_domain_list > 0) then
-        push(config.dns.rules, {
-            rule_set = (routing_mode ~= "gfwlist") and "proxy-domain" or nil,
-            query_type = { 64, 65 }, action = "reject",
-        })
-    end
-    if routing_mode == "bypass_mainland_china" then
-        local c_dns = {
-            tag = "china-dns",
-            domain_resolver = { server = "default-dns", strategy = "prefer_ipv6" },
-            detour = "direct-out",
-        }
-        local c_dns_parsed = parse_dnsserver(china_dns_server)
-        if not c_dns_parsed then
-            io.stderr:write("homeproxy: WARNING: china_dns_server '" .. tostring(china_dns_server)
-                .. "' is not parseable -- falling back to udp://" .. tostring(wan_dns) .. ".\n")
-            c_dns_parsed = parse_dnsserver(wan_dns, "udp")
-        end
-        for k, v in pairs(c_dns_parsed or {}) do c_dns[k] = v end
-        push(config.dns.servers, c_dns)
-        if proxy_domain_list and #proxy_domain_list > 0 then
-            push(config.dns.rules, { rule_set = "proxy-domain", action = "route", server = "main-dns" })
-        end
-        push(config.dns.rules, { rule_set = "geosite-cn", action = "route", server = "china-dns", strategy = "prefer_ipv6" })
-        push(config.dns.rules, {
-            type = "logical", mode = "and",
-            rules = { { rule_set = "geosite-noncn", invert = true }, { rule_set = "geoip-cn" } },
-            action = "route", server = "china-dns", strategy = "prefer_ipv6",
-        })
-    end
-elseif not isEmpty(default_outbound) then
-    uci:foreach(UCICONFIG, UCIDNSSERVER, function(cfg)
-        if cfg.enabled ~= "1" then return end
-        local outbound = get_outbound(cfg.outbound)
-        if outbound == "direct-out" and isEmpty(self_mark) then outbound = nil end
-        push(config.dns.servers, {
-            tag = "cfg-" .. cfg[".name"] .. "-dns",
-            type = cfg.type, server = cfg.server, server_port = strToInt(cfg.server_port),
-            path = cfg.path, headers = cfg.headers,
-            tls = cfg.tls_sni and { enabled = true, server_name = cfg.tls_sni } or nil,
-            domain_resolver = (cfg.address_resolver or cfg.address_strategy) and {
-                server = get_resolver(cfg.address_resolver or dns_default_server),
-                strategy = cfg.address_strategy,
-            } or nil,
-            detour = outbound,
-        })
-    end)
-    uci:foreach(UCICONFIG, UCIDNSRULE, function(cfg)
-        if cfg.enabled ~= "1" then return end
-        push(config.dns.rules, {
-            ip_version = strToInt(cfg.ip_version), query_type = parse_dnsquery(cfg.query_type),
-            network = cfg.network, protocol = cfg.protocol,
-            domain = cfg.domain, domain_suffix = cfg.domain_suffix,
-            domain_keyword = cfg.domain_keyword, domain_regex = cfg.domain_regex,
-            port = parse_port(cfg.port), port_range = cfg.port_range,
-            source_ip_cidr = cfg.source_ip_cidr, source_ip_is_private = strToBool(cfg.source_ip_is_private),
-            ip_cidr = cfg.ip_cidr, ip_is_private = strToBool(cfg.ip_is_private),
-            source_port = parse_port(cfg.source_port), source_port_range = cfg.source_port_range,
-            process_name = cfg.process_name, process_path = cfg.process_path,
-            process_path_regex = cfg.process_path_regex, user = cfg.user,
-            rule_set = get_ruleset(cfg.rule_set),
-            rule_set_ip_cidr_match_source = strToBool(cfg.rule_set_ip_cidr_match_source),
-            rule_set_ip_cidr_accept_empty = strToBool(cfg.rule_set_ip_cidr_accept_empty),
-            invert = strToBool(cfg.invert), outbound = get_outbound(cfg.outbound),
-            action = cfg.action, server = get_resolver(cfg.server), strategy = cfg.domain_strategy,
-            disable_cache = strToBool(cfg.dns_disable_cache), rewrite_ttl = strToInt(cfg.rewrite_ttl),
-            client_subnet = cfg.client_subnet, method = cfg.reject_method,
-            no_drop = strToBool(cfg.reject_no_drop), rcode = cfg.predefined_rcode,
-            answer = cfg.predefined_answer, ns = cfg.predefined_ns, extra = cfg.predefined_extra,
-        })
-    end)
-    config.dns.final = get_resolver(dns_default_server)
-end
-
--- Inbounds
-config.inbounds = {
-    { type = "direct", tag = "dns-in", listen = "::", listen_port = tonumber(dns_port) },
-    { type = "mixed", tag = "mixed-in", listen = "::", listen_port = tonumber(mixed_port),
-      udp_timeout = strToTime(udp_timeout), set_system_proxy = false },
-}
-if proxy_mode:find("redirect") then
-    push(config.inbounds, { type = "redirect", tag = "redirect-in", listen = "::",
-        listen_port = tonumber(redirect_port) })
-end
-if tproxy_port then
-    -- "tcp,udp": in a tproxy-only mode (no redirect inbound) the firewall
-    -- TPROXYs TCP here as well; in redirect_tproxy TCP goes to redirect-in
-    -- and the tcp side of this listener simply stays unused.
-    push(config.inbounds, { type = "tproxy", tag = "tproxy-in", listen = "::",
-        listen_port = tonumber(tproxy_port), network = { "tcp", "udp" },
-        udp_timeout = strToTime(udp_timeout) })
-end
-if proxy_mode:find("tun") then
-    push(config.inbounds, { type = "tun", tag = "tun-in", interface_name = tun_name,
-        address = (ipv6_support == "1") and { tun_addr4, tun_addr6 } or { tun_addr4 },
-        mtu = strToInt(tun_mtu), auto_route = false,
-        endpoint_independent_nat = strToBool(endpoint_independent_nat),
-        udp_timeout = strToTime(udp_timeout), stack = tcpip_stack })
-end
-
--- Outbounds
-config.endpoints = {}
-config.outbounds = {
-    { type = "direct", tag = "direct-out", routing_mark = strToInt(self_mark) },
-    { type = "block", tag = "block-out" },
-}
-local function add_endpoint(node_cfg, tag)
-    local ep = generate_endpoint(node_cfg)
-    if ep and tag then ep.tag = tag end
-    if ep then push(config.endpoints, ep) end
-end
-local function add_outbound(node_cfg, tag)
-    local ob = generate_outbound(node_cfg)
-    if ob and tag then ob.tag = tag end
-    if ob then push(config.outbounds, ob) end
-end
-
--- urltest member lists name node SECTIONS; a member that no longer exists
--- would emit a dangling cfg-*-out reference that sing-box check rejects.
-local function filter_node_list(list, owner)
-    return filter(list or {}, function(name)
-        local sec = uci:get_all(UCICONFIG, name)
-        if not sec or sec[".type"] ~= UCINODE then
-            io.stderr:write("homeproxy: WARNING: " .. tostring(owner)
-                .. " references missing node " .. tostring(name) .. " -- dropped.\n")
-            return false
-        end
-        return true
-    end)
-end
-
-if not isEmpty(main_node) then
-    local urltest_nodes = {}
-    if main_node == "urltest" then
-        local nodes = uget(UCIMAIN, "main_urltest_nodes") or {}
-        if type(nodes) ~= "table" then nodes = { nodes } end
-        nodes = filter_node_list(nodes, "main_urltest_nodes")
-        -- Guard against empty urltest node list (H16): clean() drops an empty
-        -- outbounds array, producing a config sing-box rejects ("outbounds
-        -- required").  Fall back to direct-out so the config remains valid.
-        if #nodes == 0 then
-            io.stderr:write("homeproxy: WARNING: main_urltest_nodes is empty -- falling back to direct outbound.\n")
-            push(config.outbounds, { type = "direct", tag = "main-out",
-                routing_mark = strToInt(self_mark) })
-        else
-            local interval = uget(UCIMAIN, "main_urltest_interval")
-            local interval_n = strToInt(interval)
-            push(config.outbounds, {
-                type = "urltest", tag = "main-out",
-                outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
-                interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_urltest_tolerance")),
-                idle_timeout = (interval_n and interval_n > 1800)
-                    and (interval_n * 2 .. "s") or nil,
-            })
-        end
-        urltest_nodes = nodes
-    else
-        local ncfg = uci:get_all(UCICONFIG, main_node) or {}
-        if ncfg.type == "wireguard" then add_endpoint(ncfg, "main-out")
-        else add_outbound(ncfg, "main-out") end
-    end
-
-    if main_udp_node == "urltest" then
-        local nodes = uget(UCIMAIN, "main_udp_urltest_nodes") or {}
-        if type(nodes) ~= "table" then nodes = { nodes } end
-        nodes = filter_node_list(nodes, "main_udp_urltest_nodes")
-        if #nodes == 0 then
-            -- Same guard as main-out: an empty urltest outbounds array is
-            -- cleaned away, leaving a broken reference from the udp rule.
-            io.stderr:write("homeproxy: WARNING: main_udp_urltest_nodes is empty -- UDP falls back to direct.\n")
-            push(config.outbounds, { type = "direct", tag = "main-udp-out",
-                routing_mark = strToInt(self_mark) })
-            nodes = nil
-        end
-        local interval = uget(UCIMAIN, "main_udp_urltest_interval")
-        local interval_n = strToInt(interval)
-        if nodes then
-        push(config.outbounds, {
-            type = "urltest", tag = "main-udp-out",
-            outbounds = map(nodes, function(k) return "cfg-" .. k .. "-out" end),
-            interval = strToTime(interval), tolerance = strToInt(uget(UCIMAIN, "main_udp_urltest_tolerance")),
-            idle_timeout = (interval_n and interval_n > 1800)
-                and (interval_n * 2 .. "s") or nil,
-        })
-            for _, l in ipairs(filter(nodes, function(l) return not contains(urltest_nodes, l) end)) do
-                urltest_nodes[#urltest_nodes + 1] = l
-            end
-        end
-    elseif dedicated_udp_node then
-        local ncfg = uci:get_all(UCICONFIG, main_udp_node) or {}
-        if ncfg.type == "wireguard" then add_endpoint(ncfg, "main-udp-out")
-        else add_outbound(ncfg, "main-udp-out") end
-    end
-
-    for _, i in ipairs(urltest_nodes) do
-        local ncfg = uci:get_all(UCICONFIG, i) or {}
-        if ncfg.type == "wireguard" then add_endpoint(ncfg, "cfg-" .. i .. "-out")
-        else add_outbound(ncfg, "cfg-" .. i .. "-out") end
-    end
-elseif not isEmpty(default_outbound) then
-    local urltest_nodes, routing_nodes = {}, {}
-    uci:foreach(UCICONFIG, UCIROUTINGNODE, function(cfg)
-        if cfg.enabled ~= "1" then return end
-        if cfg.node == "urltest" then
-            local ut_nodes = cfg.urltest_nodes
-            if type(ut_nodes) ~= "table" then ut_nodes = ut_nodes and { ut_nodes } or {} end
-            ut_nodes = filter_node_list(ut_nodes, "routing_node " .. tostring(cfg[".name"]))
-            if #ut_nodes == 0 then
-                io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
-                    .. " has an empty urltest_nodes list -- skipped.\n")
-                return
-            end
-            push(config.outbounds, {
-                type = "urltest", tag = "cfg-" .. cfg[".name"] .. "-out",
-                outbounds = map(ut_nodes, function(k) return "cfg-" .. k .. "-out" end),
-                url = cfg.urltest_url, interval = strToTime(cfg.urltest_interval),
-                tolerance = strToInt(cfg.urltest_tolerance),
-                idle_timeout = strToTime(cfg.urltest_idle_timeout),
-                interrupt_exist_connections = strToBool(cfg.urltest_interrupt_exist_connections),
-            })
-            for _, l in ipairs(filter(ut_nodes, function(l) return not contains(urltest_nodes, l) end)) do
-                urltest_nodes[#urltest_nodes + 1] = l
-            end
-        else
-            -- A missing node must NOT fall through: add_* would push nothing
-            -- and the detour/bind_interface edits below would hit whatever
-            -- outbound happens to be last in the array.
-            -- cfg.node nil -> get_all returns the whole package (truthy);
-            -- a nonexistent/non-node name yields nil or a foreign section.
-            local ob = not isEmpty(cfg.node) and uci:get_all(UCICONFIG, cfg.node) or nil
-            if type(ob) ~= "table" or ob[".type"] ~= "node" then
-                io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
-                    .. " references missing node " .. tostring(cfg.node) .. " -- skipped.\n")
-                return
-            end
-            -- Tag with the routing_node's own name so two routing_nodes
-            -- sharing one node still emit distinct entries (get_outbound
-            -- resolves references the same way).
-            local rn_tag = "cfg-" .. cfg[".name"] .. "-out"
-            if ob.type == "wireguard" then
-                local n = #config.endpoints
-                add_endpoint(ob, rn_tag)
-                if #config.endpoints == n then
-                    io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
-                        .. " node " .. tostring(cfg.node) .. " generated no endpoint -- skipped.\n")
-                    return
-                end
-                local last = config.endpoints[#config.endpoints]
-                last.bind_interface = cfg.bind_interface
-                last.detour = get_outbound(cfg.outbound)
-                if cfg.domain_resolver then
-                    last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
-                end
-            else
-                local n = #config.outbounds
-                add_outbound(ob, rn_tag)
-                if #config.outbounds == n then
-                    io.stderr:write("homeproxy: WARNING: routing_node " .. tostring(cfg[".name"])
-                        .. " node " .. tostring(cfg.node) .. " generated no outbound -- skipped.\n")
-                    return
-                end
-                local last = config.outbounds[#config.outbounds]
-                last.bind_interface = cfg.bind_interface
-                last.detour = get_outbound(cfg.outbound)
-                if cfg.domain_resolver then
-                    last.domain_resolver = { server = get_resolver(cfg.domain_resolver), strategy = cfg.domain_strategy }
-                end
-            end
-            -- Track emitted tags: a node used by a routing_node is still
-            -- materialized under its own cfg-<node>-out tag when a urltest
-            -- group references it.
-            routing_nodes[#routing_nodes + 1] = rn_tag
-        end
-    end)
-    for _, i in ipairs(filter(urltest_nodes, function(l) return not contains(routing_nodes, "cfg-" .. l .. "-out") end)) do
-        local ncfg = uci:get_all(UCICONFIG, i) or {}
-        if ncfg.type == "wireguard" then add_endpoint(ncfg) else add_outbound(ncfg) end
-    end
-end
-
--- Routing rules
-config.route = {
-    rules = { { inbound = "dns-in", action = "hijack-dns" }, { action = "sniff" } },
-    rule_set = {},
-    auto_detect_interface = isEmpty(default_interface) and true or nil,
-    default_interface = default_interface,
+---------------------------------------------------------------------------
+-- routing_rule -> meow rule string (spec §4.9).
+---------------------------------------------------------------------------
+local SINGBOX_RULE_FIELDS = {
+	ip_version = "ip_version", protocol = "protocol",
+	source_ip_is_private = "source_ip_is_private", ip_is_private = "ip_is_private",
+	process_name = "process_name", process_path = "process_path",
+	process_path_regex = "process_path_regex", user = "user",
+	invert = "invert", rule_set_ip_cidr_match_source = "rule_set_ip_cidr_match_source",
+	rule_set_ip_cidr_accept_empty = "rule_set_ip_cidr_accept_empty",
+	override_address = "override_address", override_port = "override_port",
+	udp_connect = "udp_connect", udp_disable_domain_unmapping = "udp_disable_domain_unmapping",
+	udp_timeout = "udp_timeout", tls_fragment = "tls_fragment",
+	tls_fragment_fallback_delay = "tls_fragment_fallback_delay",
+	tls_record_fragment = "tls_record_fragment",
 }
 
-if not isEmpty(main_node) then
-    config.route.default_domain_resolver = {
-        action = "route",
-        server = (routing_mode == "bypass_mainland_china") and "china-dns" or "default-dns",
-        strategy = (ipv6_support ~= "1") and "prefer_ipv4" or nil,
-    }
-    if direct_domain_list and #direct_domain_list > 0 then
-        push(config.route.rules, { rule_set = "direct-domain", action = "route", outbound = "direct-out" })
-    end
-    if dedicated_udp_node then
-        push(config.route.rules, { network = "udp", action = "route", outbound = "main-udp-out" })
-    end
-    config.route.final = "main-out"
+-- Build one condition string per field group; returns list of conditions.
+local function rule_conditions(cfg, owner)
+	local conds = {}
+	local function add(list, mk)
+		if type(list) ~= "table" then list = str_list(list) end
+		if not list or #list == 0 then return end
+		if #list == 1 then
+			push(conds, mk(list[1]))
+		else
+			local inner = {}
+			for _, v in ipairs(list) do push(inner, "(" .. mk(v) .. ")") end
+			push(conds, "OR,((" .. table.concat(inner, ",") .. "))")
+		end
+	end
+	add(cfg.domain, function(v) return "DOMAIN," .. v end)
+	add(cfg.domain_suffix, function(v) return "DOMAIN-SUFFIX," .. v end)
+	add(cfg.domain_keyword, function(v) return "DOMAIN-KEYWORD," .. v end)
+	add(cfg.domain_regex, function(v) return "DOMAIN-REGEX," .. v end)
+	if not isEmpty(cfg.geosite) then
+		warn("%s: geosite rules need geo data files meow does not ship -- dropped.", owner)
+	end
+	add(cfg.ip_cidr, function(v) return "IP-CIDR," .. v .. ",no-resolve" end)
+	add(cfg.source_ip_cidr, function(v) return "SRC-IP-CIDR," .. v end)
+	add(cfg.port, function(v) return "DST-PORT," .. v end)
+	add(cfg.port_range, function(v) return "DST-PORT," .. v:gsub(":", "-") end)
+	add(cfg.source_port, function(v) return "SRC-PORT," .. v end)
+	add(cfg.source_port_range, function(v) return "SRC-PORT," .. v:gsub(":", "-") end)
+	local nets = str_list(cfg.network)
+	if nets then
+		nets = filter(nets, function(v)
+			if v == "tcp" or v == "udp" then return true end
+			warn("%s: network '%s' is not tcp/udp -- dropped.", owner, tostring(v))
+			return false
+		end)
+		add(nets, function(v) return "NETWORK," .. v end)
+	end
+	if not isEmpty(cfg.rule_set) then
+		for _, rs in ipairs(str_list(cfg.rule_set) or {}) do
+			local pname = provider_name_for(rs)
+			if pname then
+				push(conds, "RULE-SET," .. pname)
+			end
+		end
+	end
+	return conds
+end
 
-    if direct_domain_list and #direct_domain_list > 0 then
-        push(config.route.rule_set, { type = "inline", tag = "direct-domain",
-            rules = { { domain_suffix = direct_domain_list } } })
-    end
-    if proxy_domain_list and #proxy_domain_list > 0 then
-        push(config.route.rule_set, { type = "inline", tag = "proxy-domain",
-            rules = { { domain_suffix = proxy_domain_list } } })
-    end
-    if routing_mode == "bypass_mainland_china" then
-        push(config.route.rule_set, { type = "remote", tag = "geoip-cn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/IPCIDR-CHINA@rule-set/cn.srs",
-            download_detour = "main-out" })
-        push(config.route.rule_set, { type = "remote", tag = "geosite-cn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-cn.srs",
-            download_detour = "main-out" })
-        push(config.route.rule_set, { type = "remote", tag = "geosite-noncn", format = "binary",
-            url = "https://fastly.jsdelivr.net/gh/1715173329/sing-geosite@rule-set-unstable/geosite-geolocation-!cn.srs",
-            download_detour = "main-out" })
-    end
-elseif not isEmpty(default_outbound) then
-    config.route.default_domain_resolver = { action = "resolve", server = get_resolver(default_outbound_dns) }
-    if domain_strategy then
-        push(config.route.rules, { action = "resolve", strategy = domain_strategy })
-    end
-    uci:foreach(UCICONFIG, UCIROUTINGRULE, function(cfg)
-        if cfg.enabled ~= "1" then return end
-        push(config.route.rules, {
-            ip_version = strToInt(cfg.ip_version), protocol = cfg.protocol, network = cfg.network,
-            domain = cfg.domain, domain_suffix = cfg.domain_suffix,
-            domain_keyword = cfg.domain_keyword, domain_regex = cfg.domain_regex,
-            source_ip_cidr = cfg.source_ip_cidr, source_ip_is_private = strToBool(cfg.source_ip_is_private),
-            ip_cidr = cfg.ip_cidr, ip_is_private = strToBool(cfg.ip_is_private),
-            source_port = parse_port(cfg.source_port), source_port_range = cfg.source_port_range,
-            port = parse_port(cfg.port), port_range = cfg.port_range,
-            process_name = cfg.process_name, process_path = cfg.process_path,
-            process_path_regex = cfg.process_path_regex, user = cfg.user,
-            rule_set = get_ruleset(cfg.rule_set),
-            rule_set_ip_cidr_match_source = strToBool(cfg.rule_set_ip_cidr_match_source),
-            invert = strToBool(cfg.invert), action = cfg.action, outbound = get_outbound(cfg.outbound),
-            override_address = cfg.override_address, override_port = strToInt(cfg.override_port),
-            udp_disable_domain_unmapping = strToBool(cfg.udp_disable_domain_unmapping),
-            udp_connect = strToBool(cfg.udp_connect), udp_timeout = strToTime(cfg.udp_timeout),
-            tls_fragment = strToBool(cfg.tls_fragment),
-            tls_fragment_fallback_delay = strToTime(cfg.tls_fragment_fallback_delay),
-            tls_record_fragment = strToBool(cfg.tls_record_fragment),
-        })
-    end)
-    config.route.final = get_outbound(default_outbound)
-    uci:foreach(UCICONFIG, UCIRULESET, function(cfg)
-        if cfg.enabled ~= "1" then return end
-        push(config.route.rule_set, {
-            type = cfg.type, tag = "cfg-" .. cfg[".name"] .. "-rule", format = cfg.format,
-            path = cfg.path, url = cfg.url, download_detour = get_outbound(cfg.outbound),
-            update_interval = cfg.update_interval,
-        })
-    end)
+local function translate_routing_rule(cfg)
+	local owner = "routing_rule " .. tostring(cfg[".name"])
+	local action = cfg.action or "route"
+	if action ~= "route" and action ~= "block" then
+		warn("%s: action '%s' has no meow equivalent -- skipped.", owner, tostring(action))
+		return
+	end
+	for k in pairs(SINGBOX_RULE_FIELDS) do
+		if not isEmpty(cfg[k]) then
+			warn("%s: sing-box-only field '%s' -- dropped.", owner, k)
+		end
+	end
+	local target
+	if action == "block" then
+		target = "REJECT"
+	else
+		target = resolve_outbound(cfg.outbound)
+	end
+	local conds = rule_conditions(cfg, owner)
+	if #conds == 0 then
+		-- Condition fields were configured but every one was dropped (a bad
+		-- network value, a missing ruleset, ...). Emitting MATCH here would
+		-- silently swallow every later rule, so skip this rule instead.
+		for _, k in ipairs({ "domain", "domain_suffix", "domain_keyword",
+			"domain_regex", "geosite", "ip_cidr", "source_ip_cidr", "port",
+			"port_range", "source_port", "source_port_range", "network",
+			"rule_set" }) do
+			if not isEmpty(cfg[k]) then
+				warn("%s: all conditions were dropped -- rule skipped (it would degrade to a catch-all MATCH).", owner)
+				return
+			end
+		end
+		-- A rule with no conditions matches everything.
+		return "MATCH," .. target
+	elseif #conds == 1 then
+		return conds[1] .. "," .. target
+	end
+	local inner = {}
+	for _, c in ipairs(conds) do push(inner, "(" .. c .. ")") end
+	return "AND,((" .. table.concat(inner, ",") .. "))," .. target
+end
+
+---------------------------------------------------------------------------
+-- dns_server sections -> meow nameserver URLs (custom mode, §7.4).
+---------------------------------------------------------------------------
+-- meow's rcode:// parser matches case-sensitively and accepts exactly these
+-- six labels (upstream.rs parse_rcode); anything else fails `meow -t`.
+local MEOW_RCODES = {
+	success = true, format_error = true, server_failure = true,
+	name_error = true, not_implemented = true, refused = true,
+}
+
+local function dns_url_for_outbound(url, outbound)
+	-- "#PROXY" suffix is legal on plain udp://tcp://bare forms only.
+	local ob = resolve_outbound(outbound)
+	if ob == "DIRECT" then return url end
+	if ob == "REJECT" then
+		-- REJECT cannot carry DNS queries; same nil-detour as DIRECT.
+		warn("dns server '%s': outbound detour resolves to REJECT -- dropped (queries go direct).", tostring(url))
+		return url
+	end
+	if url:match("^tls://") or url:match("^https://") then
+		warn("dns server '%s': outbound detour cannot ride an encrypted URL -- # is SNI there.", tostring(url))
+		return url
+	end
+	return url:gsub("#.*$", "") .. "#" .. ob
+end
+
+local function wan_dns_url()
+	local h = wan_dns
+	if h:match(":") and not h:match("^%[") then h = "[" .. h .. "]" end
+	return "udp://" .. h
+end
+
+local function dns_server_url(cfg)
+	-- Returns a meow nameserver URL for an enabled dns_server section.
+	for _, k in ipairs({ "headers", "address_resolver", "address_strategy" }) do
+		if not isEmpty(cfg[k]) then
+			warn("dns server '%s': sing-box-only field '%s' -- dropped.", tostring(cfg[".name"]), k)
+		end
+	end
+	local t = cfg.type or "udp"
+	local host = cfg.server
+	local port = strToInt(cfg.server_port)
+	if not isEmpty(host) and host:match(":") and not host:match("^%[") then
+		host = "[" .. host .. "]"
+	end
+	local hostport = tostring(host or "") .. ((port and port ~= 0) and (":" .. port) or "")
+	local sni = not isEmpty(cfg.tls_sni) and ("#" .. cfg.tls_sni) or nil
+	if t == "udp" then
+		if isEmpty(host) then return nil, "missing server" end
+		return dns_url_for_outbound("udp://" .. hostport, cfg.outbound)
+	elseif t == "tcp" then
+		if isEmpty(host) then return nil, "missing server" end
+		return dns_url_for_outbound("tcp://" .. hostport, cfg.outbound)
+	elseif t == "tls" then
+		if isEmpty(host) then return nil, "missing server" end
+		return "tls://" .. hostport .. (sni or "")
+	elseif t == "https" or t == "h3" then
+		if isEmpty(host) then return nil, "missing server" end
+		if t == "h3" then
+			warn("dns server '%s': h3 (DoH3) is unsupported -- degraded to https://.", tostring(cfg[".name"]))
+		end
+		local path = (type(cfg.path) == "string" and cfg.path ~= "") and cfg.path or "/dns-query"
+		return "https://" .. hostport .. path .. (sni or "")
+	elseif t == "quic" then
+		if isEmpty(host) then return nil, "missing server" end
+		warn("dns server '%s': quic (DoQ) is unsupported -- degraded to tls://.", tostring(cfg[".name"]))
+		return "tls://" .. hostport .. (sni or "")
+	elseif t == "local" or t == "system" or t == "system-dns" or t == "dhcp" then
+		return wan_dns_url()
+	elseif t == "rcode" and not isEmpty(cfg.rcode) then
+		local rc = tostring(cfg.rcode):lower()
+		if not MEOW_RCODES[rc] then
+			return nil, "rcode '" .. tostring(cfg.rcode) .. "' is not a meow rcode (success/format_error/server_failure/name_error/not_implemented/refused)"
+		end
+		return "rcode://" .. rc
+	else
+		return nil, "dns server type '" .. tostring(t) .. "' unsupported"
+	end
+end
+
+local function dns_pool_url(name, owner)
+	if isEmpty(name) then return nil end
+	if name == "default-dns" or name == "system-dns" then return wan_dns_url() end
+	local sec = uci:get_all(UCICONFIG, name)
+	if type(sec) ~= "table" or sec[".type"] ~= UCIDNSSERVER or sec.enabled ~= "1" then
+		warn("%s: dns server '%s' is missing or disabled -- skipped.", owner, tostring(name))
+		return nil
+	end
+	local url, err = dns_server_url(sec)
+	if not url then
+		warn("%s: dns server '%s': %s -- skipped.", owner, tostring(name), tostring(err))
+	end
+	return url
+end
+
+-- Non-custom mode upstreams: tls://https:// degrade to plain udp:// (the '#'
+-- suffix is a proxy tag only on plain forms; on encrypted ones it is SNI).
+local function plain_dns_url(v, proxy_tag)
+	if isEmpty(v) then return nil end
+	local u = tostring(v)
+	local scheme, rest = u:match("^([a-z][a-z0-9+%.%-]*)://(.+)$")
+	if scheme == "tls" or scheme == "https" then
+		rest = rest:gsub("#.*$", ""):gsub("/.*$", "")
+		if proxy_tag then
+			warn("dns server '%s': encrypted upstream cannot take #%s -- degraded to udp://%s.",
+				u, tostring(proxy_tag), rest)
+		else
+			warn("dns server '%s': encrypted upstream is unsupported -- degraded to udp://%s.", u, rest)
+		end
+		u = "udp://" .. rest
+	elseif not scheme then
+		-- bracket bare IPv6 literals so the URL parser sees host[:port]
+		if u:match(":") and not u:match("^%[") then u = "[" .. u .. "]" end
+		u = "udp://" .. u
+	elseif scheme ~= "udp" and scheme ~= "tcp" then
+		warn("dns server '%s': unsupported scheme -- using wan DNS.", u)
+		u = wan_dns_url()
+	end
+	if proxy_tag and not u:match("#") then u = u .. "#" .. proxy_tag end
+	return u
+end
+
+---------------------------------------------------------------------------
+-- Build the meow config skeleton (spec §4.2).
+---------------------------------------------------------------------------
+local config = {
+	mode = "rule",
+	["log-level"] = log_level,
+	ipv6 = (ipv6_support == "1"),
+	["mixed-port"] = mixed_port,
+	["allow-lan"] = true,
+	["bind-address"] = "*",
+	["external-controller"] = "127.0.0.1:19290",
+	["routing-mark"] = self_mark,
+	strict = false,
+	-- meow hard-fails `meow -t` when enable=true carries no sniff map
+	-- (lib.rs: "sniffer.enable is true but sniffer.sniff map is absent or
+	-- empty"); TLS/HTTP are the only protocols this build implements.
+	sniffer = {
+		enable = true,
+		sniff = {
+			TLS = { ports = { 443 } },
+			HTTP = { ports = { 80 } },
+		},
+	},
+}
+
+---------------------------------------------------------------------------
+-- Proxies/groups per routing mode (spec §4.3-§4.6).
+---------------------------------------------------------------------------
+local main_target = "main-out"   -- MATCH fallback target
+local udp_target = "main-udp-out" -- NETWORK,udp target when dedicated
+
+-- Emit a proxy/group for node section `sec` under adapter name `tag`;
+-- returns the adapter name rules should point at (tag, or a builtin).
+local function emit_as(tag, sec, owner)
+	if type(sec) ~= "table" or sec[".type"] ~= UCINODE then
+		warn("%s: node is missing -- %s falls back to direct.", owner, tag)
+		push(proxies, { name = tag, type = "direct" })
+		emitted[tag] = true
+		return tag
+	end
+	local t = sec.type
+	if t == "direct" then
+		push(proxies, { name = tag, type = "direct" })
+		emitted[tag] = true
+		return tag
+	elseif t == "block" then
+		-- meow has no `reject` proxies[] type; route to the REJECT builtin.
+		return "REJECT"
+	elseif t == "dns" then
+		warn("%s: dns pseudo node cannot be an outbound -- %s falls back to direct.", owner, tag)
+		push(proxies, { name = tag, type = "direct" })
+		emitted[tag] = true
+		return tag
+	elseif t == "urltest" or t == "selector" then
+		if emit_node_group(sec[".name"], sec, tag) then return tag end
+		warn("%s: %s node '%s' has no usable members -- %s falls back to direct.",
+			owner, t, tostring(sec[".name"]), tag)
+		push(proxies, { name = tag, type = "direct" })
+		emitted[tag] = true
+		return tag
+	end
+	if emit_node_proxy(sec[".name"], tag) then return tag end
+	-- §4.6: main_* / references hitting quarantine -> warn + direct fallback.
+	push(proxies, { name = tag, type = "direct" })
+	emitted[tag] = true
+	return tag
+end
+
+if routing_mode ~= "custom" then
+	if main_node == "urltest" then
+		local nodes = uget(UCIMAIN, "main_urltest_nodes") or {}
+		if type(nodes) ~= "table" then nodes = { nodes } end
+		if not emit_named_group("main-out", "url-test", nodes, {
+			url = uget(UCIMAIN, "main_urltest_url"),
+			interval = uget(UCIMAIN, "main_urltest_interval"),
+			tolerance = uget(UCIMAIN, "main_urltest_tolerance"),
+		}, "main_urltest_nodes") then
+			warn("main_urltest_nodes has no usable members -- main-out falls back to direct.")
+			push(proxies, { name = "main-out", type = "direct" })
+			emitted["main-out"] = true
+		end
+	elseif not isEmpty(main_node) and main_node ~= "nil" then
+		main_target = emit_as("main-out", uci:get_all(UCICONFIG, main_node) or {}, "main_node")
+	else
+		push(proxies, { name = "main-out", type = "direct" })
+		emitted["main-out"] = true
+	end
+
+	if main_udp_node == "urltest" then
+		local nodes = uget(UCIMAIN, "main_udp_urltest_nodes") or {}
+		if type(nodes) ~= "table" then nodes = { nodes } end
+		if not emit_named_group("main-udp-out", "url-test", nodes, {
+			url = uget(UCIMAIN, "main_udp_urltest_url"),
+			interval = uget(UCIMAIN, "main_udp_urltest_interval"),
+			tolerance = uget(UCIMAIN, "main_udp_urltest_tolerance"),
+		}, "main_udp_urltest_nodes") then
+			warn("main_udp_urltest_nodes has no usable members -- main-udp-out falls back to direct.")
+			push(proxies, { name = "main-udp-out", type = "direct" })
+			emitted["main-udp-out"] = true
+		end
+	elseif dedicated_udp_node then
+		udp_target = emit_as("main-udp-out", uci:get_all(UCICONFIG, main_udp_node) or {}, "main_udp_node")
+	end
 else
-    -- Neither a main node nor a default_outbound: sing-box still requires a
-    -- route.final, so fall back to direct rather than emitting broken JSON.
-    config.route.final = "direct-out"
+	-- custom: routing_node sections -> cfg-<rn>-out proxies/groups.
+	uci:foreach(UCICONFIG, UCIROUTINGNODE, function(cfg)
+		if cfg.enabled ~= "1" then return end
+		local rn = cfg[".name"]
+		local tag = "cfg-" .. rn .. "-out"
+		if cfg.node == "urltest" or cfg.node == "selector" then
+			local members = cfg.urltest_nodes or cfg.selector_nodes
+			if type(members) ~= "table" then members = members and { members } or {} end
+			if not isEmpty(cfg.outbound) then
+				warn("routing_node '%s': outbound detour on a group is unsupported -- dropped.", rn)
+			end
+			if not emit_named_group(tag, (cfg.node == "selector") and "select" or "url-test",
+				members, {
+					url = cfg.urltest_url, interval = cfg.urltest_interval,
+					tolerance = cfg.urltest_tolerance,
+				}, "routing_node " .. rn) then
+				warn("routing_node '%s' has no usable members -- falls back to direct.", rn)
+				push(proxies, { name = tag, type = "direct" })
+				emitted[tag] = true
+			end
+			return
+		end
+		if isEmpty(cfg.node) then
+			warn("routing_node '%s' has no node -- skipped.", rn)
+			return
+		end
+		local sec = uci:get_all(UCICONFIG, cfg.node)
+		if type(sec) ~= "table" or sec[".type"] ~= UCINODE then
+			warn("routing_node '%s' references missing node '%s' -- skipped.", rn, tostring(cfg.node))
+			return
+		end
+		if not isEmpty(cfg.bind_interface) then
+			warn("routing_node '%s': bind_interface has no meow equivalent -- dropped.", rn)
+		end
+		if sec.type == "block" then
+			pseudo_targets[rn] = "REJECT"
+			return
+		end
+		if sec.type == "direct" then
+			push(proxies, { name = tag, type = "direct" })
+			emitted[tag] = true
+			return
+		end
+		local dialer
+		if not isEmpty(cfg.outbound) and cfg.outbound ~= "nil" then
+			dialer = resolve_outbound(cfg.outbound)
+			if dialer == "DIRECT" or dialer == "REJECT" then dialer = nil end
+		end
+		if sec.type == "urltest" or sec.type == "selector" then
+			if dialer then
+				warn("routing_node '%s': outbound detour on a group is unsupported -- dropped.", rn)
+				dialer = nil
+			end
+			if not emit_node_group(cfg.node, sec, tag) then
+				warn("routing_node '%s' group '%s' has no usable members -- falls back to direct.", rn, tostring(cfg.node))
+				push(proxies, { name = tag, type = "direct" })
+				emitted[tag] = true
+			end
+			return
+		end
+		if sec.type == "dns" then
+			warn("routing_node '%s': dns pseudo node cannot be an outbound -- falls back to direct.", rn)
+			push(proxies, { name = tag, type = "direct" })
+			emitted[tag] = true
+			return
+		end
+		if dialer and sec.type == "hysteria2" then
+			-- hysteria2 owns its QUIC socket: meow cannot thread an injected
+			-- dialer through it and degrades to a DialerProxyAdapter wrapper
+			-- that fails loudly on EVERY connection at runtime.
+			warn("routing_node '%s': dialer detour on hysteria2 node '%s' is unsupported by meow -- dropped.",
+				rn, tostring(cfg.node))
+			dialer = nil
+		end
+		if not emit_node_proxy(cfg.node, tag, dialer) then
+			-- Quarantined backing node: keep the tag resolvable as direct.
+			push(proxies, { name = tag, type = "direct" })
+			emitted[tag] = true
+		end
+	end)
 end
 
--- Materialize an outbound for EVERY node (cfg-<sect>-out) so the Clash API
--- can run a per-node reachability/delay test from the web UI. Outbounds not
--- referenced by any route are inert (no routing/port-forward impact). The
--- active node keeps its "main-out" alias; this adds the cfg-<sect>-out form
--- the UI keys on. Gated by HP_MATERIALIZE_ALL_NODES (default on; init.d
--- retries with =0 if a bad unused node fails sing-box check, so a malformed
--- node never blocks startup -- ping-all is just unavailable for that run).
+-- Materialize cfg-<sect>-out for EVERY node so the API can ping each one.
+-- Quarantined nodes still get skipped (init retries with materialize off on
+-- meow -t failure, but a quarantined node never makes it that far).
 if os.getenv("HP_MATERIALIZE_ALL_NODES") ~= "0" then
-    local function has_outbound(tag)
-        for _, o in ipairs(config.outbounds) do if o.tag == tag then return true end end
-        for _, e in ipairs(config.endpoints) do if e.tag == tag then return true end end
-        return false
-    end
-    uci:foreach(UCICONFIG, UCINODE, function(cfg)
-        local tag = "cfg-" .. cfg[".name"] .. "-out"
-        if has_outbound(tag) then return end
-        -- Group/pseudo types have no single-server outbound form; skipping
-        -- them keeps one stray node from failing `sing-box check`.
-        if cfg.type == "urltest" or cfg.type == "selector" or cfg.type == "direct"
-            or cfg.type == "block" or cfg.type == "dns" then return end
-        if cfg.type == "wireguard" then add_endpoint(cfg, tag)
-        else add_outbound(cfg, tag) end
-    end)
+	uci:foreach(UCICONFIG, UCINODE, function(cfg)
+		local tag = "cfg-" .. cfg[".name"] .. "-out"
+		if emitted[tag] then return end
+		local t = cfg.type
+		if t == "urltest" or t == "selector" then
+			emit_node_group(cfg[".name"], cfg)
+			return
+		end
+		if t == "direct" or t == "block" or t == "dns" then return end
+		emit_node_proxy(cfg[".name"], tag)
+	end)
 end
 
--- Clash API (loopback only, no secret) so the web UI can run per-node
--- delay tests via GET /proxies/<tag>/delay. Used by the ping_nodes endpoint.
-config.experimental = {
-    clash_api = { external_controller = "127.0.0.1:19290" },
+config.proxies = proxies
+if #groups > 0 then
+	config["proxy-groups"] = groups
+end
+
+---------------------------------------------------------------------------
+-- rules + rule-providers (spec §4.7/§4.8/§4.9).
+---------------------------------------------------------------------------
+local rules = {}
+local DL = direct_domain_list ~= nil
+local PL = proxy_domain_list ~= nil
+
+local function file_provider(path)
+	return { type = "file", behavior = "domain", format = "text", path = path }
+end
+
+if routing_mode ~= "custom" then
+	if DL then
+		rule_providers["direct-domain"] = file_provider("providers/direct_list.txt")
+		push(rules, "RULE-SET,direct-domain,DIRECT")
+	end
+	if PL then
+		-- emitted but referenced only via nameserver-policy/dnsmasq (§4.7)
+		rule_providers["proxy-domain"] = file_provider("providers/proxy_list.txt")
+	end
+	if routing_mode == "bypass_mainland_china" then
+		rule_providers["china-domain"] = file_provider("providers/china_list.txt")
+		push(rules, "RULE-SET,china-domain,DIRECT")
+	elseif routing_mode == "gfwlist" then
+		rule_providers["gfw-domain"] = file_provider("providers/gfw_list.txt")
+		push(rules, "RULE-SET,gfw-domain," .. main_target)
+	end
+	if dedicated_udp_node then
+		push(rules, "NETWORK,udp," .. udp_target)
+	end
+	push(rules, "MATCH," .. main_target)
+else
+	uci:foreach(UCICONFIG, UCIROUTINGRULE, function(cfg)
+		if cfg.enabled ~= "1" then return end
+		local line = translate_routing_rule(cfg)
+		if line then push(rules, line) end
+	end)
+	push(rules, "MATCH," .. resolve_outbound(default_outbound))
+end
+config.rules = rules
+
+---------------------------------------------------------------------------
+-- listeners (spec §6.3): external firewall owns steering -> firewall:false.
+---------------------------------------------------------------------------
+-- proxy_mode is normalized above: "tproxy"/"redirect_tproxy" carry the UDP
+-- TPROXY arm, plain "redirect" does not.
+local udp_listener = proxy_mode ~= "redirect"
+	and ((routing_mode == "custom") or (main_udp_node and main_udp_node ~= "nil"))
+config.listeners = {
+	{
+		name = "hp-tproxy",
+		type = "tproxy",
+		listen = "0.0.0.0",
+		port = redirect_port,
+		firewall = false,
+		udp = udp_listener and true or false,
+		["udp-timeout"] = udp_timeout,
+	}
 }
-if routing_mode == "bypass_mainland_china" or routing_mode == "custom" then
-    config.experimental.cache_file = {
-        enabled = true, path = hp.RUN_DIR .. "/cache.db",
-        store_rdrc = strToBool(cache_file_store_rdrc),
-        rdrc_timeout = strToTime(cache_file_rdrc_timeout),
-    }
+if ipv6_support == "1" then
+	push(config.listeners, {
+		name = "hp-tproxy6",
+		type = "tproxy",
+		listen = "::",
+		port = v6_port,
+		firewall = false,
+		udp = false,
+	})
+end
+
+---------------------------------------------------------------------------
+-- DNS (spec §7.2-§7.4). dnsmasq stays in front; meow resolves upstream.
+---------------------------------------------------------------------------
+local dns = {
+	enable = true,
+	listen = "127.0.0.1:" .. dns_port,
+	ipv6 = (ipv6_support == "1"),
+	["enhanced-mode"] = "redir-host",
+	["default-nameserver"] = { wan_dns_url() },
+	["proxy-server-nameserver"] = { wan_dns_url() },
+}
+
+if routing_mode ~= "custom" then
+	-- The #detour must name an EMITTED proxy/group: a block main_node makes
+	-- emit_as return the REJECT builtin (nothing materialized as "main-out"),
+	-- and a dangling #main-out hard-fails `meow -t`. REJECT cannot carry DNS
+	-- queries anyway, so no tag is attached in that case.
+	local main_detour = emitted[main_target] and main_target or nil
+	if not main_detour then
+		warn("main_node resolved to '%s' (no emitted proxy) -- dns detour tag dropped.", tostring(main_target))
+	end
+	local rs = plain_dns_url(dns_server, main_detour)
+		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
+	dns.nameserver = { rs }
+	local cd = plain_dns_url(china_dns_server, nil) or (wan_dns_url())
+	local policy = {}
+	if routing_mode == "bypass_mainland_china" then
+		policy["rule-set:china-domain"] = cd
+	end
+	if DL then
+		policy["rule-set:direct-domain"] = cd
+	end
+	if next(policy) then dns["nameserver-policy"] = policy end
+else
+	-- custom mode (§7.4): dns_server sections form the nameserver pool;
+	-- dns_rule sections become nameserver-policy entries.
+	local pool, seen = {}, {}
+	uci:foreach(UCICONFIG, UCIDNSSERVER, function(cfg)
+		if cfg.enabled ~= "1" then return end
+		local url, err = dns_server_url(cfg)
+		if not url then
+			warn("dns server '%s': %s -- skipped.", tostring(cfg[".name"]), tostring(err))
+			return
+		end
+		if not seen[url] then
+			seen[url] = true
+			push(pool, url)
+		end
+	end)
+	local default_dns_url = dns_pool_url(uget(UCIROUTING, "default_outbound_dns")
+		or uget(UCIDNS, "default_server"), "default dns")
+	if not default_dns_url then default_dns_url = wan_dns_url() end
+	if not seen[default_dns_url] then push(pool, default_dns_url) end
+	dns.nameserver = pool
+
+	local policy = {}
+	uci:foreach(UCICONFIG, UCIDNSRULE, function(cfg)
+		if cfg.enabled ~= "1" then return end
+		local owner = "dns_rule " .. tostring(cfg[".name"])
+		for k in pairs(SINGBOX_RULE_FIELDS) do
+			if not isEmpty(cfg[k]) then
+				warn("%s: sing-box-only field '%s' -- dropped.", owner, k)
+			end
+		end
+		for _, k in ipairs({ "ip_cidr", "source_ip_cidr", "port", "port_range",
+			"source_port", "source_port_range", "network", "protocol", "query_type",
+			"domain_strategy", "client_subnet", "rewrite_ttl", "dns_disable_cache",
+			"reject_method", "reject_no_drop", "predefined_rcode", "predefined_answer",
+			"predefined_ns", "predefined_extra", "geosite" }) do
+			if not isEmpty(cfg[k]) then
+				warn("%s: field '%s' has no meow nameserver-policy equivalent -- dropped.", owner, k)
+			end
+		end
+		if not isEmpty(cfg.action) and cfg.action ~= "route" then
+			warn("%s: action '%s' is not 'route' -- skipped.", owner, tostring(cfg.action))
+			return
+		end
+		local url = dns_pool_url(cfg.server, owner)
+		if not url then
+			if isEmpty(cfg.server) then
+				warn("%s: no dns server configured -- skipped.", owner)
+			end
+			return
+		end
+		if not isEmpty(cfg.outbound) then
+			url = dns_url_for_outbound(url, cfg.outbound)
+		end
+		local keys = {}
+		for _, v in ipairs(str_list(cfg.domain) or {}) do push(keys, v) end
+		for _, v in ipairs(str_list(cfg.domain_suffix) or {}) do push(keys, "+." .. v) end
+		for _, v in ipairs(str_list(cfg.domain_keyword) or {}) do
+			warn("%s: domain_keyword '%s' degrades to a plain domain key.", owner, v)
+			push(keys, v)
+		end
+		for _, v in ipairs(str_list(cfg.domain_regex) or {}) do
+			warn("%s: domain_regex '%s' degrades to a plain domain key.", owner, v)
+			push(keys, v)
+		end
+		for _, v in ipairs(str_list(cfg.rule_set) or {}) do
+			local pname, prov = provider_name_for(v)
+			if pname then
+				if prov.behavior ~= "domain" then
+					warn("%s: provider '%s' behavior is %s -- nameserver-policy needs domain -- dropped.",
+						owner, pname, prov.behavior)
+				else
+					push(keys, "rule-set:" .. pname)
+				end
+			end
+		end
+		for _, k in ipairs(keys) do policy[k] = url end
+	end)
+	if next(policy) then dns["nameserver-policy"] = policy end
+end
+config.dns = dns
+
+-- ruleset providers may have been emitted during dns_rule processing.
+if next(rule_providers) then
+	config["rule-providers"] = rule_providers
+end
+
+---------------------------------------------------------------------------
+-- Atomic writes: tmp + rename keeps the previous good file on failure.
+---------------------------------------------------------------------------
+local function atomic_write(path, content)
+	local tmp = path .. ".tmp"
+	if not hp.writefile(tmp, content) then
+		os.remove(tmp)
+		error("failed to write " .. tmp, 0)
+	end
+	local ok, err = os.rename(tmp, path)
+	if not ok then
+		os.remove(tmp)
+		error("rename " .. tmp .. " -> " .. path .. " failed: " .. tostring(err), 0)
+	end
+end
+
+-- unsupported-nodes.json is shared between three writers: this file owns
+-- the role="client" partition (generate_server.lua owns role="server",
+-- update_subscriptions.lua appends source="subscription"). Merge like
+-- generate_server.lua's flush_unsupported: prior client records are
+-- rewritten from live UCI on every run, other partitions pass through.
+local function flush_unsupported()
+	local existing = {}
+	local raw = hp.readfile(UNSUPPORTED_FILE)
+	if not isEmpty(raw) then
+		local ok, j = pcall(hp.decode_json, raw)
+		if ok and type(j) == "table" then existing = j end
+	end
+	local seen, merged = {}, {}
+	for _, e in ipairs(existing) do
+		if type(e) == "table" and e.role ~= "client" then
+			local k = tostring(e.name) .. "|" .. tostring(e.type) .. "|" .. tostring(e.reason)
+			if not seen[k] then merged[#merged + 1] = e; seen[k] = true end
+		end
+	end
+	for _, e in ipairs(unsupported_nodes) do
+		local k = tostring(e.name) .. "|" .. tostring(e.type) .. "|" .. tostring(e.reason)
+		if not seen[k] then merged[#merged + 1] = e; seen[k] = true end
+	end
+	if #merged == 0 then
+		-- Nothing quarantined anywhere: remove a stale file so
+		-- `homeproxy nodes` / the API stop reporting ghosts.
+		os.remove(UNSUPPORTED_FILE)
+		return
+	end
+	atomic_write(UNSUPPORTED_FILE, hp.encode_json(merged))
 end
 
 hp.mkdir_p(hp.RUN_DIR)
-if not hp.writefile(hp.RUN_DIR .. "/sing-box-c.json", hp.encode_json(config)) then
-    io.stderr:write("homeproxy: ERROR: failed to write " .. hp.RUN_DIR .. "/sing-box-c.json\n")
-    os.exit(1)
-end
+flush_unsupported()
+atomic_write(MEOW_FILE, hp.encode_json(config))

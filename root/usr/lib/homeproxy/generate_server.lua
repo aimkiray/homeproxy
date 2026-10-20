@@ -1,7 +1,13 @@
 #!/usr/bin/lua
 -- SPDX-License-Identifier: GPL-2.0-only
--- HomeProxy server config generator (Lua port of generate_server.uc).
--- Emits the sing-box server JSON to /var/run/homeproxy/sing-box-s.json.
+-- HomeProxy server config generator (meow-rs kernel).
+-- Reads /etc/config/homeproxy `server` sections and emits the meow server
+-- config to /var/run/homeproxy/meow-s.yaml. The file holds JSON text,
+-- which is valid YAML 1.2 for meow's serde_yaml parser (migration spec
+-- 4.1/5). Only `enabled=1` + `type=shadowsocks` sections become
+-- `listeners:` entries; every other enabled server section is skipped
+-- with a stderr warning and recorded in unsupported-nodes.json
+-- (role="server").
 
 package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
 
@@ -9,160 +15,293 @@ local hp  = require("homeproxy")
 local uci = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 
 local UCICONFIG = "homeproxy"
+local UCISERVER = "server"
 uci:load(UCICONFIG)
 
-local UCISERVER = "server"
-local log_level = uci:get(UCICONFIG, UCISERVER, "log_level") or "warn"
--- Mark server-relayed egress with self_mark so the client-side firewall
--- steering (which may run on the same box) never recaptures it.
-local self_mark = uci:get(UCICONFIG, "infra", "self_mark") or "100"
+local OUT_PATH = hp.RUN_DIR .. "/meow-s.yaml"
+local UNSUPPORTED_PATH = hp.RUN_DIR .. "/unsupported-nodes.json"
 
--- Drop any stale output first: an abort mid-generation must not leave an
--- old sing-box-s.json for init.d's existence check to pick up.
-os.remove(hp.RUN_DIR .. "/sing-box-s.json")
-
-local function strToBool(v) return hp.strToBool(v) end
 local function strToInt(v) return hp.strToInt(v) end
-local function strToTime(v) return hp.strToTime(v) end
 local function isEmpty(v) return hp.isEmpty(v) end
 local function push(t, v) t[#t + 1] = v end
 
-local config = {}
-config.log = {
-    disabled = false,
-    level = log_level,
-    output = hp.RUN_DIR .. "/sing-box-s.log",
-    timestamp = true,
-}
-config.inbounds = {}
+local log_level = uci:get(UCICONFIG, UCISERVER, "log_level") or "warn"
+-- Same mapping as the client generator (spec 4.2): meow's tracing
+-- EnvFilter has no fatal/panic levels; they degrade to error. "trace" is
+-- not in meow's level whitelist at all -- map it down to debug.
+if log_level == "fatal" or log_level == "panic" then log_level = "error" end
+if log_level == "trace" then log_level = "debug" end
 
-uci:foreach(UCICONFIG, UCISERVER, function(cfg)
-    if cfg.enabled ~= "1" then return end
-    push(config.inbounds, {
-        type = cfg.type,
-        tag = "cfg-" .. cfg[".name"] .. "-in",
-        listen = cfg.address or "::",
-        listen_port = strToInt(cfg.port),
-        bind_interface = cfg.bind_interface,
-        reuse_addr = strToBool(cfg.reuse_addr),
-        tcp_fast_open = strToBool(cfg.tcp_fast_open),
-        tcp_multi_path = strToBool(cfg.tcp_multi_path),
-        udp_fragment = strToBool(cfg.udp_fragment),
-        udp_timeout = strToTime(cfg.udp_timeout),
-        network = cfg.network,
-        padding_scheme = cfg.anytls_padding_scheme,
-        up_mbps = strToInt(cfg.hysteria_up_mbps),
-        down_mbps = strToInt(cfg.hysteria_down_mbps),
-        obfs = cfg.hysteria_obfs_type and { type = cfg.hysteria_obfs_type, password = cfg.hysteria_obfs_password }
-            or cfg.hysteria_obfs_password,
-        recv_window_conn = strToInt(cfg.hysteria_recv_window_conn),
-        recv_window_client = strToInt(cfg.hysteria_revc_window_client),
-        max_conn_client = strToInt(cfg.hysteria_max_conn_client),
-        disable_mtu_discovery = strToBool(cfg.hysteria_disable_mtu_discovery),
-        ignore_client_bandwidth = strToBool(cfg.hysteria_ignore_client_bandwidth),
-        masquerade = cfg.hysteria_masquerade,
-        method = (cfg.type == "shadowsocks") and cfg.shadowsocks_encrypt_method or nil,
-        password = (cfg.type == "shadowsocks" or cfg.type == "shadowtls") and cfg.password or nil,
-        congestion_control = cfg.tuic_congestion_control,
-        auth_timeout = strToTime(cfg.tuic_auth_timeout),
-        zero_rtt_handshake = strToBool(cfg.tuic_enable_zero_rtt),
-        heartbeat = strToTime(cfg.tuic_heartbeat),
-        users = (cfg.type ~= "shadowsocks") and {
-            {
-                name = (cfg.type ~= "http" and cfg.type ~= "mixed" and cfg.type ~= "naive"
-                    and cfg.type ~= "socks") and ("cfg-" .. cfg[".name"] .. "-server") or nil,
-                username = cfg.username,
-                password = cfg.password,
-                auth = (cfg.hysteria_auth_type == "base64") and cfg.hysteria_auth_payload or nil,
-                auth_str = (cfg.hysteria_auth_type == "string") and cfg.hysteria_auth_payload or nil,
-                uuid = cfg.uuid,
-                flow = cfg.vless_flow,
-                alterId = strToInt(cfg.vmess_alterid),
-            },
-        } or nil,
-        multiplex = (cfg.multiplex == "1") and {
-            enabled = true,
-            padding = strToBool(cfg.multiplex_padding),
-            brutal = (cfg.multiplex_brutal == "1") and {
-                enabled = true,
-                up_mbps = strToInt(cfg.multiplex_brutal_up),
-                down_mbps = strToInt(cfg.multiplex_brutal_down),
-            } or nil,
-        } or nil,
-        tls = (cfg.tls == "1") and {
-            enabled = true,
-            server_name = cfg.tls_sni,
-            alpn = cfg.tls_alpn,
-            min_version = cfg.tls_min_version,
-            max_version = cfg.tls_max_version,
-            cipher_suites = cfg.tls_cipher_suites,
-            certificate_path = cfg.tls_cert_path,
-            key_path = cfg.tls_key_path,
-            acme = (cfg.tls_acme == "1") and {
-                domain = cfg.tls_acme_domain,
-                data_directory = hp.HP_DIR .. "/certs",
-                default_server_name = cfg.tls_acme_dsn,
-                email = cfg.tls_acme_email,
-                provider = cfg.tls_acme_provider,
-                disable_http_challenge = strToBool(cfg.tls_acme_dhc),
-                disable_tls_alpn_challenge = strToBool(cfg.tls_acme_dtac),
-                alternative_http_port = strToInt(cfg.tls_acme_ahp),
-                alternative_tls_port = strToInt(cfg.tls_acme_atp),
-                external_account = (cfg.tls_acme_external_account == "1") and {
-                    key_id = cfg.tls_acme_ea_keyid,
-                    mac_key = cfg.tls_acme_ea_mackey,
-                } or nil,
-                dns01_challenge = (cfg.tls_dns01_challenge == "1") and {
-                    provider = cfg.tls_dns01_provider,
-                    access_key_id = cfg.tls_dns01_ali_akid,
-                    access_key_secret = cfg.tls_dns01_ali_aksec,
-                    region_id = cfg.tls_dns01_ali_rid,
-                    api_token = cfg.tls_dns01_cf_api_token,
-                } or nil,
-            } or nil,
-            ech = cfg.tls_ech_key and { enabled = true, key = hp.split(cfg.tls_ech_key, "\n") } or nil,
-            reality = (cfg.tls_reality == "1") and {
-                enabled = true,
-                private_key = cfg.tls_reality_private_key,
-                short_id = cfg.tls_reality_short_id,
-                max_time_difference = strToTime(cfg.tls_reality_max_time_difference),
-                handshake = {
-                    server = cfg.tls_reality_server_addr,
-                    server_port = strToInt(cfg.tls_reality_server_port),
-                },
-            } or nil,
-        } or nil,
-        transport = not isEmpty(cfg.transport) and {
-            type = cfg.transport,
-            host = cfg.http_host or cfg.httpupgrade_host,
-            path = cfg.http_path or cfg.ws_path,
-            headers = cfg.ws_host and { Host = cfg.ws_host } or nil,
-            method = cfg.http_method,
-            max_early_data = strToInt(cfg.websocket_early_data),
-            early_data_header_name = cfg.websocket_early_data_header,
-            service_name = cfg.grpc_servicename,
-            idle_timeout = strToTime(cfg.http_idle_timeout),
-            ping_timeout = strToTime(cfg.http_ping_timeout),
-        } or nil,
-    })
-end)
+-- Server-relayed egress is a DIRECT outbound socket; routing-mark tags it
+-- with self_mark so client-side steering on the same box never recaptures
+-- it (advisory only -- spec 5/D9). routing-mark is a u32 fwmark: clamp or
+-- fall back to the infra default rather than emitting a rejected value.
+local self_mark = strToInt(uci:get(UCICONFIG, "infra", "self_mark")) or 100
+if self_mark < 0 or self_mark > 4294967295 then
+	io.stderr:write("homeproxy: WARNING: infra.self_mark=" .. tostring(self_mark)
+		.. " is out of u32 range -- using 100\n")
+	self_mark = 100
+end
+local ipv6_support = uci:get(UCICONFIG, "config", "ipv6_support") == "1"
 
-if #config.inbounds == 0 then
-    -- Remove a stale config so init.d's existence check can't pass on it.
-    os.remove(hp.RUN_DIR .. "/sing-box-s.json")
-    os.exit(1)
+-- Ports the co-located client instance already owns (spec 5): a listener
+-- asked to bind one would fail at runtime (meow skips the listener, the
+-- process stays up), so warn at generation time. The API controller port
+-- is hardcoded in generate_client.lua.
+local reserved_ports = { [19290] = true }
+for opt, def in pairs({ mixed_port = 5330, redirect_port = 5331, dns_port = 5333, v6_port = 5334 }) do
+	reserved_ports[strToInt(uci:get(UCICONFIG, "infra", opt)) or def] = true
 end
 
--- Explicit direct outbound carrying self_mark: inbound traffic relayed by
--- this server originates new connections that must bypass the client
--- steering rules (OUTPUT hooks) on the same router.
-config.outbounds = {
-    { type = "direct", tag = "direct-out", routing_mark = strToInt(self_mark) },
-}
-config.route = { final = "direct-out" }
+-- Listen address for every emitted listener: dual-stack wildcard while
+-- ipv6_support=1, IPv4-only wildcard otherwise (a "::" bind with IPv6
+-- disabled would be a dead listener).
+local listen_addr = ipv6_support and "::" or "0.0.0.0"
 
+-- Drop any stale output first: an abort mid-generation must not leave an
+-- old meow-s.yaml for init.d's existence check to pick up. RUN_DIR is
+-- created up front so both outputs below can always write.
+os.remove(OUT_PATH)
 hp.mkdir_p(hp.RUN_DIR)
-if not hp.writefile(hp.RUN_DIR .. "/sing-box-s.json", hp.encode_json(config)) then
-    io.stderr:write("homeproxy: ERROR: failed to write " .. hp.RUN_DIR .. "/sing-box-s.json\n")
-    os.exit(1)
+
+-- Same WAN-resolver discovery as generate_client.lua: loopback/unspecified
+-- resolvers point back at local dnsmasq and would loop. The server-side
+-- meow resolver exists to resolve SS target domain names.
+local function get_wan_dns()
+	local function valid_ns(ns)
+		if type(ns) == "table" then ns = ns[1] end
+		if type(ns) ~= "string" or ns == "" then return nil end
+		if ns:match("^127%.") or ns == "::1" or ns == "0.0.0.0" or ns == "::" then return nil end
+		return hp.validation("ipaddr", ns) and ns or nil
+	end
+	for _, p in ipairs({ "/tmp/resolv.conf.auto", "/tmp/resolv.conf.d/resolv.conf.auto",
+	                    "/tmp/resolv.conf" }) do
+		local f = io.open(p, "r")
+		if f then
+			for line in f:lines() do
+				local ns = valid_ns(line:match("^%s*nameserver%s+([%d%.:%a]+)"))
+				if ns then f:close(); return ns end
+			end
+			f:close()
+		end
+	end
+	return valid_ns(uci:get("network", "wan", "dns"))
+end
+
+local wan_dns = get_wan_dns()
+if isEmpty(wan_dns) then wan_dns = "223.5.5.5" end
+
+-- spec 5 cipher set for the ss listener (errata: xchacha20 removed).
+-- Measured against the local v0.24.0 reference binary (Windows release
+-- build, `full listener-shadowsocks`): `meow -t` accepts ANY cipher
+-- string in a listener (config validation never parses it -- the probe
+-- passes even for stream ciphers), but at runtime bind the shadowsocks
+-- crate's CipherKind::from_str runs and this build lacks `v1-aead-extra`,
+-- so 'xchacha20-ietf-poly1305' is rejected with "unknown cipher" -- a
+-- zombie listener. It is therefore NOT in the set below: sections using
+-- it go through standard quarantine like any other unsupported cipher.
+local SS_LISTENER_CIPHERS = {
+	["aes-128-gcm"] = true,
+	["aes-256-gcm"] = true,
+	["chacha20-ietf-poly1305"] = true,
+	["2022-blake3-aes-128-gcm"] = true,
+	["2022-blake3-aes-256-gcm"] = true,
+	["2022-blake3-chacha20-poly1305"] = true,
+}
+
+-- Quarantine records, same file shape as the other writers (spec 4.6,
+-- U2 merge format): {name,type,reason,source,role}. Server records carry
+-- source="uci" + role="server".
+local unsupported = {}
+local function record_skip(cfg, reason)
+	local name = tostring(cfg[".name"] or "?")
+	io.stderr:write("homeproxy: WARNING: server section '" .. name
+		.. "' skipped: " .. reason .. "\n")
+	push(unsupported, {
+		name = name,
+		type = tostring(cfg.type or "unknown"),
+		reason = reason,
+		source = "uci",
+		role = "server",
+	})
+end
+
+-- tmp+rename atomic write (spec 4.1 / hard constraint 5).
+local function atomic_write(path, content)
+	local tmp = path .. ".tmp." .. tostring(os.time()) .. "." .. tostring(math.random(100000, 999999))
+	if hp.writefile(tmp, content) and os.rename(tmp, path) then return true end
+	os.remove(tmp)
+	return false
+end
+
+-- Merge this run's skips into unsupported-nodes.json. This file owns the
+-- role="server" partition: prior server records are rewritten from live
+-- UCI sections on every run, while every other writer's records (client
+-- nodes from the generator, link drops from update_subscriptions) are
+-- preserved untouched.
+local function flush_unsupported()
+	local existing = {}
+	local raw = hp.readfile(UNSUPPORTED_PATH)
+	if not isEmpty(raw) then
+		local ok, j = pcall(hp.decode_json, raw)
+		if ok and type(j) == "table" then existing = j end
+	end
+	local seen, merged = {}, {}
+	for _, e in ipairs(existing) do
+		if type(e) == "table" and e.role ~= "server" then
+			local k = tostring(e.name) .. "|" .. tostring(e.type) .. "|" .. tostring(e.reason)
+			if not seen[k] then merged[#merged + 1] = e; seen[k] = true end
+		end
+	end
+	for _, e in ipairs(unsupported) do
+		local k = tostring(e.name) .. "|" .. tostring(e.type) .. "|" .. tostring(e.reason)
+		if not seen[k] then merged[#merged + 1] = e; seen[k] = true end
+	end
+	if #merged == 0 then
+		-- Nothing quarantined anywhere: remove a stale file so
+		-- `homeproxy nodes` / the API stop reporting ghosts.
+		os.remove(UNSUPPORTED_PATH)
+		return
+	end
+	if not atomic_write(UNSUPPORTED_PATH, hp.encode_json(merged)) then
+		io.stderr:write("homeproxy: WARNING: failed to write " .. UNSUPPORTED_PATH .. "\n")
+	end
+end
+
+local listeners = {}
+local used_ports = {}
+local saw_enabled = false   -- any enabled server section at all (rc split below)
+
+uci:foreach(UCICONFIG, UCISERVER, function(cfg)
+	if cfg.enabled ~= "1" then return end
+	saw_enabled = true
+	local name = tostring(cfg[".name"] or "?")
+
+	-- meow's server side is shadowsocks-only (spec 5/D12); every other
+	-- enabled server type is a quarantine case.
+	if cfg.type ~= "shadowsocks" then
+		record_skip(cfg, string.format(
+			"server type '%s' is not supported by meow (shadowsocks listeners only)",
+			tostring(cfg.type)))
+		return
+	end
+
+	local cipher = cfg.shadowsocks_encrypt_method
+	if isEmpty(cipher) then
+		record_skip(cfg, "missing shadowsocks_encrypt_method")
+		return
+	end
+	if not SS_LISTENER_CIPHERS[cipher] then
+		record_skip(cfg, string.format(
+			"shadowsocks cipher '%s' is not in the meow listener cipher set", tostring(cipher)))
+		return
+	end
+
+	if isEmpty(cfg.password) then
+		record_skip(cfg, "missing password")
+		return
+	end
+	-- 2022-blake3 ciphers: the password must be a base64 key of exactly
+	-- the cipher's key length, else the listener fails its runtime bind
+	-- (`meow -t` does not check this). Same rule the client-side precheck
+	-- applies to outbound nodes (subscription_parser.lua).
+	if cipher:sub(1, 12) == "2022-blake3-" then
+		local need = (cipher == "2022-blake3-aes-128-gcm") and 16 or 32
+		local decoded = type(cfg.password) == "string"
+			and cfg.password:match("^[A-Za-z0-9%+%/_%-]+=?=?$")
+			and hp.decodeBase64Str(cfg.password) or nil
+		if not decoded or #decoded ~= need then
+			record_skip(cfg, string.format(
+				"shadowsocks %s requires a base64 key of %d bytes", cipher, need))
+			return
+		end
+	end
+
+	local port = strToInt(cfg.port)
+	if not port or not hp.validation("port", cfg.port) then
+		record_skip(cfg, "missing or invalid port '" .. tostring(cfg.port) .. "'")
+		return
+	end
+	-- meow hard-fails `meow -t` on duplicate listener ports (Class A), so
+	-- a colliding section is skipped here instead.
+	if used_ports[port] then
+		record_skip(cfg, string.format(
+			"port %d already used by server section '%s'", port, used_ports[port]))
+		return
+	end
+	-- An infra-reserved port is not a quarantine case (the listener is
+	-- still emitted per spec) but its bind will fail at runtime while the
+	-- client instance owns the port -- make that visible now.
+	if reserved_ports[port] then
+		io.stderr:write("homeproxy: WARNING: server section '" .. name
+			.. "': port " .. port .. " collides with a homeproxy infra/api port"
+			.. " (5330/5331/5333/5334/19290) -- listener bind will fail at runtime\n")
+	end
+	-- server.address is silently ignored by design: listeners always bind
+	-- the wildcard so relayed LAN/WAN clients can reach them. Say so.
+	if not isEmpty(cfg.address) then
+		io.stderr:write("homeproxy: WARNING: server section '" .. name
+			.. "': address '" .. tostring(cfg.address) .. "' ignored, binding "
+			.. listen_addr .. "\n")
+	end
+
+	local listener = {
+		name = "cfg-" .. name .. "-in",
+		type = "shadowsocks",
+		listen = listen_addr,
+		port = port,
+		cipher = cipher,
+		password = cfg.password,
+		udp = true,     -- meow default is already true; emit it explicitly (spec 5)
+	}
+	-- The hysteria_obfs_* UCI fields double as the SS simple-obfs source
+	-- (spec 5). meow's server-side codec needs only the mode (http|tls);
+	-- anything else would hard-fail `meow -t`, so it is dropped with a
+	-- warning rather than emitted.
+	local obfs_mode = cfg.hysteria_obfs_type
+	if not isEmpty(obfs_mode) then
+		if obfs_mode == "http" or obfs_mode == "tls" then
+			listener["simple-obfs"] = { enable = true, mode = obfs_mode }
+		else
+			io.stderr:write("homeproxy: WARNING: server section '" .. name
+				.. "': hysteria_obfs_type '" .. tostring(obfs_mode)
+				.. "' is not a meow simple-obfs mode (http|tls) -- obfs dropped\n")
+		end
+	end
+
+	used_ports[port] = name
+	push(listeners, listener)
+end)
+
+flush_unsupported()
+
+if #listeners == 0 then
+	-- Leave no output behind (the stale file was already removed above).
+	-- Exit code splits the two cases so the caller can react differently:
+	--   rc=2 -- enabled server sections existed but every one landed in
+	--           quarantine: the server side is "configured but unusable",
+	--           init.d logs it and continues with the client config.
+	--   rc=1 -- no enabled server section at all (or a real failure
+	--           below): the original error path.
+	os.exit(saw_enabled and 2 or 1)
+end
+
+local config = {
+	mode = "rule",
+	["log-level"] = log_level,
+	ipv6 = ipv6_support,
+	["routing-mark"] = self_mark,
+	-- No external-controller: it would collide with the client instance on
+	-- 127.0.0.1:19290 (spec 5). dns.listen is likewise omitted -- the
+	-- resolver exists for SS target domain resolution only (12-Q8:
+	-- measured, `dns.enable` without `listen` passes `meow -t`).
+	dns = { enable = true, nameserver = { "udp://" .. wan_dns } },
+	listeners = listeners,
+	-- Inbound traffic terminates here and egresses via DIRECT.
+	rules = { "MATCH,DIRECT" },
+}
+
+if not atomic_write(OUT_PATH, hp.encode_json(config)) then
+	io.stderr:write("homeproxy: ERROR: failed to write " .. OUT_PATH .. "\n")
+	os.exit(1)
 end

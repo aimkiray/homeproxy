@@ -189,7 +189,7 @@ async function loadState(){
  try{
   const s=await apiJson('state');
   const b=$('badge');b.className='badge '+(s.running?'b-on':'b-off');b.textContent=s.running?'running':'stopped';
-  $('ver').textContent='sing-box '+s.version+' · MiWiFi Lua port';
+  $('ver').textContent='meow '+s.version+' · MiWiFi Lua port';
   let mn=s.main_node;
   if(mn==='nil')mn='none (nil)';
   else if(mn==='urltest')mn='urltest (auto)';
@@ -215,7 +215,11 @@ async function loadConfig(){
   const t=await api('config');cfg=JSON.parse(t);
   const sel=$('node');
   const nodes=Object.entries(cfg.values).filter(([,v])=>v['.type']==='node').sort((a,b)=>(a[1].label||a[0]).localeCompare(b[1].label||b[0]));
-  sel.innerHTML='<option value="nil">— none (nil) —</option><option value="urltest">urltest (auto)</option>'+nodes.map(([k,v])=>`<option value="${esc(k)}">${esc(v.label||k)} · ${esc(v.type||'')}</option>`).join('');
+  sel.innerHTML='<option value="nil">— none (nil) —</option><option value="urltest">urltest (auto)</option>'+nodes.map(([k,v])=>{
+   const un=v.unsupported;
+   const title=un?` title="${esc('unsupported: '+(un===true?'quarantined by generator':un))}"`:'';
+   return `<option value="${esc(k)}"${title}>${esc(v.label||k)} · ${esc(v.type||'')}${un?' ⚠':''}</option>`;
+  }).join('');
   if(lastMain!==null&&[...sel.options].some(o=>o.value===lastMain))sel.value=lastMain;
   if(pingResults)setNodeMs(pingResults);
  }catch(e){toast('config: '+e.message)}

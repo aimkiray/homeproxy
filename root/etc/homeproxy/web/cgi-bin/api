@@ -5,8 +5,8 @@
 # (init.d/homeproxy-web) bound to the LAN interface -- no authentication.
 #
 # Endpoints (action= in the query string; value in the POST body for writes):
-#   state              current settings + running flag + sing-box version
-#   config             projected UCI view (whitelisted fields only, no secrets)
+#   state|status       current settings + running flag + meow version
+#   config|settings    projected UCI view (whitelisted fields only, no secrets)
 #   set_main_node      body=node        -> set + restart
 #   set_routing_mode   body=mode        -> set + restart
 #   set_lan_proxy     body=mode        -> set control.lan_proxy_mode + restart
@@ -19,22 +19,30 @@
 #   subscribe          -> update subscriptions + restart
 #   restart            -> /etc/init.d/homeproxy restart
 #   log                -> last N lines of the log (lines=, default 80)
-#   ping_nodes         -> per-node TCP/HTTP delay (ms) via sing-box Clash API
-#   connectivity        -> Google (overseas, via proxy) + Baidu (CN) reachability & ms
+#   ping_node?name=<n> -> single-node delay (ms) via meow external-controller
+#   ping_nodes|ping_all -> per-node delay table (ms) via meow external-controller
+#   connectivity        -> Google (via mixed port) + Baidu (CN, direct) & ms
 
 set -u
 [ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
 HP_LIB_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
 HP_RES_DIR="${HP_RES_DIR:-/etc/homeproxy/resources}"
 HP_BIN_DIR="${HP_BIN_DIR:-/usr/bin}"
-HP_SINGBOX="${HP_SINGBOX:-$(command -v sing-box 2>/dev/null)}"
-HP_SINGBOX="${HP_SINGBOX:-/usr/bin/sing-box}"
-export PATH=/usr/bin:/bin:/usr/sbin:/sbin:"${HP_SINGBOX%/*}":"$HP_BIN_DIR"
+HP_MEOW_BIN="${HP_MEOW_BIN:-$(command -v meow 2>/dev/null)}"
+HP_MEOW_BIN="${HP_MEOW_BIN:-/usr/bin/meow}"
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin:"${HP_MEOW_BIN%/*}":"$HP_BIN_DIR"
 CONF=homeproxy
 RUN_DIR=/var/run/homeproxy
-LOG_PATH=$RUN_DIR/$CONF.log
+LOG_PATH=$RUN_DIR/meow-c.log
+MAIN_LOG=$RUN_DIR/$CONF.log
 INIT=/etc/init.d/$CONF
-SINGBOX="$HP_SINGBOX"
+MEOW="$HP_MEOW_BIN"
+# meow external-controller (Clash API): loopback only, no secret.
+API=http://127.0.0.1:19290
+# Router-originated proxied requests go through the explicit mixed port
+# (spec D7/D15): the router's own OUTPUT is no longer transparently steered.
+MIXED_PORT=$(uci -q get $CONF.infra.mixed_port 2>/dev/null); MIXED_PORT=${MIXED_PORT:-5330}
+TEST_URL=http://www.gstatic.com/generate_204
 
 # --- helpers ---------------------------------------------------------------
 hdr() { printf '%s\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\n\r\n' "$1"; }
@@ -52,16 +60,17 @@ jesc() {
 
 # parse ?action=...&lines=...  (set -f: QUERY_STRING is attacker input --
 # word-splitting it must not also pathname-expand globs)
-Q_action=""; Q_lines="80"
+Q_action=""; Q_lines="80"; Q_name=""
 set -f
 for kv in $(printf '%s' "${QUERY_STRING:-}" | tr '&' ' '); do
 	case "$kv" in
 		action=*) Q_action=${kv#action=} ;;
 		lines=*)  Q_lines=${kv#lines=} ;;
+		name=*)   Q_name=${kv#name=} ;;
 	esac
 done
 set +f
-case "$Q_lines" in *[!0-9]*) Q_lines=80 ;; esac
+case "$Q_lines" in ''|*[!0-9]*) Q_lines=80 ;; esac
 # Cap the log tail: an unbounded lines= is a cheap memory/CPU DoS.
 [ "$Q_lines" -gt 2000 ] 2>/dev/null && Q_lines=2000
 
@@ -123,7 +132,7 @@ is_hostname() {
 		&& [ ${#1} -le 253 ]
 }
 # loopback / unspecified / link-local / ULA -- never a legitimate upstream
-# or subscription host (DNS via these loops back through dnsmasq/sing-box,
+# or subscription host (DNS via these loops back through dnsmasq/meow,
 # and blind router-side fetches of them are pure SSRF surface).
 is_local_addr() {
 	case "$1" in
@@ -185,23 +194,38 @@ esac
 # --- endpoints -------------------------------------------------------------
 case "$Q_action" in
 
-state)
+state|status)
 	running=false
-	pgrep -f "sing-box run --config $RUN_DIR/sing-box" >/dev/null 2>&1 && running=true
-	version=$("$SINGBOX" version -n 2>/dev/null | awk 'NR==1{print $NF}')
+	# spec 8.4/10: the procd instances run "meow -f $RUN_DIR/meow-{c,s}.yaml".
+	pgrep -f "meow -f $RUN_DIR/meow-" >/dev/null 2>&1 && running=true
+	# meow --version -> "meow 0.24.0" (first line, last field; spec 8.4).
+	# Fall back to the external-controller when the binary is not callable.
+	version=$("$MEOW" --version 2>/dev/null | awk 'NR==1{print $NF}')
+	if [ -z "$version" ]; then
+		version=$(curl -sf --max-time 2 "$API/version" 2>/dev/null \
+			| sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+	fi
+	# The Clash API reports a "v"-prefixed tag ({"version":"v0.24.0"}) while
+	# `meow --version` prints a bare number -- normalize so both paths agree.
+	version=${version#v}
 	[ -z "$version" ] && version="unknown"
 	main_node=$(uci -q get $CONF.config.main_node 2>/dev/null); main_node=${main_node:-nil}
 	routing_mode=$(uci -q get $CONF.config.routing_mode 2>/dev/null); routing_mode=${routing_mode:-bypass_mainland_china}
-	proxy_mode=$(uci -q get $CONF.config.proxy_mode 2>/dev/null); proxy_mode=${proxy_mode:-redirect_tproxy}
+	# proxy_mode has a new vocabulary (spec 3.4/8.5): legacy/unknown values
+	# degrade to the strongest surviving combination, same as init.d.
+	proxy_mode=$(uci -q get $CONF.config.proxy_mode 2>/dev/null)
+	case "$proxy_mode" in redirect|tproxy|redirect_tproxy) ;; *) proxy_mode=redirect_tproxy ;; esac
 	lan_proxy=$(uci -q get $CONF.control.lan_proxy_mode 2>/dev/null); lan_proxy=${lan_proxy:-disabled}
 	json_ok "$(printf '{"ok":true,"running":%s,"version":"%s","main_node":"%s","routing_mode":"%s","proxy_mode":"%s","lan_proxy_mode":"%s"}' \
 		"$running" "$(jesc "$version")" "$(jesc "$main_node")" "$(jesc "$routing_mode")" "$(jesc "$proxy_mode")" "$(jesc "$lan_proxy")")"
 	;;
 
-config)
+config|settings)
 	# Projected view of the UCI config (H1): the raw ubus dump exposed every
 	# node credential/private key/github token to any LAN client. Only the
-	# fields the UI actually reads are emitted, per section type.
+	# fields the UI actually reads are emitted, per section type. The infra
+	# whitelist is the post-migration option set (spec 3.1): removed keys
+	# (tproxy_port, tun_*) are never emitted even while UCI still has them.
 	out=$(HP_LUAPATH="$HP_LIB_DIR" lua -e '
 		package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
 		local hp = require("homeproxy")
@@ -216,9 +240,24 @@ config)
 				lan_proxy_mac_addrs=1, lan_direct_ipv4_ips=1, lan_direct_ipv6_ips=1,
 				lan_direct_mac_addrs=1 },
 			node = { label=1, type=1, grouphash=1 },
-			infra = { mixed_port=1, redirect_port=1, tproxy_port=1, dns_port=1,
-				tun_name=1 },
+			infra = { mixed_port=1, redirect_port=1, dns_port=1,
+				v6_port=1, dns_redirect=1, udp_timeout=1 },
 		}
+		-- Quarantine annotations (spec 4.6): the generator lists nodes it
+		-- skipped in unsupported-nodes.json; flag matching node sections so
+		-- the UI can mark entries that have no outbound in the live config.
+		local unsupported = {}
+		do
+			local raw = hp.readfile(hp.RUN_DIR .. "/unsupported-nodes.json")
+			local ok, list = pcall(hp.decode_json, raw or "")
+			if ok and type(list) == "table" then
+				for _, e in ipairs(list) do
+					if type(e) == "table" and type(e.name) == "string" and e.role ~= "server" then
+						unsupported[e.name] = e.reason or true
+					end
+				end
+			end
+		end
 		local values = {}
 		for name, s in pairs(uci:get_all("homeproxy") or {}) do
 			local t = s[".type"]
@@ -229,6 +268,9 @@ config)
 				local proj = { [".type"] = t }
 				for k in pairs(keep) do
 					if s[k] ~= nil then proj[k] = s[k] end
+				end
+				if t == "node" and unsupported[name] ~= nil then
+					proj.unsupported = unsupported[name]
 				end
 				values[name] = proj
 			end
@@ -310,13 +352,15 @@ set_direct_list|set_proxy_list)
 	# blank lines. Reject any non-comment line that is not a plain domain
 	# ([A-Za-z0-9._-]+): a '/' or whitespace would break dnsmasq server=/
 	# ipset= delimiters and take DNS down silently. Empty body clears the list.
-	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.list.$$"
-	badf="${tmp}.bad"
 	# Validate per DNS label (H3): the old [A-Za-z0-9._-]+ check accepted
 	# "."/".."/"a..b"/"-x", which produce dnsmasq directives like server=/./
 	# (redirecting EVERYTHING into the proxy ipset) or make dnsmasq refuse
 	# to start -- killing LAN DNS/DHCP. Empty body still clears the list.
+	# The size gate runs before mktemp: it exits via json_err on oversize
+	# bodies and would otherwise orphan the temp file.
 	require_body_size
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.list.$$"
+	badf="${tmp}.bad"
 	read_body | tr -d '\r' | awk -v bad="$badf" '
 		function okdom(s,  i,n,a) {
 			if (length(s) > 253) return 0
@@ -346,8 +390,8 @@ set_subscription_urls)
 	# body.  Two-pass: validate-all-then-save so a single bad line
 	# does not wipe the existing list.  Must start with http(s):// or
 	# sip008:// — same scheme check as update_subscriptions.lua.
-	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.suburls.$$"
 	require_body_size
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.suburls.$$"
 	read_body >"$tmp"
 	bad=""
 	# `read` returns nonzero on an unterminated final line -- without the
@@ -393,8 +437,8 @@ set_dns)
 	# Body: two lines -- proxy_dns on line 1, china_dns on line 2.
 	# proxy_dns: IP or https://host/path (DoH via tunnel)
 	# china_dns:  IP only (UDP, direct)
-	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"
 	require_body_size
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"
 	read_body >"$tmp"
 	proxy_dns=$(sed -n '1p' "$tmp" | tr -d '\r')
 	china_dns=$(sed -n '2p' "$tmp" | tr -d '\r')
@@ -403,14 +447,17 @@ set_dns)
 	china_dns=$(printf '%s' "$china_dns" | sed 's/^[ \t]*//;s/[ \t]*$//')
 	rm -f "$tmp"
 	# Validate proxy_dns strictly (H2): anything stored here is rendered into
-	# sing-box's DNS config, where a bad value makes `sing-box check` fail and
+	# meow's dns.nameserver list, where a bad value makes `meow -t` fail and
 	# the service never comes back up. Accept a bare IP (UDP) or a
-	# proto://host[:port][/path] with a proto sing-box understands.
+	# proto://host[:port][/path] with a proto meow understands (spec 0.3:
+	# udp/tcp/tls/https -- quic/h3 were kernel-specific and dropped). rcode://
+	# is excluded on purpose: it only exists as a dns_server section type, and
+	# stored here plain_dns_url would silently swap it for wan DNS.
 	case "$proxy_dns" in
 		"") json_err "proxy DNS is required" ;;
 		*://*)
 			proto=${proxy_dns%%://*}
-			case "$proto" in udp|tcp|tls|https|quic|h3) : ;; *) json_err "unsupported DNS protocol: $proto" ;; esac
+			case "$proto" in udp|tcp|tls|https) : ;; *) json_err "unsupported DNS protocol: $proto" ;; esac
 			dha=${proxy_dns#*://}; dha=${dha%%/*}
 			# Split host/port: bracketed IPv6 may carry :port after ']';
 			# unbracketed multi-colon is unparseable -> reject.
@@ -450,18 +497,56 @@ set_dns)
 	json_ok "{\"ok\":true,\"proxy_dns\":\"$(jesc "$proxy_dns")\",\"china_dns\":\"$(jesc "$china_dns")\"}"
 	;;
 
-ping_nodes)
-	# Per-node delay (ms) via the sing-box Clash API (loopback 127.0.0.1:19290).
-	# Requires generate_client.lua experimental.clash_api + a restart. Tests a
-	# real HTTP round-trip through each node outbound -- not a raw TCP ping --
-	# because the router's own OUTPUT is NAT-redirected into sing-box.
-	api=http://127.0.0.1:19290
-	curl -sf --max-time 2 "$api/version" >/dev/null 2>&1 || json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)"
-	test_url=http://www.gstatic.com/generate_204
+ping_node)
+	# Single-node delay probe (spec 8.5): name is a UCI node section (probed
+	# as cfg-<name>-out), an explicit tag (main-out/main-udp-out/cfg-*-out)
+	# or a group/reserved name. "urltest" resolves to the main-out group.
+	case "$Q_name" in
+		"") json_err "missing name" ;;
+		nil) json_err "nothing to ping" ;;
+		urltest) tag=main-out ;;
+		*[!A-Za-z0-9_-]*) json_err "invalid node name" ;;
+		*-out|GLOBAL|DIRECT|REJECT) tag=$Q_name ;;
+		*) tag="cfg-$Q_name-out" ;;
+	esac
+	curl -sf --max-time 2 "$API/version" >/dev/null 2>&1 \
+		|| json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)"
+	body=$(mktemp 2>/dev/null) || body=/tmp/hp_pn.$$
+	code=$(curl -s --max-time 8 -o "$body" -w '%{http_code}' \
+		"$API/proxies/$tag/delay?url=$TEST_URL&timeout=5000" 2>/dev/null) || code=000
+	case "$code" in ''|*[!0-9]*) code=000 ;; esac
+	if [ "$code" != "200" ]; then
+		rm -f "$body"
+		# spec 8.5/0.3 error semantics for the delay endpoint.
+		case "$code" in
+			404) json_err "node not found" ;;
+			503) json_err "unreachable" ;;
+			504) json_err "timeout" ;;
+			400) json_err "bad request" ;;
+			000) json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)" ;;
+			*)   json_err "delay probe failed (HTTP $code)" ;;
+		esac
+	fi
+	ms=$(sed -n 's/.*"delay"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$body" 2>/dev/null)
+	rm -f "$body"
+	[ -n "$ms" ] || json_err "invalid delay response"
+	json_ok "{\"ok\":true,\"node\":\"$(jesc "$Q_name")\",\"delay\":$ms}"
+	;;
+
+ping_nodes|ping_all)
+	# Per-node delay (ms) via the meow external-controller (Clash API,
+	# loopback 127.0.0.1:19290). Requires generate_client.lua
+	# external-controller + a restart. The round-trip has to run INSIDE
+	# meow: with no OUTPUT steering left (spec D7), a router-side fetch to
+	# the test URL would bypass the proxy entirely and prove nothing.
+	curl -sf --max-time 2 "$API/version" >/dev/null 2>&1 || json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)"
 	tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/hp_ping.$$ ; mkdir -p "$tmp" 2>/dev/null
+	tags="main-out main-udp-out"
 	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
-		tag=cfg-$sect-out
-		( curl -s --max-time 8 "$api/proxies/$tag/delay?url=$test_url&timeout=5000" -o "$tmp/$sect" 2>/dev/null; echo $? >"$tmp/$sect.rc" ) &
+		tags="$tags cfg-$sect-out"
+	done
+	for tag in $tags; do
+		( curl -s --max-time 8 -o "$tmp/$tag" -w '%{http_code}' "$API/proxies/$tag/delay?url=$TEST_URL&timeout=5000" >"$tmp/$tag.code" 2>/dev/null; echo $? >"$tmp/$tag.rc" ) &
 	done
 	wait
 	first=1
@@ -470,10 +555,22 @@ ping_nodes)
 	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
 		[ "$first" -eq 0 ] && printf ','
 		first=0
-		d=$(cat "$tmp/$sect" 2>/dev/null)
-		ms=$(printf '%s' "$d" 2>/dev/null | sed -n 's/.*"delay":[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+		ms=null
+		[ "$(cat "$tmp/cfg-$sect-out.code" 2>/dev/null)" = "200" ] && \
+			ms=$(sed -n 's/.*"delay"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmp/cfg-$sect-out" 2>/dev/null)
 		[ -n "$ms" ] || ms=null
 		printf '"%s":%s' "$(jesc "$sect")" "$ms"
+	done
+	# main-out/main-udp-out are probed under their own keys too (spec 8.5:
+	# group tags are measurable); UIs keying on section names ignore them.
+	for tag in main-out main-udp-out; do
+		[ "$first" -eq 0 ] && printf ','
+		first=0
+		ms=null
+		[ "$(cat "$tmp/$tag.code" 2>/dev/null)" = "200" ] && \
+			ms=$(sed -n 's/.*"delay"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$tmp/$tag" 2>/dev/null)
+		[ -n "$ms" ] || ms=null
+		printf '"%s":%s' "$tag" "$ms"
 	done
 	printf '}}\n'
 	rm -rf "$tmp" 2>/dev/null
@@ -481,12 +578,12 @@ ping_nodes)
 
 connectivity)
 	# Reachability + round-trip latency for an overseas site (Google) and a CN
-	# site (Baidu). The router's own OUTPUT is NAT-redirected for non-CN dst,
-	# so Google is exercised THROUGH sing-box while Baidu (CN ipset RETURN) goes
-	# direct in bypass mode -- no firewall changes needed. Uses time to first
-	# byte (starttransfer) so Baidu's body size does not skew the latency.
+	# site (Baidu). With no OUTPUT steering left (spec D7), the Google leg is
+	# sent explicitly through the mixed listener (spec 9.4/D15); Baidu stays
+	# direct -- no firewall dependency either way. Uses time to first byte
+	# (starttransfer) so Baidu's body size does not skew the latency.
 	tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/hp_conn.$$ ; mkdir -p "$tmp" 2>/dev/null
-	( curl -s -o /dev/null --max-time 8 -w '%{http_code} %{time_starttransfer}' "http://www.google.com/generate_204" >"$tmp/google" 2>/dev/null; echo $? >"$tmp/google.rc" ) &
+	( curl -s -o /dev/null --max-time 8 -x "http://127.0.0.1:$MIXED_PORT" -w '%{http_code} %{time_starttransfer}' "$TEST_URL" >"$tmp/google" 2>/dev/null; echo $? >"$tmp/google.rc" ) &
 	( curl -s -o /dev/null --max-time 8 -w '%{http_code} %{time_starttransfer}' "http://www.baidu.com/" >"$tmp/baidu" 2>/dev/null; echo $? >"$tmp/baidu.rc" ) &
 	wait
 	conn_ms() {
@@ -514,7 +611,7 @@ connectivity)
 
 subscribe)
 	# The updater commits UCI and restarts the service itself when the node
-	# set changed -- restarting here too would bounce sing-box twice.
+	# set changed -- restarting here too would bounce meow twice.
 	tmp=$(mktemp 2>/dev/null || echo /tmp/hp_sub.$$.log)
 	# Run the node-name migration first (same ordering as CLI/cron): without
 	# it, an update fired between a package upgrade and the first service
@@ -539,12 +636,23 @@ restart)
 	;;
 
 log)
+	# meow-c.log is the kernel runtime log; homeproxy.log keeps the
+	# init/Lua-side messages (generator/migration warnings, spec 8.6).
+	# Show whichever logs exist so a failed generate is still diagnosable
+	# when the kernel never started (and left no meow-c.log behind).
 	n="$Q_lines"
-	text_out "$(tail -n "$n" "$LOG_PATH" 2>/dev/null || echo '(no log yet)')"
+	out=""
+	[ -s "$MAIN_LOG" ] && out="== $CONF.log ==
+$(tail -n "$n" "$MAIN_LOG" 2>/dev/null)"
+	[ -s "$LOG_PATH" ] && out="${out:+$out
+
+}== meow-c.log ==
+$(tail -n "$n" "$LOG_PATH" 2>/dev/null)"
+	text_out "${out:-(no log yet)}"
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state config set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns add_node ping_nodes connectivity subscribe restart log"
+	text_out "HomeProxy API. actions: state status config settings set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns add_node ping_node ping_nodes ping_all connectivity subscribe restart log"
 	;;
 
 *)

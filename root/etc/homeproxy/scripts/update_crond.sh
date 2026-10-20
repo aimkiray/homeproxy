@@ -3,6 +3,8 @@
 #
 # HomeProxy cron job: refresh resource lists and subscriptions.
 
+set -u
+
 SCRIPTS_DIR="/etc/homeproxy/scripts"
 [ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
 LUA_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"

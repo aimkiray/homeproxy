@@ -4,6 +4,8 @@
 # HomeProxy resource list updater (MiWiFi port; uses lua+luci.json instead of
 # jsonfilter which is unavailable on stock MiWiFi).
 
+set -u
+
 NAME="homeproxy"
 
 RESOURCES_DIR="/etc/$NAME/resources"
@@ -13,8 +15,7 @@ RUN_DIR="/var/run/$NAME"
 LOG_PATH="$RUN_DIR/$NAME.log"
 mkdir -p "$RUN_DIR"
 
-[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh
-HP_LIB_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
 
 log() {
     echo -e "$(date "+%Y-%m-%d %H:%M:%S") $*" >> "$LOG_PATH"
@@ -69,12 +70,25 @@ check_list_update() {
     auth_hdr=""
     [ -z "$github_token" ] || auth_hdr="Authorization: Bearer $github_token"
 
-    if command -v flock >/dev/null 2>&1; then
-        exec 200>"$lock"
+    # Single-flight per list type. flock when available AND the lock file can
+    # be opened; otherwise fall back to an atomic mkdir lock -- the same
+    # pattern boot_restore.sh uses (U8-8). The `exec 200>` redirect would
+    # abort the shell outright if RUN_DIR vanished mid-run, so re-create the
+    # parent dir defensively before opening it.
+    mkdir -p "$(dirname "$lock")" 2>/dev/null
+    if command -v flock >/dev/null 2>&1 && exec 200>"$lock" 2>/dev/null; then
         if ! flock -n 200 2>/dev/null; then
             log "[$(to_upper "$listtype")] A task is already running."
             return 2
         fi
+    elif ! mkdir "$lock.d" 2>/dev/null; then
+        log "[$(to_upper "$listtype")] A task is already running."
+        return 2
+    else
+        # Global (not local): the EXIT trap may fire after this function
+        # returns, when the local `lock` is already out of scope.
+        HP_RES_LOCKDIR="$lock.d"
+        trap 'rm -rf "$HP_RES_LOCKDIR" 2>/dev/null' EXIT
     fi
 
     local list_info
@@ -128,14 +142,14 @@ check_list_update() {
     # The new list only takes effect after ipsets and the dnsmasq steering
     # confs are rebuilt; both happen inside a service restart. Only restart
     # when the proxy is actually running.
-    if pgrep -f "sing-box run --config" >/dev/null 2>&1; then
+    if pgrep -f "meow -f /var/run/homeproxy/meow-" >/dev/null 2>&1; then
         /etc/init.d/"$NAME" restart >/dev/null 2>&1 && \
             log "[$(to_upper "$listtype")] Service restarted to apply new resources."
     fi
     return 0
 }
 
-case "$1" in
+case "${1:-}" in
 "china_ip4")
     check_list_update "$1" "1715173329/IPCIDR-CHINA" "master" "ipv4.txt"
     ;;

@@ -1,9 +1,13 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
 # HomeProxy firewall glue for legacy iptables (fw3) routers without nftables/fw4.
-# Usage: firewall.sh {start|stop|restart}
-# Builds ipsets + iptables/ip6tables rules to steer LAN traffic into sing-box
-# (TCP redirect, UDP tproxy, DNS hijack) honoring routing_mode and LAN control.
+# Usage: firewall.sh {start|stop|restart|reload}
+# Builds ipsets + iptables/ip6tables rules to steer LAN traffic into meow
+# (TCP redirect, IPv4-only UDP tproxy, DNS hijack) honoring routing_mode and
+# LAN control. meow owns NO firewall state (every listener is firewall:false);
+# router-self egress is NOT intercepted (no OUTPUT hooks -- meow cannot mark
+# proxy-adapter sockets, so OUTPUT capture risks an unbreakable loop), and no
+# TUN arm exists anymore.
 
 set -u
 
@@ -17,16 +21,25 @@ uci_get() { uci -q get "$CFG.$1" 2>/dev/null; }
 # --- config ---------------------------------------------------------------
 routing_mode=$(uci_get "config.routing_mode"); routing_mode=${routing_mode:-bypass_mainland_china}
 proxy_mode=$(uci_get "config.proxy_mode");      proxy_mode=${proxy_mode:-redirect_tproxy}
+# meow vocabulary: redirect = TCP REDIRECT arm only; tproxy = UDP TPROXY arm
+# only; redirect_tproxy = both. Legacy/unknown values (removed TUN modes,
+# and the old "tproxy" = TCP+UDP-TPROXY meaning) degrade to redirect_tproxy,
+# the strongest surviving combination. The formal migration is
+# migrate_config's job; this is only the defensive fallback.
+case "$proxy_mode" in
+	redirect|tproxy|redirect_tproxy) ;;
+	*)
+		echo "homeproxy: WARNING: unknown/legacy proxy_mode='$proxy_mode' -- treating as redirect_tproxy." >&2
+		proxy_mode=redirect_tproxy
+		;;
+esac
 ipv6=$(uci_get "config.ipv6_support");          ipv6=${ipv6:-0}
 routing_port=$(uci_get "config.routing_port")
 
-mixed_port=$(uci_get "infra.mixed_port");       mixed_port=${mixed_port:-5330}
 redirect_port=$(uci_get "infra.redirect_port"); redirect_port=${redirect_port:-5331}
-tproxy_port=$(uci_get "infra.tproxy_port");     tproxy_port=${tproxy_port:-5332}
-dns_port=$(uci_get "infra.dns_port");           dns_port=${dns_port:-5333}
+v6_port=$(uci_get "infra.v6_port");             v6_port=${v6_port:-5334}
 tproxy_mark=$(uci_get "infra.tproxy_mark");     tproxy_mark=${tproxy_mark:-101}
-tun_mark=$(uci_get "infra.tun_mark");           tun_mark=${tun_mark:-102}
-tun_name=$(uci_get "infra.tun_name");           tun_name=${tun_name:-singtun0}
+table_mark=$(uci_get "infra.table_mark");       table_mark=${table_mark:-100}
 self_mark=$(uci_get "infra.self_mark");         self_mark=${self_mark:-100}
 common_port=$(uci_get "infra.common_port");     common_port=${common_port:-22,53,80,143,443,465,587,853,873,993,995,5222,8080,8443,9418}
 
@@ -91,21 +104,66 @@ lan_gaming_mac()  { uci_get "control.lan_gaming_mode_mac_addrs"; }
 # dnsmasq listen port: the iptables DNS redirect forces clients using a custom
 # DNS server back to local dnsmasq, which then applies the conf-dir steering
 # rules (written by init.d). dnsmasq itself decides which domains go to
-# sing-box; we never redirect DNS straight to sing-box here.
+# meow's DNS; we never redirect DNS straight to meow here.
 dnsmasq_port=$(uci -q get dhcp.@dnsmasq[0].port 2>/dev/null); dnsmasq_port=${dnsmasq_port:-53}
+# A non-numeric or 0 port (dnsmasq DNS disabled) would emit a broken
+# `--to-ports` REDIRECT -- cleared here, the DNS arm below then skips+warns.
+case "$dnsmasq_port" in
+	''|*[!0-9]*) dnsmasq_port="" ;;
+	*) [ "$dnsmasq_port" -gt 0 ] 2>/dev/null || dnsmasq_port="" ;;
+esac
 
 IP4=iptables
 IP6=ip6tables
 
-# All chains we may create, so stop_fw can flush+delete them unconditionally.
+# All chains we may have created -- including ones only older revisions emit
+# (homeproxy_tun*/homeproxy_mangle_out/_mark from the removed TUN and
+# TCP-TPROXY arms) -- so stop_fw can flush+delete them unconditionally.
 ALL_CHAINS_NAT="homeproxy_dns homeproxy_redir homeproxy_redir_port homeproxy_redir_act homeproxy_redir_lanac"
 ALL_CHAINS_MANGLE="homeproxy_mangle homeproxy_mangle_port homeproxy_mangle_act homeproxy_mangle_lanac homeproxy_mangle_mark homeproxy_mangle_out homeproxy_tun homeproxy_tun_mark homeproxy_tun_lanac"
 ALL_IPSETS="homeproxy_cn4 homeproxy_cn6 homeproxy_gfw4 homeproxy_gfw6 homeproxy_wan_proxy4 homeproxy_wan_proxy6 homeproxy_wan_direct4 homeproxy_wan_direct6"
 
 # --- teardown -------------------------------------------------------------
-# Remove every PREROUTING/OUTPUT jump we might have added (per LAN iface, plus
-# the iface-agnostic OUTPUT and lo re-entry jumps), then flush+delete chains
-# and destroy ipsets. Best-effort; missing rules/chains are ignored.
+# One-shot cleanup of the removed TUN arm (D16). migrate_config writes the
+# old infra.tun_name AND tun_mark as "name mark" into
+# $RUN_DIR/legacy-tun-name before deleting the UCI keys (files written by
+# older revisions carry the name alone -- the mark field is then absent).
+# tun_mark/tun_table are gone from the schema, so they are resolved
+# best-effort: a value still present in UCI (unmigrated config) wins, then
+# the recorded mark, then the historical defaults. Runs on every
+# start/stop/reload; everything is a no-op once clean.
+cleanup_legacy_tun() {
+	local tfile="$RUN_DIR/legacy-tun-name" tname="" tmark_file="" tmark ttable _t _n
+	if [ -s "$tfile" ]; then
+		set -- $(cat "$tfile" 2>/dev/null)
+		tname=${1:-}
+		tmark_file=${2:-}
+	fi
+	tmark=$(uci_get "infra.tun_mark");   tmark=${tmark:-${tmark_file:-102}}
+	ttable=$(uci_get "infra.tun_table"); ttable=${ttable:-102}
+	# Drain tun fwmark rules from BOTH tables: older revisions shared
+	# table_mark for tun and tproxy rules before tun_table existed.
+	for _t in "$ttable" "$table_mark"; do
+		while ip rule del fwmark "$tmark" lookup "$_t" 2>/dev/null; do :; done
+		while ip -6 rule del fwmark "$tmark" lookup "$_t" 2>/dev/null; do :; done
+	done
+	for _n in $tname singtun0; do
+		[ -n "$_n" ] || continue
+		ip link show "$_n" >/dev/null 2>&1 || continue
+		ip route del default dev "$_n" table "$ttable" 2>/dev/null
+		ip -6 route del default dev "$_n" table "$ttable" 2>/dev/null
+		ip link set "$_n" down 2>/dev/null
+		ip tuntap del mode tun name "$_n" 2>/dev/null || ip link del "$_n" 2>/dev/null
+	done
+	rm -f "$tfile"
+}
+
+# Remove every jump into homeproxy_* chains from the built-in chains (any
+# table/hook/interface, including older revisions' OUTPUT and `-i lo`
+# re-entry hooks), then flush+delete the chains, destroy the ipsets, drain
+# the UDP-TPROXY policy routing and remove the legacy tun device -- in the
+# spec cleanup order: chains -> ipsets -> ip rule/route -> tun device.
+# Best-effort; missing rules/chains are ignored.
 # $1 = "keep_ipsets" (fw3 reload path): the sets are rebuilt right after and
 # dnsmasq still answers from its cache without re-adding learned entries, so
 # destroying wan_proxy/wan_direct/gfw sets would drop dynamic domain steering
@@ -138,21 +196,26 @@ stop_fw() {
 	[ "${1:-}" = "keep_ipsets" ] || {
 		for _s in $ALL_IPSETS; do ipset destroy "$_s" 2>/dev/null; done
 	}
+	# UDP-TPROXY policy routing. The v6 rule/route drains cover what pre-meow
+	# revisions installed for ipv6_support; `route flush` clears anything
+	# left in the table (e.g. a stale tun default route sharing it).
+	while ip rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
+	while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
+	ip route flush table "$table_mark" 2>/dev/null
+	ip -6 route flush table "$table_mark" 2>/dev/null
+	cleanup_legacy_tun
 }
 
 # --- filter-table accepts (mirror upstream firewall_pre.uc) -------------
 # Self-contained: must also run when LAN steering is disabled (pure server
 # deployments still need their listen ports accepted). Inserted at the TOP
-# of INPUT/FORWARD because MiWiFi's own chains may end with a blanket
-# REJECT/DROP that a tail-appended rule never reaches.
+# of INPUT because MiWiFi's own chains may end with a blanket REJECT/DROP
+# that a tail-appended rule never reaches.
 apply_fw_pre() {
-	local ip="$1" need_in=0 need_fwd=0 sect
+	local ip="$1" need_in=0 sect
 	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
 		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] && [ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] && need_in=1
 	done
-	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
-		need_in=1; need_fwd=1
-	fi
 	[ "$need_in" = "1" ] || return 0
 	$ip -N homeproxy_in 2>/dev/null || $ip -F homeproxy_in
 	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
@@ -162,17 +225,8 @@ apply_fw_pre() {
 		$ip -A homeproxy_in -p tcp --dport "$port" -j ACCEPT 2>/dev/null
 		$ip -A homeproxy_in -p udp --dport "$port" -j ACCEPT 2>/dev/null
 	done
-	if echo "$proxy_mode" | grep -q tun && [ -n "$tun_name" ]; then
-		$ip -A homeproxy_in -i "$tun_name" -j ACCEPT 2>/dev/null
-	fi
 	$ip -D INPUT -j homeproxy_in 2>/dev/null
 	$ip -I INPUT -j homeproxy_in 2>/dev/null
-	if [ "$need_fwd" = "1" ]; then
-		$ip -N homeproxy_fwd 2>/dev/null || $ip -F homeproxy_fwd
-		$ip -A homeproxy_fwd -o "$tun_name" -j ACCEPT 2>/dev/null
-		$ip -D FORWARD -j homeproxy_fwd 2>/dev/null
-		$ip -I FORWARD -j homeproxy_fwd 2>/dev/null
-	fi
 }
 
 cmd=${1:-}
@@ -200,14 +254,28 @@ esac
 
 mkdir -p "$RUN_DIR"
 
-# Server/tun filter accepts must exist even with LAN steering off, so they
-# are applied before the lan_proxy_mode gate.
+# Server filter accepts must exist even with LAN steering off, so they are
+# applied before the lan_proxy_mode gate.
 apply_fw_pre "$IP4"
 [ "$ipv6" = "1" ] && apply_fw_pre "$IP6"
 
 if [ "$lan_proxy_mode" = "disabled" ]; then
-	echo "homeproxy: LAN proxy disabled; only server/tun filter accepts applied." >&2
+	echo "homeproxy: LAN proxy disabled; only server filter accepts applied." >&2
 	exit 0
+fi
+
+# Effective outbound the takeover arms would steer into (same source init.d
+# uses): custom routes via routing.default_outbound, every other mode via
+# config.main_node. nil == server-only deployment: installing the
+# redirect/tproxy arms would blackhole LAN traffic into a nonexistent
+# proxy, so warn and skip them (their mode ipsets are skipped too -- an
+# empty-set abort must not tear down a pure-server box). The server filter
+# accepts above and the dnsmasq DNS hijack below still run.
+outbound_node=$(uci_get "config.main_node")
+[ "$routing_mode" = "custom" ] && outbound_node=$(uci_get "routing.default_outbound")
+outbound_node=${outbound_node:-nil}
+if [ "$outbound_node" = "nil" ]; then
+	echo "homeproxy: WARNING: no outbound configured (main_node/default_outbound=nil) -- LAN steering arms skipped; only server filter accepts + DNS hijack applied." >&2
 fi
 
 # --- ipsets ---------------------------------------------------------------
@@ -259,7 +327,7 @@ load_list_ipset() {
 	for cidr in $list; do ipset add -exist "$name" "$cidr" 2>/dev/null; done
 }
 
-if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; then
+if [ "$outbound_node" != "nil" ] && { [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_mainland_china" ]; }; then
 	build_ipset homeproxy_cn4 "$RES_DIR/china_ip4.txt" inet || {
 		echo "homeproxy: FATAL: failed to create CN ipset (ipset binary or kmod missing?). Aborting." >&2
 		stop_fw; exit 1
@@ -290,7 +358,7 @@ if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "proxy_m
 	fi
 fi
 
-if [ "$routing_mode" = "gfwlist" ]; then
+if [ "$outbound_node" != "nil" ] && [ "$routing_mode" = "gfwlist" ]; then
 	# A missing gfw4 set is fatal, not just silent: the `! --match-set` RETURN
 	# rule never installs, inverting gfwlist into proxy-everything.
 	build_ipset_empty homeproxy_gfw4 inet hash:ip || {
@@ -396,18 +464,21 @@ emit_src_list() {
 	local d; for d in $mac; do $ip -t "$tbl" -A "$ch" -m mac --mac-source "$d" -j "$tgt" 2>/dev/null; done
 }
 
-# Build the steering chain (homeproxy_redir / homeproxy_mangle / homeproxy_tun).
-# Used by the PREROUTING gate and by the OUTPUT hook directly. Order mirrors
-# upstream homeproxy_redirect / mangle_prerouting / mangle_tun:
+# Build the steering chain (homeproxy_redir / homeproxy_mangle). Jumped to
+# only from the per-client PREROUTING gate (there is no OUTPUT steering).
+# Order mirrors the historical layout:
 #   self_mark -> wan_proxy -> local -> lan_global -> wan_direct -> routing
 #   -> gaming -> catch-all(port-filtered)
 # $1=ip $2=table $3=chain $4=rset $5=port_target $6=act_target
 emit_steering() {
 	local ip="$1" tbl="$2" ch="$3" rset="$4" port_tgt="$5" act_tgt="$6"
 	$ip -t "$tbl" -N "$ch" 2>/dev/null || $ip -t "$tbl" -F "$ch"
-	# loop prevention: sing-box's own egress carries self_mark (routing_mark).
-	# Exact match -- a masked match (100/100) also matches marks that merely
-	# have those bits set (101, 102, QoS marks...), exempting real traffic.
+	# mark exemption: never steer packets already stamped with self_mark.
+	# meow's routing-mark tags only DIRECT outbound sockets (which never
+	# reach PREROUTING anyway); the rule still protects forwarded traffic
+	# whose fwmark was connmark-restored. Exact match -- a masked match
+	# (100/100) also matches marks that merely have those bits set
+	# (101, 102, QoS marks...), exempting real traffic.
 	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark" -j RETURN 2>/dev/null
 	# "always proxy" destinations/clients go to the UNFILTERED target:
 	# under routing_port=common the port-filtered target would only proxy
@@ -421,8 +492,9 @@ emit_steering() {
 	emit_routing "$ip" "$tbl" "$ch" "$rset"
 	# Block QUIC over UDP/80,443 so clients fall back to TCP (steered above).
 	# mangle has no REJECT, so DROP. Only bypass/gfwlist; upstream lets QUIC
-	# reach the proxy in proxy_mainland_china & custom. Harmless in the nat
-	# chain (which only sees tcp).
+	# reach the proxy in proxy_mainland_china & custom. Only emitted while
+	# the UDP arm exists (the mangle chain is built solely for UDP TPROXY)
+	# and only under iptables -- v6 UDP is never steered.
 	if [ "$tbl" = "mangle" ] && { [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "gfwlist" ]; }; then
 		$ip -t "$tbl" -A "$ch" -p udp -m multiport --dports 80,443 -j DROP 2>/dev/null
 	fi
@@ -430,12 +502,12 @@ emit_steering() {
 	$ip -t "$tbl" -A "$ch" -j "$port_tgt"
 }
 
-# Build the per-client gate (lanac). PREROUTING jumps here; OUTPUT bypasses it.
+# Build the per-client gate (lanac). PREROUTING jumps here.
 # $1=ip $2=table $3=chain(gate) $4=steering_target
 emit_gate() {
 	local ip="$1" tbl="$2" ch="$3" tgt="$4"
 	$ip -t "$tbl" -N "$ch" 2>/dev/null || $ip -t "$tbl" -F "$ch"
-	# loop prevention (router-self packets re-entering via lo carry self_mark).
+	# mark exemption (same self_mark reasoning as the steering chain).
 	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark" -j RETURN 2>/dev/null
 	# do not steer DNS over UDP here -- the nat-table homeproxy_dns handles it.
 	[ "$tbl" = "mangle" ] && $ip -t "$tbl" -A "$ch" -p udp --dport 53 -j RETURN 2>/dev/null
@@ -466,11 +538,14 @@ hook_prerouting() {
 }
 
 # --- TCP redirect (nat) ----------------------------------------------------
+# $3 = REDIRECT target port: redirect_port for IPv4, v6_port for IPv6 (each
+# family is delivered to its own meow tproxy listener; chain names are shared
+# because iptables/ip6tables have independent namespaces).
 apply_tcp() {
-	local ip="$1" rset="$2"
+	local ip="$1" rset="$2" rport="$3"
 	# action (no port filter) -- used by gaming src rule
 	$ip -t nat -N homeproxy_redir_act 2>/dev/null || $ip -t nat -F homeproxy_redir_act
-	$ip -t nat -A homeproxy_redir_act -p tcp -j REDIRECT --to-ports "$redirect_port"
+	$ip -t nat -A homeproxy_redir_act -p tcp -j REDIRECT --to-ports "$rport"
 	# port-filtered action -- used by catch-all / wan_proxy / lan_global
 	$ip -t nat -N homeproxy_redir_port 2>/dev/null || $ip -t nat -F homeproxy_redir_port
 	if [ "$routing_port" = "common" ]; then
@@ -483,104 +558,35 @@ apply_tcp() {
 	# gate + PREROUTING hook
 	emit_gate "$ip" nat homeproxy_redir_lanac homeproxy_redir
 	hook_prerouting "$ip" nat "-p tcp" homeproxy_redir_lanac
-	# router-self TCP -> steering (bypasses the gate; covers update_via_proxy).
-	$ip -t nat -D OUTPUT -p tcp -j homeproxy_redir 2>/dev/null
-	$ip -t nat -A OUTPUT -p tcp -j homeproxy_redir
 }
 
-# --- tproxy (mangle) -------------------------------------------------------
-# $3=with_udp $4=with_tcp. Pure `tproxy` mode (no redirect inbound) TPROXYs
-# TCP too; redirect_* modes only TPROXY UDP (TCP goes to the redirect port).
-# --tproxy-mark uses a FULL mask: a partial mask preserves unrelated mark
-# bits (e.g. MiWiFi QoS), producing a composite fwmark the exact-match
-# `ip rule fwmark $tproxy_mark` then fails to route -> leaked/dropped traffic.
+# --- UDP tproxy (mangle, IPv4 only) ---------------------------------------
+# UDP arm: TPROXY delivers to the SAME port TCP REDIRECT uses -- the single
+# meow tproxy listener (redirect_port, udp:true). Requires the fwmark -> lo
+# policy route (installed before this runs). --tproxy-mark uses a FULL mask:
+# a partial mask preserves unrelated mark bits (e.g. MiWiFi QoS), producing a
+# composite fwmark the exact-match `ip rule fwmark $tproxy_mark` then fails
+# to route -> leaked/dropped traffic. IPv4 only: meow has no v6 UDP TPROXY,
+# so ip6tables never gets a mangle rule (v6 UDP/QUIC stays direct).
 apply_tproxy() {
-	local ip="$1" rset="$2" with_udp="${3:-1}" with_tcp="${4:-0}"
+	local ip="$1" rset="$2"
 	$ip -t mangle -N homeproxy_mangle_act 2>/dev/null || $ip -t mangle -F homeproxy_mangle_act
-	[ "$with_udp" = "1" ] && $ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$tproxy_mark/0xffffffff"
-	[ "$with_tcp" = "1" ] && $ip -t mangle -A homeproxy_mangle_act -p tcp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$tproxy_mark/0xffffffff"
+	$ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-ip 0.0.0.0 --on-port "$redirect_port" --tproxy-mark "$tproxy_mark/0xffffffff"
 	$ip -t mangle -N homeproxy_mangle_port 2>/dev/null || $ip -t mangle -F homeproxy_mangle_port
-	local protos=""
-	[ "$with_udp" = "1" ] && protos="udp"
-	[ "$with_tcp" = "1" ] && protos="$protos tcp"
-	for _p in $protos; do
-		if [ "$routing_port" = "common" ]; then
-			$ip -t mangle -A homeproxy_mangle_port -p "$_p" -m multiport --dports "$common_port" -j homeproxy_mangle_act 2>/dev/null
-		else
-			$ip -t mangle -A homeproxy_mangle_port -p "$_p" -j homeproxy_mangle_act
-		fi
-	done
+	if [ "$routing_port" = "common" ]; then
+		$ip -t mangle -A homeproxy_mangle_port -p udp -m multiport --dports "$common_port" -j homeproxy_mangle_act 2>/dev/null
+	else
+		$ip -t mangle -A homeproxy_mangle_port -p udp -j homeproxy_mangle_act
+	fi
 	emit_steering "$ip" mangle homeproxy_mangle "$rset" homeproxy_mangle_port homeproxy_mangle_act
 	emit_gate "$ip" mangle homeproxy_mangle_lanac homeproxy_mangle
-	for _p in $protos; do hook_prerouting "$ip" mangle "-p $_p" homeproxy_mangle_lanac; done
-	# Router-self steering (mirrors upstream homeproxy_mangle_output -> _mark).
-	# A dedicated steering chain exempts sing-box's own egress (self_mark), then
-	# applies wan_proxy/local/wan_direct/routing split, ending in MARK tproxy_mark.
-	# ip rule (fwmark tproxy_mark -> table -> local dev lo) then re-delivers the
-	# packet on lo, where the PREROUTING hook re-enters homeproxy_mangle -> TPROXY.
-	$ip -t mangle -N homeproxy_mangle_mark 2>/dev/null || $ip -t mangle -F homeproxy_mangle_mark
-	# Create the OUTPUT steering chain BEFORE hooking jumps into it: iptables
-	# refuses -j to a chain that does not exist yet ("Couldn't load target"),
-	# which would both spam the log and leave router-self UDP unsteered.
-	emit_steering "$ip" mangle homeproxy_mangle_out "$rset" homeproxy_mangle_mark homeproxy_mangle_mark
-	for _p in $protos; do
-		if [ "$routing_port" = "common" ]; then
-			$ip -t mangle -A homeproxy_mangle_mark -p "$_p" -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
-		fi
-		$ip -t mangle -A homeproxy_mangle_mark -p "$_p" -j MARK --set-mark "$tproxy_mark"
-		$ip -t mangle -D OUTPUT -p "$_p" -j homeproxy_mangle_out 2>/dev/null
-		$ip -t mangle -A OUTPUT -p "$_p" -j homeproxy_mangle_out
-		# legacy hook cleanup (older revisions jumped straight to the mark chain)
-		$ip -t mangle -D OUTPUT -p "$_p" -j homeproxy_mangle_mark 2>/dev/null
-		# re-entry: lo packets (already tproxy-marked) run through steering -> TPROXY.
-		$ip -t mangle -D PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
-		$ip -t mangle -A PREROUTING -i lo -p "$_p" -j homeproxy_mangle 2>/dev/null
-	done
-}
-
-# --- TUN steering (mangle MARK) ------------------------------------------
-apply_tun() {
-	local ip="$1" rset="$2"
-	# mark chain: port filter (tcp only in pure tun) + MARK tun_mark
-	$ip -t mangle -N homeproxy_tun_mark 2>/dev/null || $ip -t mangle -F homeproxy_tun_mark
-	if [ "$routing_port" = "common" ]; then
-		if [ "$proxy_mode" = "tun" ]; then
-			$ip -t mangle -A homeproxy_tun_mark -p tcp -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
-		fi
-		$ip -t mangle -A homeproxy_tun_mark -p udp -m multiport ! --dports "$common_port" -j RETURN 2>/dev/null
-	fi
-	[ "$proxy_mode" = "tun" ] && $ip -t mangle -A homeproxy_tun_mark -p tcp -j MARK --set-mark "$tun_mark" 2>/dev/null
-	$ip -t mangle -A homeproxy_tun_mark -p udp -j MARK --set-mark "$tun_mark" 2>/dev/null
-	# steering chain: tun egress + loop prevention at top, then standard order.
-	$ip -t mangle -N homeproxy_tun 2>/dev/null || $ip -t mangle -F homeproxy_tun
-	$ip -t mangle -A homeproxy_tun -i "$tun_name" -j RETURN 2>/dev/null
-	$ip -t mangle -A homeproxy_tun -m mark --mark "$self_mark" -j RETURN 2>/dev/null
-	emit_dst_ipset "$ip" mangle homeproxy_tun wan_proxy homeproxy_tun_mark
-	emit_local "$ip" mangle homeproxy_tun
-	if [ "$routing_mode" != "custom" ]; then
-		emit_src_list "$ip" mangle homeproxy_tun lan_global homeproxy_tun_mark
-	fi
-	emit_dst_ipset "$ip" mangle homeproxy_tun wan_direct RETURN
-	emit_routing "$ip" mangle homeproxy_tun "$rset"
-	if [ "$routing_mode" = "bypass_mainland_china" ] || [ "$routing_mode" = "gfwlist" ]; then
-		$ip -t mangle -A homeproxy_tun -p udp -m multiport --dports 80,443 -j DROP 2>/dev/null
-	fi
-	# gaming: direct mark, no port filter (like upstream meta mark set tun_mark)
-	emit_src_list "$ip" mangle homeproxy_tun lan_gaming homeproxy_tun_mark
-	$ip -t mangle -A homeproxy_tun -j homeproxy_tun_mark
-	# gate + PREROUTING hook (tcp+udp in pure tun; udp only in redirect_tun)
-	emit_gate "$ip" mangle homeproxy_tun_lanac homeproxy_tun
-	hook_prerouting "$ip" mangle "" homeproxy_tun_lanac
-	# router-self -> tun steering (bypasses the gate). lo re-entry not needed:
-	# marked packets go to the tun device via ip rule, not back through lo.
-	$ip -t mangle -D OUTPUT -j homeproxy_tun 2>/dev/null
-	$ip -t mangle -A OUTPUT -j homeproxy_tun
+	hook_prerouting "$ip" mangle "-p udp" homeproxy_mangle_lanac
 }
 
 # --- DNS redirect (nat) ----------------------------------------------------
 # Force clients using a custom DNS server back to local dnsmasq (port 53),
 # which applies the per-routing_mode conf-dir rules written by init.d. We do
-# NOT redirect straight to sing-box: dnsmasq owns the domain split + ipset
+# NOT redirect straight to meow: dnsmasq owns the domain split + ipset
 # population. Skipped when the user disables it or dnsmasq already hijacks.
 apply_dns() {
 	local ip="$1" target="$2"
@@ -590,31 +596,41 @@ apply_dns() {
 	hook_prerouting "$ip" nat "-p udp --dport 53" homeproxy_dns
 }
 
-# --- apply per family -----------------------------------------------------
-# UDP tproxy is only steered when the user wants UDP proxied (a dedicated
-# UDP node or custom routing). In a mode WITHOUT redirect, TCP is TPROXY'd
-# to the same inbound instead -- pure `tproxy` mode proxies both protocols.
+# --- apply per arm ----------------------------------------------------------
+# UDP is only steered when the user wants UDP proxied (a dedicated UDP node
+# or custom routing) -- the same condition that sets `udp:true` on the meow
+# tproxy listener -- AND proxy_mode carries the tproxy arm. TCP never uses
+# TPROXY (REDIRECT covers it), IPv6 UDP is never intercepted, and router-self
+# traffic is never intercepted (no OUTPUT hooks exist).
 main_udp_node=$(uci_get "config.main_udp_node"); main_udp_node=${main_udp_node:-nil}
-udp_tproxy=0
+udp_want=0
 if [ "$main_udp_node" != "nil" ] || [ "$routing_mode" = "custom" ]; then
-	udp_tproxy=1
+	udp_want=1
 fi
-tcp_via_tproxy=0
-if echo "$proxy_mode" | grep -q tproxy && ! echo "$proxy_mode" | grep -q redirect; then
-	tcp_via_tproxy=1
-fi
+udp_arm=0
+case "$proxy_mode" in
+	tproxy|redirect_tproxy) [ "$udp_want" = "1" ] && udp_arm=1 ;;
+esac
 
-if echo "$proxy_mode" | grep -q redirect; then
-	apply_tcp "$IP4" "$route_set4"
-	if [ "$ipv6" = "1" ]; then apply_tcp "$IP6" "$route_set6"; fi
-fi
-if echo "$proxy_mode" | grep -q tproxy && { [ "$udp_tproxy" = "1" ] || [ "$tcp_via_tproxy" = "1" ]; }; then
-	apply_tproxy "$IP4" "$route_set4" "$udp_tproxy" "$tcp_via_tproxy"
-	if [ "$ipv6" = "1" ]; then apply_tproxy "$IP6" "$route_set6" "$udp_tproxy" "$tcp_via_tproxy"; fi
-fi
-if echo "$proxy_mode" | grep -q tun; then
-	apply_tun "$IP4" "$route_set4"
-	if [ "$ipv6" = "1" ]; then apply_tun "$IP6" "$route_set6"; fi
+# Takeover arms run only with a real outbound; server-only already warned.
+if [ "$outbound_node" != "nil" ]; then
+	case "$proxy_mode" in
+		redirect|redirect_tproxy)
+			apply_tcp "$IP4" "$route_set4" "$redirect_port"
+			[ "$ipv6" = "1" ] && apply_tcp "$IP6" "$route_set6" "$v6_port"
+			;;
+		tproxy)
+			[ "$udp_arm" = "1" ] || echo "homeproxy: WARNING: proxy_mode=tproxy but no UDP steering is configured (main_udp_node=nil, non-custom routing_mode) -- no traffic will be proxied." >&2
+			;;
+	esac
+	if [ "$udp_arm" = "1" ]; then
+		# fwmark -> lo local delivery for TPROXYed UDP (IPv4 only -- no v6 rule
+		# or route is ever added). Install BEFORE the marking rules so freshly
+		# marked packets always resolve to the listener.
+		ip rule add fwmark "$tproxy_mark" table "$table_mark" pref 100 2>/dev/null
+		ip route add local 0.0.0.0/0 dev lo table "$table_mark" 2>/dev/null
+		apply_tproxy "$IP4" "$route_set4"
+	fi
 fi
 
 # DNS redirect to dnsmasq (which steers via conf-dir). Skipped when the user
@@ -622,14 +638,18 @@ fi
 dns_hijacked=0
 [ "$(uci -q get dhcp.@dnsmasq[0].dns_redirect 2>/dev/null)" = "1" ] && dns_hijacked=1
 if [ "$dns_redirect" = "1" ] && [ "$dns_hijacked" != "1" ]; then
-	apply_dns "$IP4" "$dnsmasq_port"
-	[ "$ipv6" = "1" ] && apply_dns "$IP6" "$dnsmasq_port"
+	if [ -n "$dnsmasq_port" ]; then
+		apply_dns "$IP4" "$dnsmasq_port"
+		[ "$ipv6" = "1" ] && apply_dns "$IP6" "$dnsmasq_port"
+	else
+		echo "homeproxy: WARNING: dnsmasq port is unset/0/non-numeric -- DNS redirect arm skipped." >&2
+	fi
 else
 	echo "homeproxy: DNS redirect skipped (dns_redirect=$dns_redirect dnsmasq_hijacked=$dns_hijacked)." >&2
 fi
 
 if [ -z "$LAN_IFS" ]; then
-	echo "homeproxy: WARNING: no LAN interface found; only router-self traffic will be steered." >&2
+	echo "homeproxy: WARNING: no LAN interface found; no LAN traffic will be steered." >&2
 fi
 
 echo "homeproxy: firewall rules applied (mode=$proxy_mode routing=$routing_mode lan=$lan_proxy_mode ifaces=$LAN_IFS)." >&2

@@ -1,8 +1,8 @@
 # RFC: 内核从 sing-box 迁移至 meow-rs
 
-- **状态**：草案（Draft）
+- **状态**：已实施（Implemented on branch `meow-kernel`，per `docs/spec-meow-migration-A.md` + §13 勘误）
 - **日期**：2026-08-28
-- **依据版本**：meow-rs `v0.21.2`（`madeye/meow-rs` @ `main`），homeproxy_mi `xiaomi` 分支
+- **依据版本**：meow-rs `v0.24.0`（`meow-rs/meow-rs` tag；本文 §2–§10 写于 `v0.21.2` 时期，其中 D1 UDP-TPROXY 与 D2 nftables 硬依赖两项阻塞已在 v0.24.0 解除：`listeners[].udp:true` + `firewall:false`），homeproxy_mi `xiaomi` 分支
 - **范围**：评估并规划把本项目的代理内核从 sing-box 1.13.x 替换为 meow-rs（mihomo/Clash Meta 的 Rust 实现），覆盖配置生成、防火墙、DNS、订阅、生命周期、Web UI、安装与打包。
 
 ---

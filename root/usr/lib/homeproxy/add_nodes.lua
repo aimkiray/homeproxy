@@ -2,14 +2,18 @@
 -- SPDX-License-Identifier: GPL-2.0-only
 -- HomeProxy manual node importer. Reads share links (ss/vmess/vless/trojan/
 -- hysteria2/anytls/socks/http/sip008 single-entry, ...) from argv or stdin
--- (one per line), parses them via subscription_parser.lua and upserts UCI
--- "node" sections into /etc/config/homeproxy.
+-- (one per line), parses them via subscription_parser.lua, runs the shared
+-- meow legality precheck (spec-meow-migration-A §4.4/§9.1) and upserts UCI
+-- "node" sections into /etc/config/homeproxy. Rejected links never reach
+-- UCI; the JSON response carries their reasons.
 --
 -- Manual nodes intentionally carry NO grouphash: update_subscriptions.lua
 -- only garbage-collects nodes that belong to a fetched subscription group,
 -- so user-added nodes survive every subscription update.
 --
--- Output: a single JSON line {"ok":true,"added":[labels],"skipped":[lines]}.
+-- Output: one JSON line
+--   {"ok":true,"added":[labels],"skipped":[lines],
+--    "rejected":[{"input":line,"reason":str,"kind":str,"type":str}]}
 
 package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
 
@@ -50,26 +54,72 @@ end
 
 uci:load(CFG)
 
--- Reuse the subscription feature cache when present (written by
--- update_subscriptions.lua, keyed by binary signature).  Absent a cache,
--- assume the feature set of an official sing-box release build; a node the
--- installed binary cannot actually load is still caught by the config check
--- on the next generate/start.
+-- Reuse the subscription meow feature cache when present (written by
+-- update_subscriptions.lua, keyed by path + `meow --version` + mtime).
+-- The cache is only valid when its signature matches the binary that would
+-- be probed today -- otherwise a silent binary swap/upgrade would serve a
+-- stale feature set (L24). Absent a usable cache, assume a full official
+-- meow build; a node the installed binary cannot actually load is still
+-- caught by `meow -t` on the next generate/start.
+local MEOW_FEATURE_KEYS = {
+	"with_quic", "with_utls", "with_hysteria", "with_ss_listener",
+	"with_ss", "with_trojan", "with_vmess", "with_snell", "with_anytls",
+}
+
+-- Same binary resolution + signature as update_subscriptions.lua (spec
+-- §8.4/§9.3).
+local function meow_bin()
+	for _, var in ipairs({ "HP_MEOW_BIN", "HP_MEOW" }) do
+		local p = os.getenv(var)
+		if p and p ~= "" then local f = io.open(p, "rb"); if f then f:close(); return p end end
+	end
+	local f = io.popen("command -v meow 2>/dev/null")
+	if f then local v = hp.trim(f:read("*a") or ""); f:close(); if v ~= "" then return v end end
+	for _, cand in ipairs({ "/usr/bin/meow", "/data/other_vol/bin/meow" }) do
+		local g = io.open(cand, "rb")
+		if g then g:close(); return cand end
+	end
+	return "/usr/bin/meow"
+end
+
+local function meow_signature(bin)
+	local p = io.popen(hp.shellQuote(bin) .. " --version 2>/dev/null")
+	local version = p and hp.trim(p:read("*a") or "") or ""
+	if p then p:close() end
+	local h = io.popen("stat -c %Y " .. hp.shellQuote(bin) .. " 2>/dev/null")
+	local mtime = h and hp.trim(h:read("*a") or "") or ""
+	if h then h:close() end
+	if version == "" then return nil end
+	return hp.md5(bin .. "\n" .. version .. "\n" .. (mtime ~= "" and mtime or "0"))
+end
+
 local function detect_features()
-	local raw = hp.readfile(hp.RUN_DIR .. "/singbox-features.json")
+	local raw = hp.readfile(hp.RUN_DIR .. "/meow-features.json")
 	if raw then
 		-- luci.jsonc's parse() raises on bad JSON (luci.json's decode returns
 		-- nil) -- pcall keeps a corrupt cache from killing the whole import.
 		local _, data = pcall(hp.decode_json, raw)
-		local f = data and data.features
-		if type(f) == "table"
-			and type(f.with_quic) == "boolean"
-			and type(f.with_utls) == "boolean"
-			and type(f.with_hysteria) == "boolean" then
-			return f
+		if type(data) == "table" then
+			local f = data.features
+			local sig = meow_signature(meow_bin())
+			if type(f) == "table" and sig and data.signature == sig then
+				local complete = true
+				for _, k in ipairs(MEOW_FEATURE_KEYS) do
+					if type(f[k]) ~= "boolean" then
+						complete = false -- incomplete cache: use the default set
+						break
+					end
+				end
+				if complete then return f end
+			end
 		end
 	end
-	return { with_quic = true, with_utls = true, with_hysteria = false }
+	-- hysteria v1 is never in meow; everything else defaults to present.
+	return {
+		with_quic = true, with_utls = true, with_hysteria = false,
+		with_ss_listener = true, with_ss = true, with_trojan = true,
+		with_vmess = true, with_snell = true, with_anytls = true,
+	}
 end
 
 local parser_opts = {
@@ -86,13 +136,16 @@ else
 	input = io.read("*a") or ""
 end
 
-local added, skipped = {}, {}
+local added, skipped, rejected = {}, {}, {}
 local ok_run, run_err = pcall(function()
 for line in input:gmatch("[^\r\n]+") do
 	line = hp.trim(line)
 	if line ~= "" then
-		local pok, cfg = pcall(sharelink.parse_uri, hp, parser_opts, line)
-		if not pok then cfg = nil end
+		local pok, cfg, reason, kind, hint = pcall(sharelink.parse_uri, hp, parser_opts, line)
+		if not pok then
+			reason, kind, hint = "parser error: " .. tostring(cfg), "malformed", nil
+			cfg = nil
+		end
 		if cfg and not hp.isEmpty(cfg) then
 			local label = cfg.label
 			if hp.isEmpty(label) then
@@ -124,6 +177,15 @@ for line in input:gmatch("[^\r\n]+") do
 			end
 		else
 			skipped[#skipped + 1] = line
+			if reason then
+				-- Every meow-precheck rejection is reported with its reason so
+				-- callers can show why a link was refused (§9.1/AC-14).
+				rejected[#rejected + 1] = {
+					input = line, reason = tostring(reason),
+					kind = kind or "malformed",
+					type = hint or "unknown",
+				}
+			end
 		end
 	end
 end
@@ -146,10 +208,11 @@ release_lock()
 
 if not ok_run then
 	io.write(hp.encode_json({ ok = false, error = tostring(run_err),
-		added = {}, skipped = skipped }) .. "\n")
+		added = {}, skipped = skipped, rejected = rejected }) .. "\n")
 	io.flush()
 	os.exit(1)
 end
 
-io.write(hp.encode_json({ ok = true, added = added, skipped = skipped }) .. "\n")
+io.write(hp.encode_json({ ok = true, added = added, skipped = skipped,
+	rejected = rejected }) .. "\n")
 io.flush()

@@ -5,23 +5,28 @@
 # Usage: homeproxy <command> [args]
 #   start|stop|restart|reload|status   service control
 #   enable|disable                     boot autostart
-#   generate                           regenerate sing-box configs
-#   migrate                             apply config defaults/migration
+#   generate                           regenerate meow configs
+#   check                              validate generated meow-*.yaml (meow -t)
+#   migrate                            apply config defaults/migration
 #   subscribe                          update subscriptions now
 #   update-resources [all|china_ip4|china_ip6|gfw_list|china_list]
-#   nodes                              list proxy nodes
-#   node <name>                         show one node
-#   main-node [name|urltest|nil]        get/set main node
+#   nodes                              list proxy nodes ([quarantined] = unsupported by meow)
+#   node <name>                        show one node
+#   main-node [name|urltest|nil]       get/set main node
 #   routing-mode [mode]                get/set routing_mode
-#   proxy-mode [mode]                  get/set proxy_mode
-#   lan-proxy [mode]                    get/set lan_proxy_mode
+#   proxy-mode [redirect|tproxy|redirect_tproxy]
+#                                      get/set proxy_mode: redirect = TCP only,
+#                                      tproxy = UDP only, redirect_tproxy = both
+#   lan-proxy [mode]                   get/set lan_proxy_mode
 #   add <label> -- <type> <addr> <port> [key=val ...]
-#   import <share-link> [...]           add nodes from ss:// vmess:// vless:// etc.
-#   del <name>                          delete a node
+#   import <share-link> [...]          add nodes from ss:// vmess:// vless:// etc.
+#   del <name>                         delete a node
 #   set <section.option> <value>       set a uci option
-#   get <section.option>                get a uci option
+#   get <section.option>               get a uci option
 #   show                               dump the whole config
-#   log [-f]                            show / tail the log
+#   log [-f]                           show / tail the meow + homeproxy logs
+
+set -u
 
 CONF=homeproxy
 INIT=/etc/init.d/$CONF
@@ -55,22 +60,65 @@ node_referenced() {
     return 1
 }
 
+# Resolve the meow binary: env.sh (install.sh) may point at
+# /data/other_vol/bin/meow; a standard package build uses /usr/bin/meow.
+meow_bin() {
+    local b="${HP_MEOW_BIN:-/usr/bin/meow}"
+    [ -x "$b" ] || b="$(command -v meow 2>/dev/null || true)"
+    [ -n "$b" ] && printf '%s\n' "$b"
+}
+
+# Quarantine file (spec 4.6): one JSON object per unsupported node, written
+# by the generator / subscription updater; "name" is the UCI section name.
+QUAR_FILE=$RUN_DIR/unsupported-nodes.json
+quarantine_names() {
+    [ -f "$QUAR_FILE" ] || return 0
+    # Split on JSON structural characters so each "name" field lands on its
+    # own line (works for compact or spaced encoders without grep -o).
+    tr '{},' '\n\n\n\n' < "$QUAR_FILE" 2>/dev/null \
+        | sed -n 's/^[ ]*"name"[ ]*:[ ]*"\([^"]*\)".*/\1/p'
+}
+# node_quarantined <section> -> 0 iff the node is recorded as quarantined.
+node_quarantined() { quarantine_names | grep -qxF "$1"; }
+
 cmd_status() {
-    pgrep -f "sing-box run --config $RUN_DIR/sing-box" >/dev/null 2>&1 \
-        && echo "running" || echo "stopped"
+    local st=stopped mb ver
+    # spec 8.4 unified probe: procd runs "meow -f /var/run/homeproxy/meow-{c,s}.yaml".
+    pgrep -f "meow -f $RUN_DIR/meow-" >/dev/null 2>&1 && st=running
+    echo "$st"
+    mb="$(meow_bin)"
+    ver=""
+    [ -n "$mb" ] && ver="$("$mb" --version 2>/dev/null | sed -n '1p')"
+    if [ -z "$ver" ]; then
+        # Fallback: the running client instance's external-controller
+        # answers /version even when the meow binary is missing or its
+        # --version output is unusable. Fast-fails when meow is down.
+        ver="$(curl -sf -m 3 "http://127.0.0.1:19290/version" 2>/dev/null \
+            | sed -n 's/.*"version"[^"]*"\([^"]*\)".*/\1/p')"
+        [ -n "$ver" ] && ver="meow $ver (api)"
+    fi
+    [ -n "$ver" ] && echo "version: $ver"
+    if [ "$st" = "running" ]; then
+        pgrep -f "meow -f $RUN_DIR/meow-c.yaml" >/dev/null 2>&1 && echo "client: running"
+        pgrep -f "meow -f $RUN_DIR/meow-s.yaml" >/dev/null 2>&1 && echo "server: running"
+    fi
+    return 0
 }
 
 cmd_nodes() {
+    # Space-wrapped quarantine name list for an exact-match index() lookup.
+    local qnames=" $(quarantine_names | tr '\n' ' ')"
     echo "NAME                                LABEL                      TYPE        ADDRESS:PORT"
     # Collect fields per section and print on the next section boundary: uci
     # option order is not stable (subscription writes use pairs()), so a row
     # is only complete once the section ends. Values may contain '=' so the
     # split is on the FIRST '=' only.
-    uci -q show "$CONF" 2>/dev/null | awk '
+    uci -q show "$CONF" 2>/dev/null | awk -v q="$qnames" '
         function pr() {
             gsub(/^[ \x27]+|[ \x27]+$/,"",label); gsub(/^[ \x27]+|[ \x27]+$/,"",type)
             gsub(/^[ \x27]+|[ \x27]+$/,"",addr);   gsub(/^[ \x27]+|[ \x27]+$/,"",port)
-            printf "%-36s %-26s %-11s %s:%s\n", name, label, type, addr, port
+            printf "%-36s %-26s %-11s %s:%s%s\n", name, label, type, addr, port, \
+                (index(q, " " name " ") > 0 ? "  [quarantined]" : "")
         }
         /^homeproxy\.[^.=]+=[^ \x27]+$/ {           # any section-type line
             if (name != "") pr()
@@ -99,11 +147,12 @@ cmd_add() {
     [ "$rest" = "1" ] && [ $# -ge 3 ] || die "usage: homeproxy add <label> -- <type> <addr> <port> [key=val ...]"
     [ -n "$label" ] || die "add: a label is required"
     type="$1"; addr="$2"; port="$3"; shift 3
-    # sing-box has no shadowsocksr support; keep the list aligned with what
-    # subscription_parser.lua can produce and the generator can emit.
+    # Only types the meow generator can emit (spec 4.4); hysteria(v1)/tuic/
+    # wireguard/etc. would just be quarantined at generation, so reject them
+    # here with a clear reason instead of writing a dead node.
     case "$type" in
-        shadowsocks|vless|vmess|trojan|hysteria|hysteria2|tuic|anytls|socks|http|wireguard) ;;
-        *) die "unsupported node type: $type" ;;
+        shadowsocks|vless|vmess|trojan|hysteria2|snell|anytls|socks|http) ;;
+        *) die "unsupported node type: $type (supported: shadowsocks vless vmess trojan hysteria2 snell anytls socks http)" ;;
     esac
     case "$port" in ''|*[!0-9]*) die "invalid port: $port" ;; esac
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port"
@@ -167,24 +216,28 @@ cmd_set() {
             case "$*" in bypass_mainland_china|proxy_mainland_china|gfwlist|global|custom) ;;
                 *) die "bad routing_mode: $*" ;; esac ;;
         config.proxy_mode)
-            case "$*" in redirect|tproxy|redirect_tproxy|redirect_tun|tun|tproxy_tun) ;;
-                *) die "bad proxy_mode: $*" ;; esac ;;
+            # New vocabulary only (spec 3.4): the removed TUN modes and the
+            # old TCP+UDP meaning of "tproxy" are rejected, not rewritten.
+            case "$*" in redirect|tproxy|redirect_tproxy) ;;
+                *) die "bad proxy_mode: $* (redirect|tproxy|redirect_tproxy)" ;; esac ;;
         control.lan_proxy_mode)
             case "$*" in disabled|only_proxy|listed_only|except_listed) ;;
                 *) die "bad lan_proxy_mode: $*" ;; esac ;;
         config.main_node)
             case "$*" in urltest|nil) ;; *)
-                node_exists "$*" || die "no such node: $*" ;; esac ;;
+                node_exists "$*" || die "no such node: $*"
+                node_quarantined "$*" && echo "warning: node '$*' is quarantined (unsupported by meow) -- generation falls back to direct." >&2 ;; esac ;;
         config.main_udp_node)
             case "$*" in urltest|nil|same) ;; *)
-                node_exists "$*" || die "no such node: $*" ;; esac ;;
+                node_exists "$*" || die "no such node: $*"
+                node_quarantined "$*" && echo "warning: node '$*' is quarantined (unsupported by meow) -- generation falls back to direct." >&2 ;; esac ;;
     esac
     uci_set "$key" "$*" || die "uci set failed: $key"
     echo "Set $key = $*"
 }
 cmd_get() { [ -n "$1" ] || die "usage: homeproxy get <section.option>"; uci_get "$1"; }
 
-case "$1" in
+case "${1:-}" in
 start|stop|restart|reload) "$INIT" "$@" ;;
 status) cmd_status ;;
 enable) "$INIT" enable && echo "Enabled $CONF at boot." ;;
@@ -195,25 +248,66 @@ generate)
     gen_c=0; gen_s=0
     # In custom routing mode the client config is needed even with main_node
     # unset: routing rules point at nodes directly.
-    if [ "$(uci -q get $CONF.config.main_node)" != "nil" ] || [ "$(uci -q get $CONF.config.routing_mode)" = "custom" ]; then
+    if [ "$(uci -q get $CONF.config.main_node 2>/dev/null)" != "nil" ] || [ "$(uci -q get $CONF.config.routing_mode 2>/dev/null)" = "custom" ]; then
         lua "$LUA_DIR/generate_client.lua" || die "client generation failed"
         gen_c=1
     fi
-    if [ "$(uci -q get $CONF.server.enabled)" = "1" ]; then
-        lua "$LUA_DIR/generate_server.lua" || die "server generation failed"
-        gen_s=1
+    if [ "$(uci -q get $CONF.server.enabled 2>/dev/null)" = "1" ]; then
+        # rc split (spec 8.1/F7): 2 = enabled sections existed but all were
+        # quarantined -> warn and continue client-only; 1 = real failure.
+        gen_s_rc=0
+        lua "$LUA_DIR/generate_server.lua" || gen_s_rc=$?
+        case "$gen_s_rc" in
+            0) gen_s=1 ;;
+            2) echo "homeproxy: no usable server listeners (all enabled server" >&2
+               echo "  sections were quarantined) -- continuing without meow-s.yaml" >&2 ;;
+            *) die "server generation failed" ;;
+        esac
     fi
-    # Validate with sing-box when available so a bad config is caught here,
-    # not at the next service start. Only files generated in THIS run are
-    # checked -- a stale sing-box-s.json from a now-disabled server must not
-    # fail the command.
-    SB=${HP_SINGBOX:-/usr/bin/sing-box}
-    [ -x "$SB" ] || SB=$(command -v sing-box 2>/dev/null || true)
-    if [ -n "$SB" ]; then
-        [ "$gen_c" = "1" ] && { [ -f "$RUN_DIR/sing-box-c.json" ] || die "sing-box-c.json missing after generation"; "$SB" check --config "$RUN_DIR/sing-box-c.json" || die "sing-box check failed: sing-box-c.json"; }
-        [ "$gen_s" = "1" ] && { [ -f "$RUN_DIR/sing-box-s.json" ] || die "sing-box-s.json missing after generation"; "$SB" check --config "$RUN_DIR/sing-box-s.json" || die "sing-box check failed: sing-box-s.json"; }
+    # Validate with meow when available so a bad config is caught here, not
+    # at the next service start. Only files generated in THIS run are checked
+    # -- a stale meow-s.yaml from a now-disabled server must not fail it.
+    MB="$(meow_bin)"
+    if [ -n "$MB" ]; then
+        if [ "$gen_c" = "1" ]; then
+            [ -f "$RUN_DIR/meow-c.yaml" ] || die "meow-c.yaml missing after generation"
+            if ! "$MB" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR"; then
+                # A bad *unused* node (materialized as a probe outbound) can
+                # fail the whole-config check; retry once without them, same
+                # contract as init.d (spec 8.1/8.2, HP_MATERIALIZE_ALL_NODES).
+                if [ "${HP_MATERIALIZE_ALL_NODES:-1}" != "0" ]; then
+                    echo "homeproxy: meow -t failed; retrying with HP_MATERIALIZE_ALL_NODES=0" >&2
+                    HP_MATERIALIZE_ALL_NODES=0 lua "$LUA_DIR/generate_client.lua" || die "client regeneration failed"
+                    "$MB" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR" || die "meow -t failed: meow-c.yaml"
+                else
+                    die "meow -t failed: meow-c.yaml"
+                fi
+            fi
+        fi
+        if [ "$gen_s" = "1" ]; then
+            [ -f "$RUN_DIR/meow-s.yaml" ] || die "meow-s.yaml missing after generation"
+            "$MB" -f "$RUN_DIR/meow-s.yaml" -t -d "$RUN_DIR" || die "meow -t failed: meow-s.yaml"
+        fi
     fi
+    # spec 8.2: surface the quarantine summary so dropped nodes are visible.
+    qn="$(quarantine_names | grep -c .)"
+    [ "$qn" -gt 0 ] && echo "homeproxy: $qn node(s) quarantined (unsupported by meow) -- see $QUAR_FILE"
     echo "Configs generated in $RUN_DIR."
+    ;;
+check)
+    MB="$(meow_bin)"
+    [ -n "$MB" ] || die "meow binary not found"
+    found=0; rc=0
+    for f in "$RUN_DIR/meow-c.yaml" "$RUN_DIR/meow-s.yaml"; do
+        [ -f "$f" ] || continue
+        found=1
+        if "$MB" -f "$f" -t -d "$RUN_DIR"; then echo "$f: OK"; else echo "$f: FAILED" >&2; rc=1; fi
+    done
+    if [ "$found" = "0" ]; then
+        echo "no generated configs in $RUN_DIR (run: homeproxy generate)"
+        rc=1
+    fi
+    exit "$rc"
     ;;
 migrate) lua "$LUA_DIR/migrate_config.lua" && echo "Migration applied." ;;
 # Run the node-name migration first: an update fired between a package
@@ -222,40 +316,77 @@ migrate) lua "$LUA_DIR/migrate_config.lua" && echo "Migration applied." ;;
 subscribe) lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"; lua "$LUA_DIR/update_subscriptions.lua" ;;
 update-resources)
     shift
-    if [ -z "$1" ] || [ "$1" = "all" ]; then
+    if [ -z "${1:-}" ] || [ "${1:-}" = "all" ]; then
         for i in china_ip4 china_ip6 gfw_list china_list; do "$HP_DIR/scripts/update_resources.sh" "$i"; done
     else "$HP_DIR/scripts/update_resources.sh" "$1"; fi
     ;;
 nodes) cmd_nodes ;;
-node) [ -n "$2" ] || die "usage: homeproxy node <name>"; uci -q show "$CONF.$2" 2>/dev/null || die "no such section: $2" ;;
+node)
+    [ -n "${2:-}" ] || die "usage: homeproxy node <name>"
+    uci -q show "$CONF.$2" 2>/dev/null || die "no such section: $2"
+    node_quarantined "$2" && echo "# quarantined: unsupported by meow (see $QUAR_FILE)" || true ;;
 main-node)
-    if [ -z "$2" ]; then uci_get "config.main_node"; else
-        case "$2" in urltest|nil) ;; *) node_exists "$2" || die "no such node: $2" ;; esac
+    if [ -z "${2:-}" ]; then uci_get "config.main_node"; else
+        case "$2" in urltest|nil) ;; *)
+            node_exists "$2" || die "no such node: $2"
+            node_quarantined "$2" && echo "warning: node '$2' is quarantined (unsupported by meow) -- generation falls back to direct." >&2 ;; esac
         uci_set "config.main_node" "$2" || die "set failed"; echo "main_node=$2"
     fi ;;
 routing-mode)
-    if [ -z "$2" ]; then uci_get "config.routing_mode"; else
+    if [ -z "${2:-}" ]; then uci_get "config.routing_mode"; else
         case "$2" in bypass_mainland_china|proxy_mainland_china|gfwlist|global|custom) ;; *) die "bad routing_mode: $2 (bypass_mainland_china|proxy_mainland_china|gfwlist|global|custom)" ;; esac
         uci_set "config.routing_mode" "$2" || die "set failed"; echo "routing_mode=$2"
     fi ;;
 proxy-mode)
-    if [ -z "$2" ]; then uci_get "config.proxy_mode"; else
-        case "$2" in redirect|tproxy|redirect_tproxy|redirect_tun|tun|tproxy_tun) ;; *) die "bad proxy_mode: $2 (redirect|tproxy|redirect_tproxy|redirect_tun|tun|tproxy_tun)" ;; esac
+    if [ -z "${2:-}" ]; then uci_get "config.proxy_mode"; else
+        # New vocabulary (spec 3.4): redirect = TCP REDIRECT arm only;
+        # tproxy = UDP TPROXY arm only (TCP is NOT intercepted);
+        # redirect_tproxy = both. TUN modes were removed.
+        case "$2" in redirect|tproxy|redirect_tproxy) ;;
+            *) die "bad proxy_mode: $2 (redirect|tproxy|redirect_tproxy)" ;; esac
+        if [ "$2" = "tproxy" ]; then
+            mun=$(uci_get "config.main_udp_node"); mun=${mun:-nil}
+            rmod=$(uci_get "config.routing_mode"); rmod=${rmod:-bypass_mainland_china}
+            if [ "$mun" = "nil" ] && [ "$rmod" != "custom" ]; then
+                echo "warning: proxy_mode=tproxy steers UDP only; with main_udp_node=nil and" >&2
+                echo "  a non-custom routing_mode the firewall intercepts NO traffic at all." >&2
+            fi
+        fi
         uci_set "config.proxy_mode" "$2" || die "set failed"; echo "proxy_mode=$2"
     fi ;;
 lan-proxy)
-    if [ -z "$2" ]; then uci_get "control.lan_proxy_mode"; else
+    if [ -z "${2:-}" ]; then uci_get "control.lan_proxy_mode"; else
         # Same value set as the web UI / API / firewall gate.
         case "$2" in disabled|only_proxy|listed_only|except_listed) ;; *) die "bad lan_proxy_mode: $2 (disabled|only_proxy|listed_only|except_listed)" ;; esac
         uci_set "control.lan_proxy_mode" "$2" || die "set failed"; echo "lan_proxy_mode=$2"
     fi ;;
 add) shift; cmd_add "$@" ;;
 import) shift; [ $# -ge 1 ] || die "usage: homeproxy import <share-link> [more links...]"; printf '%s\n' "$@" | lua "$LUA_DIR/add_nodes.lua" ;;
-del) cmd_del "$2" ;;
+del) cmd_del "${2:-}" ;;
 set) shift; cmd_set "$@" ;;
-get) cmd_get "$2" ;;
+get) cmd_get "${2:-}" ;;
 show) uci -q show "$CONF" ;;
-log) if [ "$2" = "-f" ]; then tail -F "$LOG_PATH" 2>/dev/null || echo "no log yet"; else tail -n 50 "$LOG_PATH" 2>/dev/null || echo "no log yet"; fi ;;
-""|-h|--help|help) sed -n '4,24p' "$0" 2>/dev/null ;;
-*) die "unknown command '$1' (try: homeproxy help)" ;;
+log)
+    # meow kernel logs (procd stdout/stderr) plus our own homeproxy.log,
+    # which carries the lua/shell warnings.
+    if [ "${2:-}" = "-f" ]; then
+        lf=""
+        for f in "$RUN_DIR/meow-c.log" "$RUN_DIR/meow-s.log" "$LOG_PATH"; do
+            [ -f "$f" ] && lf="$lf $f"
+        done
+        if [ -n "$lf" ]; then tail -F $lf; else echo "no log yet"; fi
+    else
+        shown=0
+        for f in "$RUN_DIR/meow-c.log" "$RUN_DIR/meow-s.log" "$LOG_PATH"; do
+            if [ -f "$f" ]; then
+                [ "$shown" = "1" ] && echo
+                echo "== $f =="
+                tail -n 50 "$f"
+                shown=1
+            fi
+        done
+        if [ "$shown" = "0" ]; then echo "no log yet"; fi
+    fi ;;
+""|-h|--help|help) sed -n '4,27p' "$0" 2>/dev/null ;;
+*) die "unknown command '${1:-}' (try: homeproxy help)" ;;
 esac

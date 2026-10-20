@@ -4,8 +4,13 @@ Verify ss (shadowsocks) share-link parsing: OLD vs NEW Lua handler logic.
 
 Replicates the Lua functions in homeproxy.lua and subscription_parser.lua
 (both the pre-d2acb22 "manual" handler, the post-d2acb22 "parseURL-based"
-handler, and the current fixed handler in subscription_parser.lua) to confirm
-which ss link formats break and which the fix resolves.
+handler, and the current meow-era handler in subscription_parser.lua) to
+confirm which ss link formats break and which the fix resolves.
+
+Post-migration additions mirror the meow legality precheck (spec
+§4.4/§9.1): AEAD-only cipher set, 2022-blake3 base64 key-length rule, and
+the in-process SIP003 plugin names ("simple-obfs"/"obfs-local" normalize
+onto the "obfs" builtin; external plugins are rejected).
 
 Lua pattern semantics reproduced:
   - parseURL: IPv6 brackets stripped from hostname; username always assigned
@@ -417,8 +422,9 @@ def ss_fixed(rest):
         m = re.match(r"^([^;]+);?(.*)$", ssp["plugin"])
         if m:
             pname = m.group(1)
-            if pname == "simple-obfs":
-                pname = "obfs-local"
+            # meow: legacy names map onto the "obfs" builtin.
+            if pname in ("simple-obfs", "obfs-local"):
+                pname = "obfs"
             ssplugin = pname
             sspluginopts = m.group(2) or None
     if method and ssurl.get("hostname") and ssurl.get("port"):
@@ -428,6 +434,46 @@ def ss_fixed(rest):
                 "port": ssurl["port"], "method": method, "password": pass_,
                 "plugin": ssplugin, "plugin_opts": sspluginopts}
     return None
+
+
+# ---------------------------------------------------------------------------
+# meow SS legality precheck (mirror of subscription_parser.lua
+# M.validate_node shadowsocks branch, spec §4.4/§9.1).
+# ---------------------------------------------------------------------------
+MEOW_SS_AEAD = {
+    "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+    "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm",
+    "2022-blake3-chacha20-poly1305",
+}
+MEOW_SS_BUILTIN_PLUGINS = {
+    "obfs", "simple-obfs", "v2ray-plugin", "gost-plugin", "shadow-tls",
+    "restls", "jls", "ech-tls-tunnel", "kcptun",
+}
+
+
+def b64_decoded_len(s):
+    """Mirror of the Lua b64_key_len: strict charset, decoded byte count."""
+    if not isinstance(s, str) or not re.match(r"^[A-Za-z0-9+/_\-]+=?=?$", s):
+        return None
+    try:
+        return len(base64.b64decode(s + "=" * (-len(s) % 4)))
+    except Exception:
+        return None
+
+
+def ss_meow_precheck(method, password, plugin=None):
+    """Returns (ok, reason). Mirrors validate_node's shadowsocks branch."""
+    if not method or not password:
+        return (False, "shadowsocks node missing encrypt_method or password")
+    if method not in MEOW_SS_AEAD:
+        return (False, "not an AEAD cipher meow accepts")
+    if method.startswith("2022-blake3-"):
+        need = 16 if method == "2022-blake3-aes-128-gcm" else 32
+        if b64_decoded_len(password) != need:
+            return (False, "requires a base64 key of %d bytes" % need)
+    if plugin and plugin not in MEOW_SS_BUILTIN_PLUGINS:
+        return (False, "not a meow built-in plugin")
+    return (True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +634,71 @@ def run_tests():
         sys.exit(1)
 
 
+def check_meow_ss_precheck():
+    """Contract checks for the meow-era ss precheck (AEAD set, 2022 keys,
+    plugin normalization)."""
+    key16 = base64.b64encode(b"k" * 16).decode()
+    key32 = base64.b64encode(b"k" * 32).decode()
+
+    accepted = [
+        ("aes-128-gcm", "password", None),
+        ("aes-256-gcm", "password", "obfs"),          # normalized builtin
+        ("aes-256-gcm", "password", "v2ray-plugin"),
+        ("chacha20-ietf-poly1305", "password", None),
+        ("2022-blake3-aes-128-gcm", key16, None),
+        ("2022-blake3-aes-256-gcm", key32, None),
+        ("2022-blake3-chacha20-poly1305", key32, None),
+    ]
+    for method, pw, plugin in accepted:
+        ok, reason = ss_meow_precheck(method, pw, plugin)
+        assert ok, f"should accept {method}/{plugin}: {reason}"
+
+    rejected = [
+        # measured against the v0.24.0 reference build: these fail `meow -t`.
+        ("xchacha20-ietf-poly1305", "password", None),
+        ("aes-192-gcm", "password", None),
+        ("aes-128-ccm", "password", None),
+        ("aes-256-ccm", "password", None),
+        ("rc4-md5", "password", None),                # stream cipher
+        ("aes-256-cfb", "password", None),            # stream cipher
+        # 2022 ciphers with wrong key material must be rejected.
+        ("2022-blake3-aes-128-gcm", "password", None),
+        ("2022-blake3-aes-128-gcm", key32, None),     # wrong length
+        ("2022-blake3-aes-256-gcm", key16, None),     # wrong length
+        # external SIP003 plugin names are disabled by --no-external-plugins
+        ("aes-256-gcm", "password", "ck-client"),
+        ("aes-256-gcm", "password", "some-external-plugin"),
+        # missing credentials
+        (None, "password", None),
+        ("aes-256-gcm", None, None),
+    ]
+    for method, pw, plugin in rejected:
+        ok, reason = ss_meow_precheck(method, pw, plugin)
+        assert not ok, f"should reject {method}/{plugin}"
+        assert reason
+    print("meow ss precheck checks: PASS")
+
+
+def check_plugin_normalization():
+    """simple-obfs / obfs-local links must normalize to the 'obfs' builtin."""
+    for plugin_in in ("simple-obfs", "obfs-local", "obfs"):
+        url = make_sip002_plugin("aes-256-gcm", "password", "example.com",
+                                 "8388", plugin_in, "mode=http")
+        r = ss_fixed(extract_rest(url))
+        assert r is not None, plugin_in
+        assert r["plugin"] == "obfs", (plugin_in, r["plugin"])
+        assert r["plugin_opts"] == "mode=http"
+    # SIP008 plugin field gets the same normalization upstream; ensure an
+    # unknown plugin survives parsing (precheck rejects it, not the parser).
+    url = make_sip002_plugin("aes-256-gcm", "password", "example.com",
+                             "8388", "ck-client", "mode=x")
+    r = ss_fixed(extract_rest(url))
+    assert r is not None and r["plugin"] == "ck-client"
+    ok, reason = ss_meow_precheck(r["method"], r["password"], r["plugin"])
+    assert not ok and reason
+    print("plugin normalization checks: PASS")
+
+
 def check_hostname_replica():
     """Lock the Python replica to the hardened Lua is_hostname contract."""
     good = ["example.com", "a.b-c.example.org", "localhost", "node_1.example.com",
@@ -612,6 +723,16 @@ def test_parser_matrix():
     run_tests()
 
 
+def test_meow_ss_precheck():
+    check_meow_ss_precheck()
+
+
+def test_plugin_normalization():
+    check_plugin_normalization()
+
+
 if __name__ == "__main__":
     check_hostname_replica()
     run_tests()
+    check_meow_ss_precheck()
+    check_plugin_normalization()

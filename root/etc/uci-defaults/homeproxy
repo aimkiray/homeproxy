@@ -1,7 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-2.0-only
-# Run HomeProxy config migration/defaults once at first boot.
-lua /usr/lib/homeproxy/migrate_config.lua
+# Run HomeProxy config migration/defaults once at first boot. Honors the
+# install.sh-generated env.sh so the same file works on the persistent
+# MiWiFi layout (files under /data/other_vol) and a standard package build.
+[ -f /etc/homeproxy/env.sh ] && . /etc/homeproxy/env.sh || true
+HP_LIB_DIR="${HP_LIB_DIR:-/usr/lib/homeproxy}"
+export HP_LUAPATH="$HP_LIB_DIR"
+lua "$HP_LIB_DIR/migrate_config.lua"
 
 # Register a fw3 include so homeproxy iptables rules are re-applied whenever
 # the firewall reloads/restarts (fw3 flushes the base chains). Mirrors the
@@ -9,7 +14,7 @@ lua /usr/lib/homeproxy/migrate_config.lua
 if ! uci -q get firewall.homeproxy >/dev/null 2>&1; then
     uci -q set firewall.homeproxy=include
     uci -q set firewall.homeproxy.type='script'
-    uci -q set firewall.homeproxy.path='/usr/lib/homeproxy/firewall_include.sh'
+    uci -q set firewall.homeproxy.path="$HP_LIB_DIR/firewall_include.sh"
     uci -q set firewall.homeproxy.reload='1'
     uci -q set firewall.homeproxy.enabled='1'
     uci -q commit firewall

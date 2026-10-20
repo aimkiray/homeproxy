@@ -84,7 +84,7 @@ default_prerm' > "$TEMP_DIR/pre-deinstall"
 	apk mkpkg \
 		--info "name:$PKG_NAME" \
 		--info "version:$PKG_VERSION" \
-		--info "description:Modern sing-box proxy for iptables-only (MiWiFi) routers" \
+		--info "description:Modern meow-rs proxy for iptables-only (MiWiFi) routers" \
 		--info "arch:noarch" \
 		--info "origin:https://github.com/immortalwrt/homeproxy" \
 		--info "url:" \
@@ -93,7 +93,7 @@ default_prerm' > "$TEMP_DIR/pre-deinstall"
 		--script "post-install:$TEMP_DIR/post-install" \
 		--script "post-upgrade:$TEMP_DIR/post-upgrade" \
 		--script "pre-deinstall:$TEMP_DIR/pre-deinstall" \
-		--info "depends:libc sing-box lua libuci-lua luci-lib-jsonc iptables iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-ipset kmod-ipt-ipset iptables-mod-conntrack kmod-ipt-conntrack iptables-mod-multiport kmod-ipt-multiport iptables-mod-extra kmod-ipt-extra ipset curl firewall uhttpd" \
+		--info "depends:libc lua libuci-lua luci-lib-jsonc iptables iptables-mod-tproxy kmod-ipt-tproxy iptables-mod-ipset kmod-ipt-ipset iptables-mod-conntrack kmod-ipt-conntrack iptables-mod-multiport kmod-ipt-multiport iptables-mod-extra kmod-ipt-extra ipset curl firewall uhttpd" \
 		--files "$TEMP_PKG_DIR" \
 		--output "$TEMP_DIR/${PKG_NAME}_${PKG_VERSION}.apk"
 
@@ -104,7 +104,7 @@ else
 	cat > "$TEMP_PKG_DIR/CONTROL/control" <<-EOF
 		Package: $PKG_NAME
 		Version: $PKG_VERSION
-		Depends: libc, sing-box, lua, libuci-lua, luci-lib-jsonc, iptables, iptables-mod-tproxy, kmod-ipt-tproxy, iptables-mod-ipset, kmod-ipt-ipset, iptables-mod-conntrack, kmod-ipt-conntrack, iptables-mod-multiport, kmod-ipt-multiport, iptables-mod-extra, kmod-ipt-extra, ipset, curl, firewall, uhttpd
+		Depends: libc, lua, libuci-lua, luci-lib-jsonc, iptables, iptables-mod-tproxy, kmod-ipt-tproxy, iptables-mod-ipset, kmod-ipt-ipset, iptables-mod-conntrack, kmod-ipt-conntrack, iptables-mod-multiport, kmod-ipt-multiport, iptables-mod-extra, kmod-ipt-extra, ipset, curl, firewall, uhttpd
 		Source: https://github.com/immortalwrt/homeproxy
 		SourceName: $PKG_NAME
 		Section: net
@@ -112,7 +112,7 @@ else
 		Maintainer: Tianling Shen <cnsztl@immortalwrt.org>
 		Architecture: all
 		Installed-Size: TO-BE-FILLED-BY-IPKG-BUILD
-		Description:  Modern sing-box proxy for iptables-only (MiWiFi) routers
+		Description:  Modern meow-rs proxy for iptables-only (MiWiFi) routers
 	EOF
 	chmod 0644 "$TEMP_PKG_DIR/CONTROL/control"
 

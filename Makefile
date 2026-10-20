@@ -2,19 +2,19 @@
 #
 # Copyright (C) 2022-2025 ImmortalWrt.org
 #
-# HomeProxy — sing-box front-end for routers without LuCI/nftables/ucode
+# HomeProxy — meow-rs front-end for routers without LuCI/nftables/ucode
 # (e.g. stock Xiaomi/MiWiFi). Backend logic is implemented in Lua and traffic
 # steering uses iptables + ipset instead of fw4/nftables.
 
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=homeproxy
-PKG_VERSION:=1.0.0
+PKG_VERSION:=2.0.0
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 PKG_MAINTAINER:=ImmortalWrt / community
 
-LUCI_TITLE:=Modern proxy platform (sing-box) for iptables-only routers
+LUCI_TITLE:=Modern proxy platform (meow-rs) for iptables-only routers
 PKGARCH:=all
 
 define Package/homeproxy
@@ -24,7 +24,6 @@ define Package/homeproxy
   TITLE:=$(LUCI_TITLE)
   PKGARCH:=$(PKGARCH)
   DEPENDS:= \
-	+sing-box \
 	+lua \
 	+libuci-lua \
 	+luci-lib-jsonc \
@@ -46,7 +45,7 @@ define Package/homeproxy
 endef
 
 define Package/homeproxy/description
-  Manages a sing-box client/server with a shell CLI instead of LuCI. Config
+  Manages a meow-rs client/server with a shell CLI instead of LuCI. Config
   generators and the subscription updater run under the on-device lua
   (luci.json + uci binding); firewall rules are applied with iptables/ipset
   so it works on devices without nftables/fw4/ucode (e.g. MiWiFi).

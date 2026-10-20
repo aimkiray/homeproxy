@@ -5,7 +5,7 @@
 #
 # Why this exists: '/' is squashfs (ro) and '/etc' is ramfs (volatile) -- every
 # reboot wipes /etc/init.d/*, the /etc/homeproxy symlink, and /etc/profile.d.
-# The backend (lib/scripts/web/resources), sing-box, and the patched init
+# The backend (lib/scripts/web/resources), meow, and the patched init
 # scripts all live on persistent /data/other_vol; and MiWiFi mirrors
 # /etc/config + /etc/crontabs to /data/etc/ and restores them on boot, so the
 # UCI config (lan_proxy_mode, subscription, main_node, firewall include) and
