@@ -1,49 +1,52 @@
 # homeproxy — MiWiFi / iptables port
 
-A [sing-box](https://github.com/SagerNet/sing-box) front-end for routers **without LuCI, ucode, or nftables** — e.g. stock Xiaomi/MiWiFi (OpenWrt 18.06 base, kernel 5.4, busybox/ash). The original `luci-app-homeproxy` (LuCI JS view + ucode + fw4/nftables) is replaced by:
+A [meow-rs](https://github.com/meow-rs/meow-rs) (mihomo/Clash Meta in Rust) front-end for routers **without LuCI, ucode, or nftables** — e.g. stock Xiaomi/MiWiFi (OpenWrt 18.06 base, kernel 5.4, busybox/ash). The original `luci-app-homeproxy` (LuCI JS view + ucode + fw4/nftables) is replaced by:
 
 - **Lua backend** — on-device `lua 5.1` + `luci.json` + `uci` binding (no `ucode`/`nft`/`fw4`/`jq`).
-- **iptables + ipset** traffic steering — TCP redirect, UDP tproxy, DNS hijack, CN bypass.
+- **iptables + ipset** traffic steering — TCP redirect, UDP tproxy (IPv4), DNS hijack, CN bypass. Firewall ownership stays with homeproxy (`listeners[].firewall: false`).
 - **Shell CLI** (`homeproxy …`) **and a tiny web UI** (status / node / mode / subscribe / restart / log, domain lists, node ping, connectivity) served by a standalone uhttpd on the LAN interface, no auth.
 
-Verified on a Xiaomi router with **sing-box 1.13.15** (1.14.x not tested), `iptables`/`ip6tables`, `ipset`, `xt_TPROXY`.
+Target kernel: meow-rs **v0.24.0**, locally compiled (`aarch64-unknown-linux-musl`, features `full listener-shadowsocks` — upstream release binaries lack the SS server listener). Migration spec: `docs/spec-meow-migration-A.md`.
 
 ## Features
 
 - Routing modes: `bypass_mainland_china`, `global`, `gfwlist`, `proxy_mainland_china`, `custom`.
-- Proxy modes: `redirect_tproxy` (TCP redirect + UDP tproxy + DNS hijack), `tun` (best-effort).
-- Subscriptions: `ss`/`vmess`/`vless`/`trojan`/`hysteria`/`hysteria2`/`http`/`socks`/`tuic`/`anytls` share-links + SIP008; subscription parsing is modularized into `subscription_parser.lua` (no UCI/IO deps, pure Lua 5.1).
+- Proxy modes: `redirect_tproxy` (TCP redirect + UDP tproxy + DNS hijack), `redirect`, `tproxy` (UDP only). TUN mode removed in the meow migration.
+- Subscriptions: `ss`/`vmess`/`vless`/`trojan`/`hysteria2`/`http`/`socks`/`anytls`/`snell` share-links + SIP008; parsing is modularized into `subscription_parser.lua` (no UCI/IO deps, pure Lua 5.1). Unsupported types (ssr/tuic/wireguard/ssh/hysteria1/shadowtls) are dropped with reasons recorded in `unsupported-nodes.json`.
 - LAN proxy control: `disabled` / `only_proxy` / `listed_only` / `except_listed` (the last two use per-IP/MAC lists).
-- Force-direct / force-proxy **domain lists** (fed to both dnsmasq `ipset=`/`server=` and sing-box inline rule-sets).
-- Node TCP/HTTP delay (ms) via the sing-box Clash API; Google/Baidu connectivity test.
+- Force-direct / force-proxy **domain lists** (fed to dnsmasq `ipset=`/`server=` and meow rule-providers).
+- Node delay (ms) via the meow external-controller (Clash API); Google/Baidu connectivity test through the mixed port.
+- Server mode: Shadowsocks inbound only (`listeners[].type: shadowsocks`).
 - Auto-update subscriptions/resources via cron; boot-time self-restore on MiWiFi's volatile `/etc`.
 
 ## Requirements
 
-sing-box (not bundled) + `lua 5.1`, `luci.json`, `uci` binding, `iptables`/`ip6tables` with the `-mod-tproxy`/`-mod-ipset`/`-mod-multiport`/`-mod-conntrack` packages, `ipset`, `kmod-ipt-tproxy`, `kmod-ipt-ipset`, `curl`. **No** `ucode`, `nft`, `fw4`, or `jq` needed.
+meow-rs ≥ v0.24.0 (not bundled in the ipk; provisioned by `install.sh`) + `lua 5.1`, `luci.json`, `uci` binding, `iptables`/`ip6tables` with the `-mod-tproxy`/`-mod-ipset`/`-mod-multiport`/`-mod-conntrack` packages, `ipset`, `kmod-ipt-tproxy`, `kmod-ipt-ipset`, `curl`. **No** `ucode`, `nft`, `fw4`, or `jq` needed.
 
 ## Install (on the router)
 
 ```sh
-# one-shot installer / upgrader (also bundles sing-box 1.13.15 arm64 by default)
+# one-shot installer / upgrader
 curl -fsSL <URL>/install.sh | sh
 # or from a local checkout / tarball:
 sh install.sh [SRC] [--force] [--rollback]
-# env: HP_SRC_URL (tarball URL)  HP_SINGBOX_URL  HP_CONFIRM_TIMEOUT (default 30)  HP_WEBUI_PORT (default 8910)
+# env: HP_SRC_URL (repo tarball URL)  HP_MEOW_URL (kernel artifact, http(s):// or file://,
+#      tarball or bare binary)  HP_MEOW_SHA256  HP_CONFIRM_TIMEOUT (default 30)
 ```
 
-Persistent files live on `/data/other_vol/homeproxy` (ubifs); volatile `/etc` bits are recreated every boot by `boot_restore.sh`. A failed **upgrade** auto-rolls back after a 30s verify window; a failed **fresh** install cleans up to a safe no-proxy state. Paths are resolved via `/etc/homeproxy/env.sh` (sourced by init.d / CLI / cron / firewall / web API).
+For a locally built kernel push the binary to the router and use `HP_MEOW_URL=file:///path/to/meow` (or a tarball containing it). Persistent files live on `/data/other_vol/homeproxy` (ubifs); volatile `/etc` bits are recreated every boot by `boot_restore.sh`. A failed **upgrade** auto-rolls back after a 30s verify window; a failed **fresh** install cleans up to a safe no-proxy state. Paths are resolved via `/etc/homeproxy/env.sh` (sourced by init.d / CLI / cron / firewall / web API).
 
 ## Quick start (CLI)
 
 ```sh
 homeproxy subscribe                 # fetch/parse subscription -> nodes
-homeproxy nodes                     # list node sections (hash + label)
+homeproxy nodes                     # list node sections (hash + label; ⚠ = quarantined)
 homeproxy main-node <hash>          # pick the main outbound
 homeproxy routing-mode bypass_mainland_china
 homeproxy proxy-mode redirect_tproxy
 homeproxy lan-proxy only_proxy      # disabled | only_proxy | listed_only | except_listed
 homeproxy generate && homeproxy restart
+homeproxy check                     # meow -t on generated configs
 homeproxy log -f
 ```
 
@@ -54,9 +57,9 @@ Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dro
 ## Project layout
 
 - `Makefile` — OpenWrt package definition (`Package/homeproxy`).
-- `root/usr/lib/homeproxy/` — Lua backend (`homeproxy.lua`, `generate_client.lua`, `generate_server.lua`, `migrate_config.lua`, `update_subscriptions.lua`, `subscription_parser.lua`) + `firewall.sh` (iptables/ipset) + `firewall_include.sh` (fw3 reload hook).
+- `root/usr/lib/homeproxy/` — Lua backend (`homeproxy.lua`, `generate_client.lua`, `generate_server.lua`, `migrate_config.lua`, `update_subscriptions.lua`, `subscription_parser.lua`, `add_nodes.lua`) + `firewall.sh` (iptables/ipset) + `firewall_include.sh` (fw3 reload hook).
 - `root/usr/bin/homeproxy` — CLI.
-- `root/etc/init.d/homeproxy` — procd service: generators + dnsmasq steering + firewall.
+- `root/etc/init.d/homeproxy` — procd service: generators + `meow -t` + meow-c/meow-s instances + firewall.
 - `root/etc/init.d/homeproxy-web` — standalone uhttpd for the web UI (LAN-only, no auth).
 - `root/etc/homeproxy/env.sh` — runtime paths (generated by the installer; sourced by init.d / CLI / cron / firewall / web API).
 - `root/etc/homeproxy/web/` — web UI (`index.html` + `cgi-bin/api`).
@@ -64,12 +67,13 @@ Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dro
 - `root/etc/homeproxy/scripts/` — `clean_log.sh`, `update_crond.sh`, `update_resources.sh`, `boot_restore.sh`.
 - `install.sh` — on-router installer/upgrader.
 - `tests/` — Python test replicas of the Lua URL/SS parser and subscription helpers (no on-device Lua interpreter needed).
-- `docs/` — design review notes (`ss-subscription-review.md`).
+- `docs/` — `spec-meow-migration-A.md` (migration spec + errata), `RFC-meow-rs-migration.md`, design review notes.
 
 ## Notes / limitations
 
 - `/` is squashfs (read-only) on MiWiFi; the installer places everything on `/data/other_vol` and symlinks `/etc/homeproxy` → it.
-- Only `redirect_tproxy` (+ DNS hijack) is fully wired for iptables; `tun` needs the tun kmod and is best-effort.
+- UDP tproxy is IPv4-only (meow v0.24.0); IPv6 TCP goes through a separate redirect listener (`infra.v6_port`, default 5334).
+- Router's own outbound traffic is **not** transparently intercepted (meow `routing-mark` only marks DIRECT sockets; capturing OUTPUT would loop). `update_via_proxy=1` routes fetches through the mixed port explicitly.
 - Port-forward / DNAT rules from the stock firewall (`fw3`) are never touched — only homeproxy's own chains/ipsets are managed.
 
 ## License

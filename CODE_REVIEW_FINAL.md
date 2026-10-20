@@ -1,5 +1,7 @@
 # HomeProxy — Complete Engineering Code Review
 
+> **历史存档**：本评审针对 sing-box 时代的代码基线（分支 `xiaomi`）。当前 `meow-kernel` 分支已完成 meow-rs v0.24.0 迁移与独立评审/修复，见 `docs/spec-meow-migration-A.md` §13 勘误。
+
 **Scope**: 7 core files (~3500 lines)  
 **Target**: Xiaomi/MiWiFi router, OpenWrt 18.06, Lua 5.1, iptables+ipset, sing-box 1.11+  
 **Method**: 7 parallel subagent deep reviews + manual cross-file analysis
