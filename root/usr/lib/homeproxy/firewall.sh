@@ -18,6 +18,16 @@ RUN_DIR=/var/run/homeproxy
 
 uci_get() { uci -q get "$CFG.$1" 2>/dev/null; }
 
+# uci truth-table (same vocabulary as init.d's config_get_bool / install.sh
+# bool_on): only {1,yes,on,true,enabled} are true; every other spelling --
+# including garbage values -- is false.
+bool_on() {
+	case "$1" in
+		1|yes|on|true|enabled) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 # --- config ---------------------------------------------------------------
 routing_mode=$(uci_get "config.routing_mode"); routing_mode=${routing_mode:-bypass_mainland_china}
 proxy_mode=$(uci_get "config.proxy_mode");      proxy_mode=${proxy_mode:-redirect_tproxy}
@@ -213,14 +223,22 @@ stop_fw() {
 # that a tail-appended rule never reaches.
 apply_fw_pre() {
 	local ip="$1" need_in=0 sect
+	# meow's server side runs shadowsocks listeners only -- the same gate
+	# generate_server.lua applies as its quarantine predicate (type ~=
+	# shadowsocks -> skip). Both loops below must carry the identical
+	# predicate, and a failed/empty uci type read resolves to "not ss"
+	# (fail-closed: the INPUT hole simply never opens).
 	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
-		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] && [ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] && need_in=1
+		[ "$(uci -q get "$CFG.$sect.type" 2>/dev/null)" = "shadowsocks" ] \
+			&& bool_on "$(uci -q get "$CFG.$sect.enabled")" \
+			&& bool_on "$(uci -q get "$CFG.$sect.firewall")" && need_in=1
 	done
 	[ "$need_in" = "1" ] || return 0
 	$ip -N homeproxy_in 2>/dev/null || $ip -F homeproxy_in
 	for sect in $(uci -q show "$CFG" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
-		[ "$(uci -q get "$CFG.$sect.enabled")" = "1" ] || continue
-		[ "$(uci -q get "$CFG.$sect.firewall")" = "1" ] || continue
+		[ "$(uci -q get "$CFG.$sect.type" 2>/dev/null)" = "shadowsocks" ] || continue
+		bool_on "$(uci -q get "$CFG.$sect.enabled")" || continue
+		bool_on "$(uci -q get "$CFG.$sect.firewall")" || continue
 		local port; port=$(uci -q get "$CFG.$sect.port"); [ -n "$port" ] || continue
 		$ip -A homeproxy_in -p tcp --dport "$port" -j ACCEPT 2>/dev/null
 		$ip -A homeproxy_in -p udp --dport "$port" -j ACCEPT 2>/dev/null
@@ -396,6 +414,23 @@ elif [ "$routing_mode" = "gfwlist" ]; then
 	route_set4=homeproxy_gfw4; route_set6=homeproxy_gfw6
 fi
 
+# v6 classification-set existence gate. A MISSING inet6 set is worse than an
+# empty one: the `-m set --match-set` / `! --match-set` routing rule then
+# fails to install at all, inverting the mode into proxy-everything for v6
+# (bypass loses its RETURN rule; gfwlist/proxy_mainland lose their
+# not-in-set RETURN). Fail open instead: drop the whole v6 TCP arm so v6
+# traffic stays direct. Each mode arm is judged independently through
+# route_set6 (only one ever assigns it); global/custom leave it empty and
+# keep steering v6 via the catch-all. The v4 missing-set cases already
+# FATAL-abort above; an empty-but-existing set is not missing -- the
+# existing empty-set warns keep their semantics.
+v6_steer=1
+if [ "$ipv6" = "1" ] && [ -n "$route_set6" ] && ! ipset list "$route_set6" >/dev/null 2>&1; then
+	echo "homeproxy: WARNING: v6 routing ipset '$route_set6' missing -- v6 TCP steering arm skipped, all v6 traffic goes direct." >&2
+	route_set6=""
+	v6_steer=0
+fi
+
 # --- shared rule emitters -------------------------------------------------
 # local/private destinations -> RETURN (mirrors upstream @homeproxy_local_addr).
 # $1=ip $2=table $3=chain
@@ -537,6 +572,64 @@ hook_prerouting() {
 	done
 }
 
+# --- routing_port=common multiport groups ---------------------------------
+# infra.common_port arrives as a comma string (option) or a space string
+# (uci list rendering) -- commas fold to spaces and each token must be
+# ^[0-9]+$ (1 multiport slot) or ^[0-9]+:[0-9]+$ (a range, which the
+# xt_multiport manual counts as TWO slots; conservative counting, one extra
+# rule beats an overflowed one). xt_multiport caps --dports at 15 slots:
+# over-15 input makes the WHOLE rule fail to install, so valid tokens are
+# repacked into <=15-slot groups emitted as identical rules. A garbage
+# token warns once and is skipped instead of killing the entire filter;
+# when nothing usable remains the port-filter chain stays empty (implicit
+# RETURN -> falls through to direct) -- today's broken-rule outcome, but
+# visible. Groups are built lazily on first use so `stop` stays silent.
+common_port_groups=""
+cpg_built=0
+# Echo the slot cost of a valid token (1 or 2); rc=1 for garbage.
+common_port_slots() {
+	case "$1" in
+		*:*)
+			case "${1%%:*}" in ''|*[!0-9]*) return 1 ;; esac
+			case "${1#*:}"  in ''|*[!0-9]*) return 1 ;; esac
+			echo 2 ;;
+		''|*[!0-9]*) return 1 ;;
+		*) echo 1 ;;
+	esac
+}
+build_common_port_groups() {
+	[ "$cpg_built" = "1" ] && return 0
+	cpg_built=1
+	local tok grp="" slots=0 need ok=0
+	for tok in $(echo "$common_port" | tr ',' ' '); do
+		need=$(common_port_slots "$tok") || {
+			echo "homeproxy: WARNING: invalid common_port token '$tok' -- skipped." >&2
+			continue
+		}
+		ok=1
+		if [ $((slots + need)) -gt 15 ]; then
+			common_port_groups="${common_port_groups:+$common_port_groups;}$grp"
+			grp="" slots=0
+		fi
+		grp="${grp:+$grp,}$tok"
+		slots=$((slots + need))
+	done
+	[ -n "$grp" ] && common_port_groups="${common_port_groups:+$common_port_groups;}$grp"
+	[ "$ok" = "1" ] || echo "homeproxy: WARNING: no usable common_port tokens -- port-filter chain left empty, traffic falls through to direct." >&2
+}
+# Emit one identical multiport jump per slot group.
+# $1=ip $2=table $3=chain $4=proto $5=target
+emit_common_port_rules() {
+	local ip="$1" tbl="$2" ch="$3" proto="$4" tgt="$5" g rest
+	build_common_port_groups
+	rest="$common_port_groups"
+	while [ -n "$rest" ]; do
+		g=${rest%%;*}
+		if [ "$g" = "$rest" ]; then rest=""; else rest=${rest#*;}; fi
+		$ip -t "$tbl" -A "$ch" -p "$proto" -m multiport --dports "$g" -j "$tgt" 2>/dev/null
+	done
+}
+
 # --- TCP redirect (nat) ----------------------------------------------------
 # $3 = REDIRECT target port: redirect_port for IPv4, v6_port for IPv6 (each
 # family is delivered to its own meow tproxy listener; chain names are shared
@@ -549,7 +642,7 @@ apply_tcp() {
 	# port-filtered action -- used by catch-all / wan_proxy / lan_global
 	$ip -t nat -N homeproxy_redir_port 2>/dev/null || $ip -t nat -F homeproxy_redir_port
 	if [ "$routing_port" = "common" ]; then
-		$ip -t nat -A homeproxy_redir_port -p tcp -m multiport --dports "$common_port" -j homeproxy_redir_act 2>/dev/null
+		emit_common_port_rules "$ip" nat homeproxy_redir_port tcp homeproxy_redir_act
 	else
 		$ip -t nat -A homeproxy_redir_port -p tcp -j homeproxy_redir_act
 	fi
@@ -574,7 +667,7 @@ apply_tproxy() {
 	$ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-ip 0.0.0.0 --on-port "$redirect_port" --tproxy-mark "$tproxy_mark/0xffffffff"
 	$ip -t mangle -N homeproxy_mangle_port 2>/dev/null || $ip -t mangle -F homeproxy_mangle_port
 	if [ "$routing_port" = "common" ]; then
-		$ip -t mangle -A homeproxy_mangle_port -p udp -m multiport --dports "$common_port" -j homeproxy_mangle_act 2>/dev/null
+		emit_common_port_rules "$ip" mangle homeproxy_mangle_port udp homeproxy_mangle_act
 	else
 		$ip -t mangle -A homeproxy_mangle_port -p udp -j homeproxy_mangle_act
 	fi
@@ -617,7 +710,9 @@ if [ "$outbound_node" != "nil" ]; then
 	case "$proxy_mode" in
 		redirect|redirect_tproxy)
 			apply_tcp "$IP4" "$route_set4" "$redirect_port"
-			[ "$ipv6" = "1" ] && apply_tcp "$IP6" "$route_set6" "$v6_port"
+			# v6_steer=0 (v6 classification set missing) -> no v6 TCP arm at
+			# all: no PREROUTING jump, no chains -> v6 fails open to direct.
+			[ "$ipv6" = "1" ] && [ "$v6_steer" = "1" ] && apply_tcp "$IP6" "$route_set6" "$v6_port"
 			;;
 		tproxy)
 			[ "$udp_arm" = "1" ] || echo "homeproxy: WARNING: proxy_mode=tproxy but no UDP steering is configured (main_udp_node=nil, non-custom routing_mode) -- no traffic will be proxied." >&2

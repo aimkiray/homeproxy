@@ -126,14 +126,14 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
    <label>Proxy DNS</label>
    <select id="dnsPreset" style="flex:0 0 200px">
     <option value="">— preset —</option>
-    <option value="8.8.8.8">Google DoH (8.8.8.8)</option>
-    <option value="1.1.1.1">Cloudflare DoH (1.1.1.1)</option>
-    <option value="9.9.9.9">Quad9 DoH (9.9.9.9)</option>
-    <option value="https://dns.adguard-dns.com/dns-query">AdGuard DoH</option>
-    <option value="https://dns.cloudflare.com/dns-query">Cloudflare DoH (host)</option>
-    <option value="https://dns.google/dns-query">Google DoH (host)</option>
+    <option value="8.8.8.8">Google DNS (8.8.8.8)</option>
+    <option value="1.1.1.1">Cloudflare DNS (1.1.1.1)</option>
+    <option value="9.9.9.9">Quad9 DNS (9.9.9.9)</option>
+    <option value="https://dns.adguard-dns.com/dns-query">AdGuard DoH → UDP</option>
+    <option value="https://dns.cloudflare.com/dns-query">Cloudflare DoH (host) → UDP</option>
+    <option value="https://dns.google/dns-query">Google DoH (host) → UDP</option>
    </select>
-   <input id="proxyDns" placeholder="IP or https://host/dns-query">
+   <input id="proxyDns" placeholder="IP or URL (https:// degrades to udp://)">
   </div>
   <div class="row">
    <label>China DNS</label>
@@ -150,7 +150,7 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
   <div class="row" style="margin-top:8px">
    <button id="applyDns" class="ghost">Apply</button>
   </div>
-  <div class="sub" style="margin-top:8px">Proxy DNS = DoH via tunnel (non-CN domains) · China DNS = UDP direct (CN domains). Apply restarts the proxy.</div>
+  <div class="sub" style="margin-top:8px">Proxy DNS = plain UDP/TCP to the configured address for non-CN domains, queries detour via the proxy node; https:// and tls:// are downgraded to udp://host. China DNS = UDP direct (CN domains). Apply restarts the proxy. Unused in custom mode (dns_server sections apply).</div>
  </div>
 
  <div class="card">

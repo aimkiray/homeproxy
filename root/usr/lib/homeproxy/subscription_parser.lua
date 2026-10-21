@@ -203,6 +203,17 @@ function M.validate_node(hp, cfg, features)
 		return false, string.format("%s support is missing from this meow build", t)
 	end
 
+	-- Port legality applies to every supported type (spec §4.4): a decimal
+	-- integer in 1..65535. hysteria2 is the only type whose `ports` hopping
+	-- set may stand in for a missing dial port.
+	if is_empty(hp, cfg.port) then
+		if t ~= "hysteria2" or is_empty(hp, cfg.hysteria_hopping_port) then
+			return false, string.format("%s node missing port", t)
+		end
+	elseif not hp.validation("port", tostring(cfg.port)) then
+		return false, string.format("port '%s' is not a valid port (1-65535)", tostring(cfg.port))
+	end
+
 	if t == "shadowsocks" then
 		if is_empty(hp, cfg.shadowsocks_encrypt_method) or is_empty(hp, cfg.password) then
 			return false, "shadowsocks node missing encrypt_method or password"
@@ -222,11 +233,40 @@ function M.validate_node(hp, cfg, features)
 			return false, string.format("shadowsocks plugin '%s' is not a meow built-in (external SIP003 plugins are disabled)",
 				tostring(cfg.shadowsocks_plugin))
 		end
+		-- obfs plugins carry their mode in plugin_opts ';'-separated k=v
+		-- under either key name ("mode" or "obfs"); meow implements
+		-- http/tls only. An absent mode key falls through to the kernel
+		-- default, so only a declared bad value rejects.
+		if cfg.shadowsocks_plugin == "obfs" or cfg.shadowsocks_plugin == "simple-obfs"
+			or cfg.shadowsocks_plugin == "obfs-local" then
+			for kv in tostring(cfg.shadowsocks_plugin_opts or ""):gmatch("[^;]+") do
+				local k, v = kv:match("^%s*([%w_%-]+)%s*=%s*(.-)%s*$")
+				if (k == "mode" or k == "obfs") and not is_empty(hp, v)
+					and v ~= "http" and v ~= "tls" then
+					return false, string.format("shadowsocks obfs mode '%s' is not supported by meow (http/tls)", v)
+				end
+			end
+		end
 	elseif t == "vless" then
 		if is_empty(hp, cfg.uuid) then return false, "vless node missing uuid" end
 		if not is_empty(hp, cfg.vless_flow) and cfg.vless_flow ~= "xtls-rprx-vision" then
 			return false, string.format("vless flow '%s' is not supported by meow (only xtls-rprx-vision)",
 				tostring(cfg.vless_flow))
+		end
+		-- "none" is the only plain value; anything else must be a
+		-- mlkem768x25519plus suite: "<pfx>.<mode>.<rtt>.<keys...>" with
+		-- mode in {native,xorpub,random}, rtt in {1rtt,0rtt} and >=4
+		-- dot-separated sections (i.e. at least one key section).
+		if not is_empty(hp, cfg.vless_encryption) and cfg.vless_encryption ~= "none" then
+			local secs = {}
+			for s in tostring(cfg.vless_encryption):gmatch("[^%.]+") do secs[#secs + 1] = s end
+			if secs[1] ~= "mlkem768x25519plus"
+				or (secs[2] ~= "native" and secs[2] ~= "xorpub" and secs[2] ~= "random")
+				or (secs[3] ~= "1rtt" and secs[3] ~= "0rtt")
+				or #secs < 4 then
+				return false, string.format("vless encryption '%s' is not a valid mlkem768x25519plus suite",
+					tostring(cfg.vless_encryption))
+			end
 		end
 		if not is_empty(hp, cfg.transport) and not VLESS_TRANSPORTS[cfg.transport] then
 			return false, string.format("vless transport '%s' is not supported by meow", tostring(cfg.transport))
@@ -317,6 +357,15 @@ function M.validate_node(hp, cfg, features)
 		if not is_empty(hp, om) and om ~= "http" and om ~= "tls" then
 			return false, string.format("snell obfs mode '%s' is not supported (http/tls)", tostring(om))
 		end
+		-- Deliberate double gate (the generator's build_proxy rejects the
+		-- same pair): meow hard-errors obfs-opts on snell v6 ("6"/"v6");
+		-- v3-v5 carry obfs fine.
+		-- (parens truncate gsub's second return -- the substitution count
+		-- would otherwise leak into tonumber as an invalid base)
+		local vn = tonumber((tostring(v or ""):gsub("^%s*[vV]", "")))
+		if vn == 6 and not is_empty(hp, om) then
+			return false, "snell v6 does not support obfs-opts (v3-v5 only)"
+		end
 	elseif t == "socks" then
 		if cfg.socks_version == "4" then
 			return false, "meow supports socks5 only (socks4/socks4a link)"
@@ -331,6 +380,29 @@ function M.validate_node(hp, cfg, features)
 		end
 	end
 
+	-- UUID shape wherever it is set (vless/vmess): 32 hex digits, '-' at any
+	-- position ignored. Lua 5.1 patterns have no {n} quantifier, so length
+	-- and charset are checked separately.
+	if not is_empty(hp, cfg.uuid) then
+		local u = tostring(cfg.uuid):gsub("%-", "")
+		if #u ~= 32 or not u:match("^[0-9a-fA-F]+$") then
+			return false, string.format("uuid '%s' is not a 32-hex-digit UUID", tostring(cfg.uuid))
+		end
+	end
+	-- REALITY material wherever reality is on: the public key must decode
+	-- to a 32-byte X25519 key (url-safe base64 accepted); the vless branch
+	-- above already rejects a missing key.
+	if cfg.tls_reality == "1" and not is_empty(hp, cfg.tls_reality_public_key)
+		and b64_key_len(hp, cfg.tls_reality_public_key) ~= 32 then
+		return false, "tls_reality_public_key is not a 32-byte base64 key"
+	end
+	-- short-id: even-length hex of at most 16 chars; empty is legal.
+	if not is_empty(hp, cfg.tls_reality_short_id) then
+		local sid = tostring(cfg.tls_reality_short_id)
+		if #sid % 2 ~= 0 or #sid > 16 or not sid:match("^[0-9a-fA-F]+$") then
+			return false, string.format("tls_reality_short_id '%s' is not even-length hex (<=16 chars)", sid)
+		end
+	end
 	-- client-fingerprint legality wherever it is set (vless/vmess primarily).
 	if not is_empty(hp, cfg.tls_utls) then
 		if features and features.with_utls == false then

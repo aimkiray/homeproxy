@@ -37,6 +37,17 @@ fi
 
 cp -fpR "$PKG_DIR/root"/* "$TEMP_PKG_DIR/"
 
+# Force mode 0755 on the whole in-package executable surface: cp -fpR only
+# preserves checkout modes, so a lost +x bit in the git index/worktree (e.g.
+# watchdog.sh historically committed 100644) would silently ship non-
+# executable scripts. Failure aborts the build via errexit.
+chmod 0755 "$TEMP_PKG_DIR"/etc/homeproxy/scripts/*.sh \
+	"$TEMP_PKG_DIR"/etc/init.d/* \
+	"$TEMP_PKG_DIR"/usr/bin/homeproxy \
+	"$TEMP_PKG_DIR"/etc/homeproxy/web/cgi-bin/api \
+	"$TEMP_PKG_DIR"/usr/lib/homeproxy/*.sh \
+	"$TEMP_PKG_DIR"/etc/uci-defaults/homeproxy
+
 cat > "$TEMP_PKG_DIR/lib/upgrade/keep.d/$PKG_NAME" <<-EOF
 /etc/homeproxy/certs/
 /etc/homeproxy/ruleset/

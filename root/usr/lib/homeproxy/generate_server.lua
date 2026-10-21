@@ -170,11 +170,9 @@ end
 
 local listeners = {}
 local used_ports = {}
-local saw_enabled = false   -- any enabled server section at all (rc split below)
 
 uci:foreach(UCICONFIG, UCISERVER, function(cfg)
-	if cfg.enabled ~= "1" then return end
-	saw_enabled = true
+	if not hp.uci_true(cfg.enabled) then return end
 	local name = tostring(cfg[".name"] or "?")
 
 	-- meow's server side is shadowsocks-only (spec 5/D12); every other
@@ -277,13 +275,12 @@ flush_unsupported()
 
 if #listeners == 0 then
 	-- Leave no output behind (the stale file was already removed above).
-	-- Exit code splits the two cases so the caller can react differently:
-	--   rc=2 -- enabled server sections existed but every one landed in
-	--           quarantine: the server side is "configured but unusable",
-	--           init.d logs it and continues with the client config.
-	--   rc=1 -- no enabled server section at all (or a real failure
-	--           below): the original error path.
-	os.exit(saw_enabled and 2 or 1)
+	-- Exit code contract (C2): rc=2 -- no usable listener (no enabled
+	-- server section at all, or every enabled section landed in
+	-- quarantine): a definitional skip, init.d logs it and continues
+	-- with the client config. rc=1 is reserved for hard errors (the
+	-- atomic_write failure below).
+	os.exit(2)
 end
 
 local config = {

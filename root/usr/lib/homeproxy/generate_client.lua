@@ -425,7 +425,11 @@ local function build_proxy(node, tag)
 	elseif t == "snell" then
 		p.psk = not isEmpty(node.snell_psk) and node.snell_psk or node.password
 		local sv = not isEmpty(node.snell_version) and node.snell_version or node.version
-		p.version = strToInt(sv) or tonumber(tostring(sv or ""):gsub("^%s*[vV]", ""))
+		-- Extra parens truncate gsub's second return (replace count); without
+		-- them it leaks into tonumber's base arg and non-decimal spellings
+		-- ("v6"/absent) hard-error the whole generate (same idiom as
+		-- subscription_parser.lua's version check).
+		p.version = strToInt(sv) or tonumber((tostring(sv or ""):gsub("^%s*[vV]", "")))
 		-- The reference v0.24.0 build implements v3/v4/v5/v6 (SnellVersion::V6
 		-- + v6-only `mode`); keep the generator-side gate aligned with the
 		-- subscription parser's {3..6} precheck so a bad UCI value quarantines
@@ -702,8 +706,12 @@ local function ruleset_provider(sec)
 		end
 		if detour ~= "DIRECT" then p.proxy = detour end
 	elseif t == "inline" then
+		-- Only scalar payloads go through str_list: a table is already a
+		-- list, and re-splitting it would shred classical entries that
+		-- legitimately contain commas ('DOMAIN-SUFFIX,x.com').
 		local payload = sec.payload
-		if type(payload) ~= "table" or isEmpty(payload) then
+		if type(payload) ~= "table" then payload = str_list(payload) end
+		if isEmpty(payload) then
 			warn("ruleset '%s': inline provider requires a payload list -- skipped.", tostring(sec[".name"]))
 			return nil
 		end
@@ -759,7 +767,9 @@ local function rule_conditions(cfg, owner)
 		else
 			local inner = {}
 			for _, v in ipairs(list) do push(inner, "(" .. mk(v) .. ")") end
-			push(conds, "OR,((" .. table.concat(inner, ",") .. "))")
+			-- Kernel form OR,(<sub>,<sub>,...) expects one outer pair; each
+			-- sub already carries its own parentheses.
+			push(conds, "OR,(" .. table.concat(inner, ",") .. ")")
 		end
 	end
 	add(cfg.domain, function(v) return "DOMAIN," .. v end)
@@ -813,8 +823,13 @@ local function translate_routing_rule(cfg)
 	else
 		target = resolve_outbound(cfg.outbound)
 	end
-	local conds = rule_conditions(cfg, owner)
-	if #conds == 0 then
+	-- RULE-SET is a top-level-only type: inside a logic group the kernel
+	-- rejects it outright, so bucket it before any AND/OR assembly.
+	local conds, rs_conds = {}, {}
+	for _, c in ipairs(rule_conditions(cfg, owner)) do
+		if c:match("^RULE%-SET,") then push(rs_conds, c) else push(conds, c) end
+	end
+	if #conds == 0 and #rs_conds == 0 then
 		-- Condition fields were configured but every one was dropped (a bad
 		-- network value, a missing ruleset, ...). Emitting MATCH here would
 		-- silently swallow every later rule, so skip this rule instead.
@@ -828,13 +843,30 @@ local function translate_routing_rule(cfg)
 			end
 		end
 		-- A rule with no conditions matches everything.
-		return "MATCH," .. target
-	elseif #conds == 1 then
-		return conds[1] .. "," .. target
+		return { "MATCH," .. target }
 	end
-	local inner = {}
-	for _, c in ipairs(conds) do push(inner, "(" .. c .. ")") end
-	return "AND,((" .. table.concat(inner, ",") .. "))," .. target
+	-- Returns a list of top-level lines: one RULE-SET,<p>,<target> per
+	-- resolved provider plus one line for the ordinary conditions.
+	local lines = {}
+	for _, c in ipairs(rs_conds) do push(lines, c .. "," .. target) end
+	if #conds > 0 then
+		if #rs_conds > 0 then
+			-- meow cannot express AND(rule_set, other); degrade to OR by
+			-- emitting both sides as independent top-level lines.
+			warn("%s: rule_set cannot combine with other conditions on meow -- degraded to separate lines (OR).", owner)
+		end
+		if #conds == 1 then
+			-- A trailing ,no-resolve is an EXTRA flag after the adapter
+			-- slot, not part of the condition payload.
+			local bare = conds[1]:match("^(.*),no%-resolve$")
+			push(lines, (bare or conds[1]) .. "," .. target .. (bare and ",no-resolve" or ""))
+		else
+			local inner = {}
+			for _, c in ipairs(conds) do push(inner, "(" .. c .. ")") end
+			push(lines, "AND,(" .. table.concat(inner, ",") .. ")," .. target)
+		end
+	end
+	return lines
 end
 
 ---------------------------------------------------------------------------
@@ -863,9 +895,18 @@ local function dns_url_for_outbound(url, outbound)
 	return url:gsub("#.*$", "") .. "#" .. ob
 end
 
+-- Bracket a bare IPv6 literal so the URL parser sees host[:port]; a single
+-- colon means host:port and must NOT be bracketed.
+local function bracket_v6(s)
+	if type(s) ~= "string" then return s end
+	if s:match("^%[") then return s end
+	if select(2, s:gsub(":", "")) >= 2 then return "[" .. s .. "]" end
+	return s
+end
+
 local function wan_dns_url()
 	local h = wan_dns
-	if h:match(":") and not h:match("^%[") then h = "[" .. h .. "]" end
+	h = bracket_v6(h)
 	return "udp://" .. h
 end
 
@@ -879,8 +920,8 @@ local function dns_server_url(cfg)
 	local t = cfg.type or "udp"
 	local host = cfg.server
 	local port = strToInt(cfg.server_port)
-	if not isEmpty(host) and host:match(":") and not host:match("^%[") then
-		host = "[" .. host .. "]"
+	if not isEmpty(host) then
+		host = bracket_v6(host)
 	end
 	local hostport = tostring(host or "") .. ((port and port ~= 0) and (":" .. port) or "")
 	local sni = not isEmpty(cfg.tls_sni) and ("#" .. cfg.tls_sni) or nil
@@ -949,7 +990,7 @@ local function plain_dns_url(v, proxy_tag)
 		u = "udp://" .. rest
 	elseif not scheme then
 		-- bracket bare IPv6 literals so the URL parser sees host[:port]
-		if u:match(":") and not u:match("^%[") then u = "[" .. u .. "]" end
+		u = bracket_v6(u)
 		u = "udp://" .. u
 	elseif scheme ~= "udp" and scheme ~= "tcp" then
 		warn("dns server '%s': unsupported scheme -- using wan DNS.", u)
@@ -1184,11 +1225,15 @@ if routing_mode ~= "custom" then
 		push(rules, "RULE-SET,direct-domain,DIRECT")
 	end
 	if PL then
-		-- emitted but referenced only via nameserver-policy/dnsmasq (§4.7)
+		-- bypass_mainland_china also references this from rules (below);
+		-- other modes emit it for the dnsmasq/ipset side only (§4.7).
 		rule_providers["proxy-domain"] = file_provider("providers/proxy_list.txt")
 	end
 	if routing_mode == "bypass_mainland_china" then
 		rule_providers["china-domain"] = file_provider("providers/china_list.txt")
+		-- proxy_list domains must precede china-domain: the CN DIRECT rule
+		-- would otherwise swallow them (direct-domain stays first anyway).
+		if PL then push(rules, "RULE-SET,proxy-domain," .. main_target) end
 		push(rules, "RULE-SET,china-domain,DIRECT")
 	elseif routing_mode == "gfwlist" then
 		rule_providers["gfw-domain"] = file_provider("providers/gfw_list.txt")
@@ -1201,8 +1246,8 @@ if routing_mode ~= "custom" then
 else
 	uci:foreach(UCICONFIG, UCIROUTINGRULE, function(cfg)
 		if cfg.enabled ~= "1" then return end
-		local line = translate_routing_rule(cfg)
-		if line then push(rules, line) end
+		local lines = translate_routing_rule(cfg)
+		for _, l in ipairs(lines or {}) do push(rules, l) end
 	end)
 	push(rules, "MATCH," .. resolve_outbound(default_outbound))
 end

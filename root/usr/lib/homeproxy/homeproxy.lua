@@ -207,6 +207,15 @@ function _M.validation(datatype, data)
     return true
 end
 
+-- Lua dual of the shell bool_on() / init.d config_get_bool truth table
+-- (firewall.sh, CLI, install.sh): only {1,yes,on,true,enabled} count as
+-- true; every other spelling -- including nil, "0"/"no"/"off" and
+-- garbage values -- is false.
+local UCI_TRUE_WORDS = { ["1"] = true, yes = true, on = true, ["true"] = true, enabled = true }
+function _M.uci_true(v)
+	return UCI_TRUE_WORDS[tostring(v)] == true
+end
+
 -- ---------------------------------------------------------------------------
 -- Base64 (pure Lua, standard + URL-safe input)
 -- ---------------------------------------------------------------------------

@@ -16,7 +16,6 @@ local sharelink = require("subscription_parser")
 local uci       = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 
 local CFG = "homeproxy"
-uci:load(CFG)
 
 local UCIMAIN = "config"
 local UCINODE = "node"
@@ -65,6 +64,16 @@ if not acquire_lock() then
 	-- Nonzero: a skipped update is NOT a success -- callers (web/CLI) must
 	-- not treat it as "nodes refreshed" (e.g. by restarting the service).
 	os.exit(3)
+end
+
+-- Snapshot the UCI package INSIDE the lock: loading before acquire_lock()
+-- would freeze pre-lock state, and the post-fetch commit would then
+-- clobber changes a cooperating writer staged in between (B3-U3).
+local load_ok, load_err = pcall(function() uci:load(CFG) end)
+if not load_ok then
+	release_lock()
+	log("[FATAL ERROR] uci:load(" .. CFG .. "): " .. tostring(load_err))
+	os.exit(1)
 end
 
 local allow_insecure    = uci:get(CFG, UCISUB, "allow_insecure") or "0"

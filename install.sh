@@ -500,18 +500,58 @@ log "starting services..."
 # configured, server disabled) -- "installed, awaiting configuration" is a
 # success state, so verify the web UI instead of a process that will never
 # exist. Mirrors the start conditions in init.d/homeproxy.
-meow_expected=0
-if [ "$(uci -q get homeproxy.server.enabled 2>/dev/null)" = "1" ]; then
-    meow_expected=1
-elif [ "$(uci -q get homeproxy.config.routing_mode 2>/dev/null)" = "custom" ]; then
-    _o=$(uci -q get homeproxy.routing.default_outbound 2>/dev/null)
-    [ -n "$_o" ] && [ "$_o" != "nil" ] && meow_expected=1
-else
-    _o=$(uci -q get homeproxy.config.main_node 2>/dev/null)
-    [ -n "$_o" ] && [ "$_o" != "nil" ] && meow_expected=1
+#
+# uci truth-table helper (same vocabulary as config_get_bool): only
+# {1,yes,on,true,enabled} are true; every other spelling -- including
+# garbage values -- is false. The absent/empty default is each caller's
+# choice (config.enabled defaults on, the server switches default off).
+bool_on() {
+    case "$1" in
+        1|yes|on|true|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Master switch first (spec 7.2): config.enabled absent/empty = enabled;
+# any other value disables the whole service. An explicit disabled must
+# NOT be overturned by the HP_WAS_RUNNING upgrade override below.
+hp_disabled=0
+_en=$(uci -q get homeproxy.config.enabled 2>/dev/null)
+if [ -n "$_en" ] && ! bool_on "$_en"; then hp_disabled=1; fi
+
+# Expectations per instance so the stage-1 probe can look for exactly the
+# yamls this install should run: expect_c -> meow-c.yaml (an outbound is
+# configured), expect_s -> meow-s.yaml (C3 server formula).
+expect_c=0; expect_s=0
+if [ "$hp_disabled" = 0 ]; then
+    # C3: the named `homeproxy.server.enabled` master switch is uci-true
+    # OR any `config server` listener section's enabled is uci-true (same
+    # sed pipeline as the CLI srv_en probe / firewall.sh apply_fw_pre).
+    if bool_on "$(uci -q get homeproxy.server.enabled 2>/dev/null)"; then
+        expect_s=1
+    else
+        for _s in $(uci -q show homeproxy 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
+            bool_on "$(uci -q get "homeproxy.$_s.enabled" 2>/dev/null)" && expect_s=1
+        done
+    fi
+    if [ "$(uci -q get homeproxy.config.routing_mode 2>/dev/null)" = "custom" ]; then
+        _o=$(uci -q get homeproxy.routing.default_outbound 2>/dev/null)
+    else
+        _o=$(uci -q get homeproxy.config.main_node 2>/dev/null)
+    fi
+    [ -n "$_o" ] && [ "$_o" != "nil" ] && expect_c=1
 fi
-# Upgrades: a previously running meow must come back regardless.
-[ "$HP_WAS_RUNNING" = "yes" ] && meow_expected=1
+meow_expected=0
+{ [ "$expect_c" = 1 ] || [ "$expect_s" = 1 ]; } && meow_expected=1
+# Upgrades: a previously running meow must come back regardless -- unless
+# the master switch was explicitly turned off.
+[ "$hp_disabled" = 0 ] && [ "$HP_WAS_RUNNING" = "yes" ] && meow_expected=1
+
+# yaml set the stage-1 probe should look for. Empty means "meow was
+# running before but nothing is expected now" -> any meow- instance.
+exp_yamls=""
+[ "$expect_c" = 1 ] && exp_yamls="$exp_yamls meow-c.yaml"
+[ "$expect_s" = 1 ] && exp_yamls="$exp_yamls meow-s.yaml"
 
 # Process probe: prefer pgrep -f; busybox builds may ship without it, so fall
 # back to `ps w | grep` (the bracket patterns below keep grep from matching
@@ -548,14 +588,28 @@ if [ "$meow_expected" = 0 ]; then
     done
     [ "$ok" = 1 ] && log "installed (unconfigured): web UI up, add a node to start proxying."
 else
-    # Stage 1: wait for the meow process (unchanged semantics).
+    # Stage 1: wait for a meow process from the EXPECTED yaml set -- any
+    # one expected instance up counts, an orphan outside the set does not.
+    # With no yaml expectation (HP_WAS_RUNNING alone) fall back to the
+    # legacy meow- prefix probe.
     log "verifying meow start (${TIMEOUT}s)..."
     while [ "$i" -lt "$TIMEOUT" ]; do
-        if proc_running '[m]eow -f /var/run/homeproxy/meow-'; then ok=1; break; fi
+        if [ -n "$exp_yamls" ]; then
+            for _y in $exp_yamls; do
+                if proc_running "[m]eow -f /var/run/homeproxy/$_y"; then ok=1; break; fi
+            done
+        elif proc_running '[m]eow -f /var/run/homeproxy/meow-'; then
+            ok=1
+        fi
+        [ "$ok" = 1 ] && break
         sleep 1; i=$((i+1))
     done
     if [ "$ok" != 1 ]; then
         fail_reason="process never appeared"
+    elif [ "$expect_c" != 1 ]; then
+        # Pure-server expectation (or a was-running upgrade with no yaml
+        # set): meow-s has no mixed port, so process presence is the pass.
+        log "meow process up; no client instance expected -- skipping connectivity probe."
     elif [ "${HP_INSTALL_SKIP_CONN:-}" = "1" ]; then
         log "meow process up; HP_INSTALL_SKIP_CONN=1 -- skipping connectivity probe."
     elif ! command -v curl >/dev/null 2>&1; then

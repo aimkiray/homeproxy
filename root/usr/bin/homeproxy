@@ -45,6 +45,16 @@ die() { echo "homeproxy: $*" >&2; exit 1; }
 uci_set() { uci set "$CONF.$1=$2" 2>/dev/null && uci commit "$CONF"; }
 uci_get() { uci -q get "$CONF.$1" 2>/dev/null; }
 
+# uci truth-table (same vocabulary as init.d's config_get_bool / install.sh
+# bool_on): only {1,yes,on,true,enabled} are true; every other spelling --
+# including garbage values -- is false.
+bool_on() {
+    case "$1" in
+        1|yes|on|true|enabled) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Section type check: node_exists <name> -> 0 iff homeproxy.<name> is a node.
 node_exists() {
     [ "$(uci -q show "$CONF.$1" 2>/dev/null | awk -F= 'NR==1{print $2}')" = "node" ]
@@ -84,6 +94,62 @@ quarantine_names() {
 }
 # node_quarantined <section> -> 0 iff the node is recorded as quarantined.
 node_quarantined() { quarantine_names | grep -qxF "$1"; }
+
+# File-type rule-providers resolve `path` relative to the meow home dir
+# (-d $RUN_DIR), so generated configs reference providers/<list>.txt while
+# the canonical lists live in $HP_DIR/resources; sync the ones the current
+# routing_mode can reference into providers/ and prune stale copies.
+# SEMANTIC SOURCE = init.d sync_rule_files (contract C-B2-3): this is a
+# faithful port -- keep the want/copy/prune rules item-for-item identical.
+sync_providers() {
+    local prov_dir="$RUN_DIR/providers" f want=""
+    mkdir -p "$prov_dir" || return 0
+    # china-domain/gfw-domain and the CN ipcidr lists may be referenced in
+    # any routing_mode (rules and nameserver-policy); direct/proxy-domain
+    # exist only while the user ships those lists; direct-ip/proxy-ip are
+    # custom-mode only.
+    want="china_list.txt gfw_list.txt china_ip4.txt china_ip6.txt"
+    for f in direct_list.txt proxy_list.txt; do
+        [ -s "$HP_DIR/resources/$f" ] && want="$want $f"
+    done
+    if [ "$1" = "custom" ]; then
+        for f in direct_ip.txt proxy_ip.txt; do
+            [ -s "$HP_DIR/resources/$f" ] && want="$want $f"
+        done
+    fi
+    for f in $want; do
+        if [ -f "$HP_DIR/resources/$f" ]; then
+            cp -f "$HP_DIR/resources/$f" "$prov_dir/$f" 2>/dev/null
+        else
+            # A provider whose backing list vanished would fail `meow -t`;
+            # drop the stale copy so the failure is one consistent error.
+            rm -f "$prov_dir/$f"
+            echo "homeproxy: warning: resource $f missing -- rule-providers referencing it will fail." >&2
+        fi
+    done
+    # Prune stale copies of the known resource names (e.g. after a custom ->
+    # bypass mode switch shrank the want set). Unknown files in providers/
+    # (generator/user-placed) are left alone.
+    for f in china_list.txt gfw_list.txt china_ip4.txt china_ip6.txt \
+             direct_list.txt proxy_list.txt direct_ip.txt proxy_ip.txt; do
+        case " $want " in
+            *" $f "*) ;;
+            *) rm -f "$prov_dir/$f" ;;
+        esac
+    done
+}
+
+# C-B2-2 same-generation rollback for `generate`: the meow-c.yaml and
+# meow-s.yaml written by one run are a single generation, so ANY failure
+# (gen nonzero, yaml missing, meow -t, server gen rc=1 -- including a
+# server-side failure after the client already passed) must restore every
+# .hp-prev snapshot taken THIS run, then die. cprev/sprev flag the snapshots
+# taken this run; a failed/absent backup just means "no prev to restore".
+gen_rollback() {
+    [ "${cprev:-0}" = "1" ] && mv -f "$RUN_DIR/meow-c.yaml.hp-prev" "$RUN_DIR/meow-c.yaml"
+    [ "${sprev:-0}" = "1" ] && mv -f "$RUN_DIR/meow-s.yaml.hp-prev" "$RUN_DIR/meow-s.yaml"
+    return 0
+}
 
 cmd_status() {
     local st=stopped mb ver enabled
@@ -301,23 +367,57 @@ firewall-stop)
 generate)
     mkdir -p "$RUN_DIR"
     lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
-    gen_c=0; gen_s=0
+    gen_c=0; gen_s=0; cprev=0; sprev=0
     # In custom routing mode the client config is needed even with main_node
     # unset: routing rules point at nodes directly.
-    if [ "$(uci -q get $CONF.config.main_node 2>/dev/null)" != "nil" ] || [ "$(uci -q get $CONF.config.routing_mode 2>/dev/null)" = "custom" ]; then
-        lua "$LUA_DIR/generate_client.lua" || die "client generation failed"
+    routing_mode="$(uci -q get $CONF.config.routing_mode 2>/dev/null)"
+    if [ "$(uci -q get $CONF.config.main_node 2>/dev/null)" != "nil" ] || [ "$routing_mode" = "custom" ]; then
+        # spec 4.7/C-B2-3: file rule-providers read their lists from
+        # $RUN_DIR/providers/ -- sync before generation/validation (same
+        # placement as init.d's sync_rule_files call in start_service).
+        sync_providers "$routing_mode"
+        # C-B2-2: snapshot the current yaml so a failure in this run can
+        # restore the previous generation before dying (a cp failure just
+        # leaves cprev=0 -- "no prev to restore", non-fatal).
+        if [ -e "$RUN_DIR/meow-c.yaml" ]; then
+            cp -f "$RUN_DIR/meow-c.yaml" "$RUN_DIR/meow-c.yaml.hp-prev" 2>/dev/null && cprev=1
+        fi
+        lua "$LUA_DIR/generate_client.lua" || { gen_rollback; die "client generation failed"; }
+        [ -f "$RUN_DIR/meow-c.yaml" ] || { gen_rollback; die "meow-c.yaml missing after generation"; }
         gen_c=1
     fi
-    if [ "$(uci -q get $CONF.server.enabled 2>/dev/null)" = "1" ]; then
+    # Server-enabled gate (spec C3): run the server generator when EITHER the
+    # named `homeproxy.server.enabled` master switch is uci-true OR any
+    # type=server listener section has enabled uci-true ({1,yes,on,true,
+    # enabled}, same as init.d config_get_bool / install.sh bool_on). The two
+    # are independent section kinds
+    # (config homeproxy 'server' vs config server 'name'), so the disjunction
+    # must cover both -- same formula as init.d's server_enabled probe. The
+    # section walk is the same sed pipeline firewall.sh apply_fw_pre uses;
+    # every uci probe is best-effort (errors swallowed).
+    srv_en=0
+    bool_on "$(uci -q get $CONF.server.enabled 2>/dev/null)" && srv_en=1
+    if [ "$srv_en" != "1" ]; then
+        for sect in $(uci -q show "$CONF" 2>/dev/null | sed -n "s/^homeproxy\.\([^.]*\)=server/\1/p"); do
+            bool_on "$(uci -q get "$CONF.$sect.enabled" 2>/dev/null)" && srv_en=1
+        done
+    fi
+    if [ "$srv_en" = "1" ]; then
+        if [ -e "$RUN_DIR/meow-s.yaml" ]; then
+            cp -f "$RUN_DIR/meow-s.yaml" "$RUN_DIR/meow-s.yaml.hp-prev" 2>/dev/null && sprev=1
+        fi
         # rc split (spec 8.1/F7): 2 = enabled sections existed but all were
-        # quarantined -> warn and continue client-only; 1 = real failure.
+        # quarantined -> warn and continue client-only (NOT a failure: no
+        # rollback); 1 = real failure -> roll back BOTH yamls, then die.
         gen_s_rc=0
         lua "$LUA_DIR/generate_server.lua" || gen_s_rc=$?
         case "$gen_s_rc" in
-            0) gen_s=1 ;;
+            0)
+                [ -f "$RUN_DIR/meow-s.yaml" ] || { gen_rollback; die "meow-s.yaml missing after generation"; }
+                gen_s=1 ;;
             2) echo "homeproxy: no usable server listeners (all enabled server" >&2
                echo "  sections were quarantined) -- continuing without meow-s.yaml" >&2 ;;
-            *) die "server generation failed" ;;
+            *) gen_rollback; die "server generation failed" ;;
         esac
     fi
     # Validate with meow when available so a bad config is caught here, not
@@ -326,25 +426,33 @@ generate)
     MB="$(meow_bin)"
     if [ -n "$MB" ]; then
         if [ "$gen_c" = "1" ]; then
-            [ -f "$RUN_DIR/meow-c.yaml" ] || die "meow-c.yaml missing after generation"
             if ! "$MB" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR"; then
                 # A bad *unused* node (materialized as a probe outbound) can
                 # fail the whole-config check; retry once without them, same
                 # contract as init.d (spec 8.1/8.2, HP_MATERIALIZE_ALL_NODES).
                 if [ "${HP_MATERIALIZE_ALL_NODES:-1}" != "0" ]; then
                     echo "homeproxy: meow -t failed; retrying with HP_MATERIALIZE_ALL_NODES=0" >&2
-                    HP_MATERIALIZE_ALL_NODES=0 lua "$LUA_DIR/generate_client.lua" || die "client regeneration failed"
-                    "$MB" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR" || die "meow -t failed: meow-c.yaml"
+                    HP_MATERIALIZE_ALL_NODES=0 lua "$LUA_DIR/generate_client.lua" || { gen_rollback; die "client regeneration failed"; }
+                    if [ ! -f "$RUN_DIR/meow-c.yaml" ] || ! "$MB" -f "$RUN_DIR/meow-c.yaml" -t -d "$RUN_DIR"; then
+                        gen_rollback
+                        die "meow -t failed: meow-c.yaml"
+                    fi
                 else
+                    gen_rollback
                     die "meow -t failed: meow-c.yaml"
                 fi
             fi
         fi
         if [ "$gen_s" = "1" ]; then
-            [ -f "$RUN_DIR/meow-s.yaml" ] || die "meow-s.yaml missing after generation"
-            "$MB" -f "$RUN_DIR/meow-s.yaml" -t -d "$RUN_DIR" || die "meow -t failed: meow-s.yaml"
+            if ! "$MB" -f "$RUN_DIR/meow-s.yaml" -t -d "$RUN_DIR"; then
+                gen_rollback
+                die "meow -t failed: meow-s.yaml"
+            fi
         fi
     fi
+    # The generation pair is final -- drop the snapshots (this also sweeps
+    # stale .hp-prev files left behind by a SIGKILLed earlier run).
+    rm -f "$RUN_DIR/meow-c.yaml.hp-prev" "$RUN_DIR/meow-s.yaml.hp-prev"
     # spec 8.2: surface the quarantine summary so dropped nodes are visible.
     qn="$(quarantine_names | grep -c .)"
     [ "$qn" -gt 0 ] && echo "homeproxy: $qn node(s) quarantined (unsupported by meow) -- see $QUAR_FILE"

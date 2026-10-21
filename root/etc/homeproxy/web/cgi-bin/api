@@ -446,9 +446,11 @@ set_subscription_urls)
 	;;
 
 set_dns)
-	# Set proxy DNS (DoH) and China DNS servers.
+	# Set proxy DNS and China DNS servers.
 	# Body: two lines -- proxy_dns on line 1, china_dns on line 2.
-	# proxy_dns: IP or https://host/path (DoH via tunnel)
+	# proxy_dns: IP or proto://host/path -- plain UDP/TCP upstream for non-CN
+	# domains (queries detour via the proxy node); tls://https:// are degraded
+	# to udp://host by the generator.
 	# china_dns:  IP only (UDP, direct)
 	require_body_size
 	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"

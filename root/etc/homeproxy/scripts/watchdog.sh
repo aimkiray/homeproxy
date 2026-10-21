@@ -229,8 +229,11 @@ if [ "$p_ok" = "1" ] && [ "$a_ok" = "1" ]; then
 			&& missing="$missing dns(nat)"
 		if [ -n "$missing" ]; then
 			log "steering jump(s) missing ($missing ) while meow is alive -- re-applying firewall."
+			# [C-B2-1] reload=stop_fw keep_ipsets+重建:此路径 firewall.active
+			# 已在、meow 活着,仅跳点被 fw3 冲掉;start 会销毁 ipset 使
+			# dnsmasq 已学动态成员蒸发。
 			fw=$(resolve_fw) && {
-				out=$(sh "$fw" start 2>&1)
+				out=$(sh "$fw" reload 2>&1)
 				[ -n "$out" ] && printf '%s\n' "$out" >>"$LOG_PATH" 2>/dev/null
 			}
 		fi
