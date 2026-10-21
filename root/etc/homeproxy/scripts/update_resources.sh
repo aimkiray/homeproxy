@@ -42,6 +42,17 @@ bool_on() {
     esac
 }
 
+# Process probe: prefer pgrep -f; busybox builds may ship without it, so fall
+# back to `ps w | grep` (bracket patterns keep grep from matching its own
+# command line in the ps output). Same convention as install.sh/watchdog.sh.
+proc_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$1" >/dev/null 2>&1
+    else
+        ps w 2>/dev/null | grep -q "$1"
+    fi
+}
+
 # update_via_proxy (homeproxy.subscription.update_via_proxy): fetch resource
 # updates through the local meow mixed port, so routers whose upstreams are
 # unreachable without the proxy (api.github.com / jsdelivr behind GFW) can
@@ -184,7 +195,7 @@ check_list_update() {
     # The new list only takes effect after ipsets and the dnsmasq steering
     # confs are rebuilt; both happen inside a service restart. Only restart
     # when the proxy is actually running.
-    if pgrep -f "meow -f /var/run/homeproxy/meow-" >/dev/null 2>&1; then
+    if proc_running "[m]eow -f /var/run/homeproxy/meow-"; then
         /etc/init.d/"$NAME" restart >/dev/null 2>&1 && \
             log "[$(to_upper "$listtype")] Service restarted to apply new resources."
     fi

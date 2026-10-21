@@ -55,6 +55,17 @@ bool_on() {
     esac
 }
 
+# Process probe: prefer pgrep -f; busybox builds may ship without it, so fall
+# back to `ps w | grep` (bracket patterns keep grep from matching its own
+# command line in the ps output). Same convention as install.sh/watchdog.sh.
+proc_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$1" >/dev/null 2>&1
+    else
+        ps w 2>/dev/null | grep -q "$1"
+    fi
+}
+
 # Section type check: node_exists <name> -> 0 iff homeproxy.<name> is a node.
 node_exists() {
     [ "$(uci -q show "$CONF.$1" 2>/dev/null | awk -F= 'NR==1{print $2}')" = "node" ]
@@ -154,7 +165,7 @@ gen_rollback() {
 cmd_status() {
     local st=stopped mb ver enabled
     # spec 8.4 unified probe: procd runs "meow -f /var/run/homeproxy/meow-{c,s}.yaml".
-    pgrep -f "meow -f $RUN_DIR/meow-" >/dev/null 2>&1 && st=running
+    proc_running "[m]eow -f $RUN_DIR/meow-" && st=running
     echo "$st"
     # Unset means enabled (same default as the api's ${enabled:-1} and
     # init.d's config_get_bool ... "1").
@@ -173,8 +184,8 @@ cmd_status() {
     fi
     [ -n "$ver" ] && echo "version: $ver"
     if [ "$st" = "running" ]; then
-        pgrep -f "meow -f $RUN_DIR/meow-c.yaml" >/dev/null 2>&1 && echo "client: running"
-        pgrep -f "meow -f $RUN_DIR/meow-s.yaml" >/dev/null 2>&1 && echo "server: running"
+        proc_running "[m]eow -f $RUN_DIR/meow-c.yaml" && echo "client: running"
+        proc_running "[m]eow -f $RUN_DIR/meow-s.yaml" && echo "server: running"
     fi
     return 0
 }
