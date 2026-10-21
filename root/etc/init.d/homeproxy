@@ -73,11 +73,29 @@ teardown_takeover() {
     drop_dnsmasq_confs
 }
 
+# Materialize a behavior:domain provider file: bare domains get the "+."
+# suffix form; prefixed (+. / *. / .) and other lines pass through,
+# blanks/comments drop. Atomic tmp+mv; a failed transform falls back to a
+# verbatim copy rather than losing the provider.
+domain_list_to_provider() {    # $1 = resources file, $2 = providers file
+    local tmp="$2.tmp.$$"
+    if awk '{sub(/^[ \t\r]+/,"");sub(/[ \t\r]+$/,"");sub(/\.+$/,"")}
+            !NF || /^#/ {next}
+            /^[A-Za-z0-9_][A-Za-z0-9._-]*$/ {print "+."$0; next}
+            {print}' "$1" > "$tmp" 2>/dev/null && mv -f "$tmp" "$2" 2>/dev/null; then
+        return 0
+    fi
+    rm -f "$tmp"
+    log "Warning: domain transform failed for ${2##*/} -- installing verbatim copy."
+    cp -f "$1" "$2" 2>/dev/null
+}
+
 # File-type rule-providers (spec 4.7) resolve their `path` relative to the
 # meow home dir (-d $RUN_DIR), so the generated config references
 # providers/<list>.txt. The canonical lists live in $HP_DIR/resources; the
 # generator does NOT copy them -- sync the ones the current routing_mode can
 # reference into providers/ and drop stale copies this function installed.
+# Domain lists materialize in suffix form; ipcidr lists copy verbatim.
 sync_rule_files() {
     local prov_dir="$RUN_DIR/providers" f want=""
     mkdir -p "$prov_dir" || return 0
@@ -96,19 +114,26 @@ sync_rule_files() {
     fi
     for f in $want; do
         if [ -f "$HP_DIR/resources/$f" ]; then
-            cp -f "$HP_DIR/resources/$f" "$prov_dir/$f" 2>/dev/null
+            case "$f" in
+                china_list.txt|gfw_list.txt|direct_list.txt|proxy_list.txt)
+                    domain_list_to_provider "$HP_DIR/resources/$f" "$prov_dir/$f" ;;
+                *)
+                    cp -f "$HP_DIR/resources/$f" "$prov_dir/$f" 2>/dev/null ;;
+            esac
         else
-            # A provider whose backing list vanished would fail `meow -t`;
-            # drop the stale copy so the failure is one consistent error.
+            # A provider whose payload vanished is warn-skipped by meow and
+            # its RULE-SET references drop with it; drop the stale copy.
             rm -f "$prov_dir/$f"
             log "Warning: resource $f missing -- rule-providers referencing it will fail."
         fi
     done
     # Prune stale copies of the known resource names (e.g. after a custom ->
     # bypass mode switch shrank the want set). Unknown files in providers/
-    # (generator/user-placed) are left alone.
+    # (generator/user-placed) are left alone. The .tmp.* sweep only covers
+    # leftovers of the known names.
     for f in china_list.txt gfw_list.txt china_ip4.txt china_ip6.txt \
              direct_list.txt proxy_list.txt direct_ip.txt proxy_ip.txt; do
+        rm -f "$prov_dir/$f".tmp.*
         case " $want " in
             *" $f "*) ;;
             *) rm -f "$prov_dir/$f" ;;

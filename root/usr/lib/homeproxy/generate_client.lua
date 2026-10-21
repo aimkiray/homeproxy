@@ -1215,8 +1215,13 @@ local rules = {}
 local DL = direct_domain_list ~= nil
 local PL = proxy_domain_list ~= nil
 
-local function file_provider(path)
-	return { type = "file", behavior = "domain", format = "text", path = path }
+local function file_provider(path, behavior)
+	return { type = "file", behavior = behavior or "domain", format = "text", path = path }
+end
+
+local function res_nonempty(name)
+	local d = hp.readfile(hp.HP_DIR .. "/resources/" .. name)
+	return d ~= nil and d:find("%S") ~= nil
 end
 
 if routing_mode ~= "custom" then
@@ -1235,6 +1240,16 @@ if routing_mode ~= "custom" then
 		-- would otherwise swallow them (direct-domain stays first anyway).
 		if PL then push(rules, "RULE-SET,proxy-domain," .. main_target) end
 		push(rules, "RULE-SET,china-domain,DIRECT")
+		-- dst_ip-only flows (redirect/tproxy daddr, IP literals, sniff
+		-- misses) get their CN bypass here; no-resolve never pays a lookup.
+		if res_nonempty("china_ip4.txt") then
+			rule_providers["china-ip4"] = file_provider("providers/china_ip4.txt", "ipcidr")
+			push(rules, "RULE-SET,china-ip4,DIRECT,no-resolve")
+		end
+		if ipv6_support == "1" and res_nonempty("china_ip6.txt") then
+			rule_providers["china-ip6"] = file_provider("providers/china_ip6.txt", "ipcidr")
+			push(rules, "RULE-SET,china-ip6,DIRECT,no-resolve")
+		end
 	elseif routing_mode == "gfwlist" then
 		rule_providers["gfw-domain"] = file_provider("providers/gfw_list.txt")
 		push(rules, "RULE-SET,gfw-domain," .. main_target)

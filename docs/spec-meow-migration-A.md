@@ -269,13 +269,17 @@ CLI `homeproxy proxy-mode` 合法值更新为 `{redirect|tproxy|redirect_tproxy}
                     "path":"providers/direct_list.txt" },   // 仅 direct_list 非空时
   "proxy-domain": { "type":"file", "behavior":"domain", "format":"text",
                     "path":"providers/proxy_list.txt" },    // 仅 proxy_list 非空时
+  "china-ip4":    { "type":"file", "behavior":"ipcidr","format":"text",
+                    "path":"providers/china_ip4.txt" },     // 仅 bypass 且非空时
+  "china-ip6":    { "type":"file", "behavior":"ipcidr","format":"text",
+                    "path":"providers/china_ip6.txt" },     // 仅 bypass + ipv6_support=1 且非空时
   "direct-ip":    { "type":"file", "behavior":"ipcidr","format":"text",
                     "path":"providers/direct_ip.txt" },     // 仅 custom 模式需要
   "proxy-ip":     { ... }                                    // 同上
 }
 ```
 
-- init `start` 前先 `sync_rule_files()`：`cp -f /etc/homeproxy/resources/{china_list,gfw_list,direct_list,proxy_list,china_ip4,china_ip6}.txt /var/run/homeproxy/providers/`（仅复制当前 mode 实际引用者；删多余文件）。相对路径天然落入 config 父目录 `/var/run/homeproxy`，safe-path 检查通过。
+- init `start` 前先 `sync_rule_files()`：把当前 mode 实际引用者物化进 `/var/run/homeproxy/providers/`（删多余文件）。domain 类列表（china_list/gfw_list/direct_list/proxy_list.txt）裸条目物化时改写 `+.domain`，前缀行及其他行原样透传；`*_ip*.txt` 原样 cp。相对路径天然落入 config 父目录 `/var/run/homeproxy`，safe-path 检查通过。
 - `wan_domain_list`/`wan_ip_list` 属 dnsmasq/防火墙侧，不进 rule-providers。
 
 ### 4.8 五种 `routing_mode` 的精确 `rules:` 文本
@@ -287,7 +291,10 @@ CLI `homeproxy proxy-mode` 合法值更新为 `{redirect|tproxy|redirect_tproxy}
 ```yaml
 rules:
   - RULE-SET,direct-domain,DIRECT          # 仅 DL
+  - RULE-SET,proxy-domain,main-out         # 仅 PL（先于 china-domain）
   - RULE-SET,china-domain,DIRECT           # 域名级 CN 放行（sniff/DNS 反查命中）
+  - RULE-SET,china-ip4,DIRECT,no-resolve   # 仅 china_ip4.txt 非空时
+  - RULE-SET,china-ip6,DIRECT,no-resolve   # 仅 ipv6_support=1 且 china_ip6.txt 非空时
   - NETWORK,udp,main-udp-out               # 仅 DU
   - MATCH,main-out
 ```
@@ -320,7 +327,7 @@ rules:
 **`custom`：**
 按 §4.9 翻译 `routing_rule` 段，末行 `MATCH,<default_outbound>`。
 
-注：`china-domain`/`gfw-domain` 域名规则能命中是因为 `enhanced-mode: redir-host` 使 snooping 反查表把 dst-IP 还原为域名；IP 字面量流量（无 DNS 反查）仍按 MATCH 兜底。
+注：`china-domain`/`gfw-domain` 域名规则能命中是因为 `enhanced-mode: redir-host` 使 snooping 反查表把 dst-IP 还原为域名；IP 字面量流量（无 DNS 反查）仍按 MATCH 兜底（bypass 模式 CN 目的 IP 先由 china-ip4/6 放行）。
 
 ### 4.9 `custom` 模式：`routing_rule` 段 → meow 规则字符串
 
@@ -690,3 +697,4 @@ features = {
 10. `legacy-tun-name` 文件格式：`"<name> <tun_mark>"` 双字段（单字段旧文件兼容，mark 兜底 102）。
 11. 上游 release 二进制不含 `listener-shadowsocks` feature（不在 `full` 内）——SS 服务端须用契约构建产物（`full listener-shadowsocks`），经 `file://`+本地编译部署。
 12. Q4 已确认：`meow --version` → `meow 0.24.0` 单行；Q8 已确认：dns.enable 无 listen 合法（-t rc=0）。
+13. meow-rs `behavior:domain` 文本集裸域名 = exact-only 匹配（上游 mihomo 为后缀匹配）——物化层改写 `+.domain` 恢复语义（§4.7）。
