@@ -980,12 +980,11 @@ local function plain_dns_url(v, proxy_tag)
 	local u = tostring(v)
 	local scheme, rest = u:match("^([a-z][a-z0-9+%.%-]*)://(.+)$")
 	if scheme == "tls" or scheme == "https" then
-		-- DoT/DoH pass through verbatim; a '#fragment' is the TLS SNI, not
-		-- a proxy tag (meow-rs only supports #PROXY on plain udp/tcp), so
-		-- a requested proxy_tag is unfulfillable and the entry goes direct.
+		-- Encrypted upstreams carry the proxy as ?proxy=NAME (meow >= 0.26.1,
+		-- issue #67); '#' stays reserved for the TLS SNI. Older kernels
+		-- reject the parameter outright — `meow -t` catches that.
 		if proxy_tag then
-			warn("dns server '%s': encrypted upstream cannot take #%s -- used direct.",
-				u, tostring(proxy_tag))
+			u = u .. (u:find("?", 1, true) and "&" or "?") .. "proxy=" .. proxy_tag
 		end
 		return u
 	elseif not scheme then
@@ -1318,12 +1317,8 @@ if routing_mode ~= "custom" then
 	if not main_detour then
 		warn("main_node resolved to '%s' (no emitted proxy) -- dns detour tag dropped.", tostring(main_target))
 	end
-	-- DoT/DoH upstreams cannot take a #detour tag and always dial direct,
-	-- so they are only suitable for resolvers reachable without the proxy.
-	local function detour_for(v)
-		local s = tostring(v or ""):match("^([a-z][a-z0-9+%.%-]*)://")
-		return (s == "tls" or s == "https") and nil or main_detour
-	end
+	-- Every upstream scheme can ride the proxy: plain forms take '#tag',
+	-- DoT/DoH take '?proxy=tag' (meow >= 0.26.1).
 	-- A proxied udp:// upstream is the weakest leg in the DNS path: the
 	-- relay's plain-UDP forwarding drops packets under transit load, and
 	-- each lost query surfaces client-side as a multi-second stall or
@@ -1341,12 +1336,12 @@ if routing_mode ~= "custom" then
 	-- domestic resolver as the primary nameserver and demote dns_server
 	-- (the foreign resolver) to a geoip-gated fallback riding the chain.
 	local rs = plain_dns_url(bypass and china_dns_server or dns_server,
-			bypass and nil or detour_for(dns_server))
+			(not bypass) and main_detour or nil)
 		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 	dns.nameserver = { rs }
 	with_tcp_twin(dns.nameserver, rs)
 	if bypass then
-		local fb = plain_dns_url(dns_server, detour_for(dns_server))
+		local fb = plain_dns_url(dns_server, main_detour)
 			or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 		if fb ~= rs then
 			dns.fallback = { fb }
