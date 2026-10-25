@@ -494,15 +494,15 @@ dnsmasq 继续承担：**按域名分流**与 **ipset 填充**（`ipset=/<domain
 }
 ```
 
-`use-hosts`/`fake-ip*`/`fallback-filter` 不发（dnsmasq 已处理本地名；fake-ip 会打乱 ipset 填充，禁用）。
+`use-hosts`/`fake-ip*` 不发（dnsmasq 已处理本地名；fake-ip 会打乱 ipset 填充，禁用）。`fallback-filter` 仅在 bypass 模式且有 fallback 时发射：`{geoip:false, ipcidr:[bogon 段]}`——geoip 门需要 mmdb（一次性 ~21MB geodata），已用域名策略 + 静态 bogon 表替代；geodata 三项全钉 `/dev/null` 使按需下载永不触发。
 
 ### 7.3 各 mode 的 nameserver 与 dnsmasq 生成项
 
-记 `CD=china_dns_server`（默认 `223.5.5.5`），`RS=dns_server`（默认 `8.8.8.8`）。`https://`/`tls://` 型 `dns_server` **降级**为 `udp://<host>#main-out` 并 warn（`#` 仅 plain 形式有效；`tls://x#p` 的 `#` 会被当 SNI）。
+记 `CD=china_dns_server`（默认 `223.5.5.5`），`RS=dns_server`（默认 `8.8.8.8`）。`https://`/`tls://` 型上游的代理经 `?proxy=<tag>` 参数携带（meow ≥ 0.26.1，`#` 在加密形式上是 SNI）；plain 形式用 `#<tag>`。经代理的上游自动配 `tcp://<host>#<tag>` 孪生（旧内核无 `?proxy=` 时 DoH 直连失败 → 孪生兜底；新内核上仅多一条竞速腿）。
 
 | mode | meow `nameserver` | meow `nameserver-policy` | dnsmasq conf 追加 |
 |---|---|---|---|
-| bypass_mainland_china | `["udp://<RS>#main-out"]` | `"rule-set:china-domain":"udp://<CD>"`; `"rule-set:direct-domain":"udp://<CD>"`(DL) | `server=127.0.0.1#5333`（全局转发）；`ipset=` china_ip4/6 已含 |
+| bypass_mainland_china | `["<CD>"]`（国内解析器直连） | `"rule-set:china-domain":"<CD>"`; `"rule-set:direct-domain":"<CD>"`(DL); `"rule-set:proxy-domain"`/`"rule-set:gfw-domain"`→`<RS>#main-out`（名单内被墙域直送链上解析，跳过注定被污染的国内查询）；`fallback:[<RS>#main-out 池]` + `fallback-filter` ipcidr bogon 门兜底未列名域的伪造答案 | `server=127.0.0.1#5333`（全局转发）；`ipset=` china_ip4/6 已含 |
 | proxy_mainland_china | `["udp://<RS>#main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | 仅 `server=/domain(china_list)/127.0.0.1#5333`；默认走 resolv.conf 直连 |
 | gfwlist | `["udp://<RS>#main-out"]` | 同左 | `server=/domain(gfw_list)/127.0.0.1#5333` + `ipset=/…/homeproxy_gfw4,homeproxy_gfw6` |
 | global | `["udp://<RS>#main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | `server=127.0.0.1#5333` |

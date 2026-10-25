@@ -982,9 +982,15 @@ local function plain_dns_url(v, proxy_tag)
 	if scheme == "tls" or scheme == "https" then
 		-- Encrypted upstreams carry the proxy as ?proxy=NAME (meow >= 0.26.1,
 		-- issue #67); '#' stays reserved for the TLS SNI. Older kernels
-		-- reject the parameter outright — `meow -t` catches that.
+		-- reject the parameter outright — `meow -t` catches that. The
+		-- parameter must precede the '#': appended after the fragment it
+		-- would corrupt the SNI instead.
 		if proxy_tag then
-			u = u .. (u:find("?", 1, true) and "&" or "?") .. "proxy=" .. proxy_tag
+			local base, frag = u:match("^(.-)#(.*)$")
+			base = base or u
+			u = base .. (base:find("?", 1, true) and "&" or "?")
+				.. "proxy=" .. proxy_tag
+			if frag then u = u .. "#" .. frag end
 		end
 		return u
 	elseif not scheme then
@@ -1336,6 +1342,18 @@ if routing_mode ~= "custom" then
 			pool[#pool + 1] = "tcp://" .. host .. "#" .. tag
 		end
 	end
+	-- A chained resolver pool: the entry URL plus a tcp:// twin on the same
+	-- host. Kernels predating ?proxy= (meow < 0.26.1) parse the marker into
+	-- the request path and dial direct -- which fails CN-side; the twin
+	-- keeps a working member in the pool there and merely races the DoH
+	-- leg on new kernels.
+	local function chain_pool(u)
+		local pool = { u }
+		with_tcp_twin(pool, u)
+		local h, t = u:match("^https?://([^/?#]+).-[?&]proxy=([^&#]+)")
+		if h and t then push(pool, "tcp://" .. h .. "#" .. t) end
+		return pool
+	end
 	local bypass = (routing_mode == "bypass_mainland_china")
 	-- bypass mode already routes CN rules at china_dns_server; use the same
 	-- domestic resolver as the primary nameserver and demote dns_server
@@ -1345,24 +1363,27 @@ if routing_mode ~= "custom" then
 		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 	dns.nameserver = { rs }
 	with_tcp_twin(dns.nameserver, rs)
-	local fb
+	local fb, fb_pool
 	if bypass then
 		fb = plain_dns_url(dns_server, main_detour)
 			or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
-		if fb ~= rs then
-			dns.fallback = { fb }
-			with_tcp_twin(dns.fallback, fb)
+		-- Same resolver on both sides means no distinct foreign vantage to
+		-- fall back to; compare the bare URLs -- an appended detour tag
+		-- alone would fake a difference.
+		if plain_dns_url(dns_server) == plain_dns_url(china_dns_server) then
+			fb = nil
+		else
+			fb_pool = chain_pool(fb)
+			dns.fallback = fb_pool
 			-- bogon gate (no GeoIP/mmdb): answers inside forged
 			-- null/reserved ranges are replaced by the chained fallback's
 			-- answer. Known-proxy domains never reach this gate -- the
 			-- nameserver-policy below sends them straight to fb.
 			dns["fallback-filter"] = {
 				geoip = false,
-				ipcidr = { "0.0.0.0/8", "127.0.0.0/8", "240.0.0.0/4",
-					"::/128", "2001::/32" },
+				ipcidr = { "0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
+					"224.0.0.0/3", "::/128", "::1/128", "2001::/32" },
 			}
-		else
-			fb = nil
 		end
 	end
 	local cd = plain_dns_url(china_dns_server, nil) or (wan_dns_url())
@@ -1374,10 +1395,10 @@ if routing_mode ~= "custom" then
 		-- so skip the wasted primary query instead of fixing it up
 		-- afterwards. Keys are emitted only for providers actually
 		-- declared above -- a dangling rule-set ref fails `meow -t`.
-		if fb then
+		if fb_pool then
 			for _, name in ipairs({ "proxy-domain", "gfw-domain" }) do
 				if rule_providers[name] then
-					policy["rule-set:" .. name] = fb
+					policy["rule-set:" .. name] = fb_pool
 				end
 			end
 		end
