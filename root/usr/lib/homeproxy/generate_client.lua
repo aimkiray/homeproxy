@@ -1235,6 +1235,11 @@ if routing_mode ~= "custom" then
 	end
 	if routing_mode == "bypass_mainland_china" then
 		rule_providers["china-domain"] = file_provider("providers/china_list.txt")
+		-- gfw-domain feeds nameserver-policy only (below): unlisted traffic
+		-- already reaches main-out via MATCH, so no rule references it.
+		if res_nonempty("gfw_list.txt") then
+			rule_providers["gfw-domain"] = file_provider("providers/gfw_list.txt")
+		end
 		-- proxy_list domains must precede china-domain: the CN DIRECT rule
 		-- would otherwise swallow them (direct-domain stays first anyway).
 		if PL then push(rules, "RULE-SET,proxy-domain," .. main_target) end
@@ -1334,27 +1339,48 @@ if routing_mode ~= "custom" then
 	local bypass = (routing_mode == "bypass_mainland_china")
 	-- bypass mode already routes CN rules at china_dns_server; use the same
 	-- domestic resolver as the primary nameserver and demote dns_server
-	-- (the foreign resolver) to a geoip-gated fallback riding the chain.
+	-- (the foreign resolver) to a gated fallback riding the chain.
 	local rs = plain_dns_url(bypass and china_dns_server or dns_server,
 			(not bypass) and main_detour or nil)
 		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 	dns.nameserver = { rs }
 	with_tcp_twin(dns.nameserver, rs)
+	local fb
 	if bypass then
-		local fb = plain_dns_url(dns_server, main_detour)
+		fb = plain_dns_url(dns_server, main_detour)
 			or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 		if fb ~= rs then
 			dns.fallback = { fb }
 			with_tcp_twin(dns.fallback, fb)
-			-- geoip gate: keep domestic answers; a non-CN answer (foreign
-			-- or forged) is replaced by the chained fallback's answer.
-			dns["fallback-filter"] = { geoip = true, ["geoip-code"] = "CN" }
+			-- bogon gate (no GeoIP/mmdb): answers inside forged
+			-- null/reserved ranges are replaced by the chained fallback's
+			-- answer. Known-proxy domains never reach this gate -- the
+			-- nameserver-policy below sends them straight to fb.
+			dns["fallback-filter"] = {
+				geoip = false,
+				ipcidr = { "0.0.0.0/8", "127.0.0.0/8", "240.0.0.0/4",
+					"::/128", "2001::/32" },
+			}
+		else
+			fb = nil
 		end
 	end
 	local cd = plain_dns_url(china_dns_server, nil) or (wan_dns_url())
 	local policy = {}
 	if routing_mode == "bypass_mainland_china" then
 		policy["rule-set:china-domain"] = cd
+		-- Known-bad domains (gfw list + user proxy list) go straight to the
+		-- chained resolver: the domestic answer would be poisoned anyway,
+		-- so skip the wasted primary query instead of fixing it up
+		-- afterwards. Keys are emitted only for providers actually
+		-- declared above -- a dangling rule-set ref fails `meow -t`.
+		if fb then
+			for _, name in ipairs({ "proxy-domain", "gfw-domain" }) do
+				if rule_providers[name] then
+					policy["rule-set:" .. name] = fb
+				end
+			end
+		end
 	end
 	if DL then
 		policy["rule-set:direct-domain"] = cd
@@ -1442,13 +1468,13 @@ else
 end
 config.dns = dns
 
--- Pin geodata DBs to persistent storage: RUN_DIR is volatile tmpfs, so
--- meow's unconditional startup fetch_missing would re-download ~21MB over
--- the proxied chain on every boot. Country.mmdb backs the DNS
--- fallback-filter geoip gate; ASN/geosite DBs have no consumer here
--- (GEOSITE rules are dropped), so /dev/null suppresses their fetch.
+-- Nothing in this config consumes geodata: rules use text rule-sets
+-- (china-ip4/6), the DNS fallback gate is a static ipcidr list, and
+-- GEOSITE rules are dropped upstream. Point every path at /dev/null so
+-- meow's on-demand fetch never downloads the ~21MB bundle over the
+-- proxied chain (or anywhere else).
 config.geodata = {
-	["mmdb-path"] = hp.HP_DIR .. "/resources/Country.mmdb",
+	["mmdb-path"] = "/dev/null",
 	["asn-path"] = "/dev/null",
 	["geosite-path"] = "/dev/null",
 }
