@@ -498,7 +498,7 @@ dnsmasq 继续承担：**按域名分流**与 **ipset 填充**（`ipset=/<domain
 
 ### 7.3 各 mode 的 nameserver 与 dnsmasq 生成项
 
-记 `CD=china_dns_server`（默认 `223.5.5.5`），`RS=dns_server`（默认 `8.8.8.8`）。`https://`/`tls://` 型上游的代理经 `?proxy=<tag>` 参数携带（meow ≥ 0.26.1，`#` 在加密形式上是 SNI）；plain 形式用 `#<tag>`。经代理的上游自动配 `tcp://<host>#<tag>` 孪生（旧内核无 `?proxy=` 时 DoH 直连失败 → 孪生兜底；新内核上仅多一条竞速腿）。
+记 `CD=china_dns_server`（默认 `223.5.5.5`），`RS=dns_server`（默认 `8.8.8.8`）。`https://`/`tls://` 型上游的代理经 `?proxy=<tag>` 参数携带（meow ≥ 0.26.1，`#` 在加密形式上是 SNI）；plain 形式用 `#<tag>`。经代理的池自动追加 `https://1.1.1.1/dns-query?proxy=<tag>` 作 Cloudflare DoH 备份（纯 DoH 冗余，不作 TCP 降级）。
 
 | mode | meow `nameserver` | meow `nameserver-policy` | dnsmasq conf 追加 |
 |---|---|---|---|

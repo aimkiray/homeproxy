@@ -1342,16 +1342,17 @@ if routing_mode ~= "custom" then
 			pool[#pool + 1] = "tcp://" .. host .. "#" .. tag
 		end
 	end
-	-- A chained resolver pool: the entry URL plus a tcp:// twin on the same
-	-- host. Kernels predating ?proxy= (meow < 0.26.1) parse the marker into
-	-- the request path and dial direct -- which fails CN-side; the twin
-	-- keeps a working member in the pool there and merely races the DoH
-	-- leg on new kernels.
-	local function chain_pool(u)
+	-- A chained resolver pool: the entry URL plus a Cloudflare-DoH backup
+	-- on the same detour. When the primary provider's endpoint is blocked
+	-- or flaky through the chain, the pool's first-answer-wins races the
+	-- backup leg -- pure-DoH redundancy, no plain-DNS fallback.
+	local CF_DOH = "https://1.1.1.1/dns-query"
+	local function chain_pool(u, proxy_tag)
 		local pool = { u }
-		with_tcp_twin(pool, u)
-		local h, t = u:match("^https?://([^/?#]+).-[?&]proxy=([^&#]+)")
-		if h and t then push(pool, "tcp://" .. h .. "#" .. t) end
+		if proxy_tag and not u:match("^https?://1%.[01]%.[01]%.[01]/")
+			and not u:match("^https?://cloudflare%-dns%.com/") then
+			push(pool, CF_DOH .. "?proxy=" .. proxy_tag)
+		end
 		return pool
 	end
 	local bypass = (routing_mode == "bypass_mainland_china")
@@ -1373,7 +1374,7 @@ if routing_mode ~= "custom" then
 		if plain_dns_url(dns_server) == plain_dns_url(china_dns_server) then
 			fb = nil
 		else
-			fb_pool = chain_pool(fb)
+			fb_pool = chain_pool(fb, main_detour)
 			dns.fallback = fb_pool
 			-- bogon gate (no GeoIP/mmdb): answers inside forged
 			-- null/reserved ranges are replaced by the chained fallback's
