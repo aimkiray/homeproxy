@@ -980,14 +980,14 @@ local function plain_dns_url(v, proxy_tag)
 	local u = tostring(v)
 	local scheme, rest = u:match("^([a-z][a-z0-9+%.%-]*)://(.+)$")
 	if scheme == "tls" or scheme == "https" then
-		rest = rest:gsub("#.*$", ""):gsub("/.*$", "")
+		-- DoT/DoH pass through verbatim; a '#fragment' is the TLS SNI, not
+		-- a proxy tag (meow-rs only supports #PROXY on plain udp/tcp), so
+		-- a requested proxy_tag is unfulfillable and the entry goes direct.
 		if proxy_tag then
-			warn("dns server '%s': encrypted upstream cannot take #%s -- degraded to udp://%s.",
-				u, tostring(proxy_tag), rest)
-		else
-			warn("dns server '%s': encrypted upstream is unsupported -- degraded to udp://%s.", u, rest)
+			warn("dns server '%s': encrypted upstream cannot take #%s -- used direct.",
+				u, tostring(proxy_tag))
 		end
-		u = "udp://" .. rest
+		return u
 	elseif not scheme then
 		-- bracket bare IPv6 literals so the URL parser sees host[:port]
 		u = bracket_v6(u)
@@ -1318,9 +1318,44 @@ if routing_mode ~= "custom" then
 	if not main_detour then
 		warn("main_node resolved to '%s' (no emitted proxy) -- dns detour tag dropped.", tostring(main_target))
 	end
-	local rs = plain_dns_url(dns_server, main_detour)
+	-- DoT/DoH upstreams cannot take a #detour tag and always dial direct,
+	-- so they are only suitable for resolvers reachable without the proxy.
+	local function detour_for(v)
+		local s = tostring(v or ""):match("^([a-z][a-z0-9+%.%-]*)://")
+		return (s == "tls" or s == "https") and nil or main_detour
+	end
+	-- A proxied udp:// upstream is the weakest leg in the DNS path: the
+	-- relay's plain-UDP forwarding drops packets under transit load, and
+	-- each lost query surfaces client-side as a multi-second stall or
+	-- NXDOMAIN (ERR_NAME_NOT_RESOLVED). Race a tcp:// twin on the same
+	-- upstream -- TCP rides the strong splice path, so pool-first-answer
+	-- keeps UDP speed when healthy and bounds the worst case otherwise.
+	local function with_tcp_twin(pool, u)
+		local host, tag = u:match("^udp://([^#]+)#(.+)$")
+		if host and tag then
+			pool[#pool + 1] = "tcp://" .. host .. "#" .. tag
+		end
+	end
+	local bypass = (routing_mode == "bypass_mainland_china")
+	-- bypass mode already routes CN rules at china_dns_server; use the same
+	-- domestic resolver as the primary nameserver and demote dns_server
+	-- (the foreign resolver) to a geoip-gated fallback riding the chain.
+	local rs = plain_dns_url(bypass and china_dns_server or dns_server,
+			bypass and nil or detour_for(dns_server))
 		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 	dns.nameserver = { rs }
+	with_tcp_twin(dns.nameserver, rs)
+	if bypass then
+		local fb = plain_dns_url(dns_server, detour_for(dns_server))
+			or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
+		if fb ~= rs then
+			dns.fallback = { fb }
+			with_tcp_twin(dns.fallback, fb)
+			-- geoip gate: keep domestic answers; a non-CN answer (foreign
+			-- or forged) is replaced by the chained fallback's answer.
+			dns["fallback-filter"] = { geoip = true, ["geoip-code"] = "CN" }
+		end
+	end
 	local cd = plain_dns_url(china_dns_server, nil) or (wan_dns_url())
 	local policy = {}
 	if routing_mode == "bypass_mainland_china" then
@@ -1411,6 +1446,17 @@ else
 	if next(policy) then dns["nameserver-policy"] = policy end
 end
 config.dns = dns
+
+-- Pin geodata DBs to persistent storage: RUN_DIR is volatile tmpfs, so
+-- meow's unconditional startup fetch_missing would re-download ~21MB over
+-- the proxied chain on every boot. Country.mmdb backs the DNS
+-- fallback-filter geoip gate; ASN/geosite DBs have no consumer here
+-- (GEOSITE rules are dropped), so /dev/null suppresses their fetch.
+config.geodata = {
+	["mmdb-path"] = hp.HP_DIR .. "/resources/Country.mmdb",
+	["asn-path"] = "/dev/null",
+	["geosite-path"] = "/dev/null",
+}
 
 -- ruleset providers may have been emitted during dns_rule processing.
 if next(rule_providers) then
