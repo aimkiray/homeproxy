@@ -40,7 +40,7 @@
 - `tproxy` + `udp:true`（**要求** `firewall:false`）：同一 TCP 监听 socket 上同时启用 IPv4 UDP TPROXY（`IP_TRANSPARENT` + `IP_RECVORIGDSTADDR`）。**UDP TPROXY 仅 IPv4**：`listen` 必须是 IPv4 字面地址（`::`/双栈被拒绝），fwmark 策略路由由部署方自备。
 - TCP 透明代理由外部 REDIRECT 送入，meow 经 `SO_ORIGINAL_DST` 恢复原目的（先 IPv4 后 IPv6 getsockopt）。`tproxy-port` 顶层简写绑死 `127.0.0.1` 且 firewall=managed —— **不可用**，必须用 `listeners:` 命名项 + `listen: "0.0.0.0"`。
 - `routing-mark: N` **只**给 `DIRECT` outbound socket 打 `SO_MARK`；proxy adapter 出站不打标（verified）。
-- `dns:`：`enable/listen/enhanced-mode/nameserver/nameserver-policy/default-nameserver/proxy-server-nameserver/fallback-filter/fake-ip*`。nameserver 条目支持裸 IP/hostname、`udp://`、`tcp://`、`tls://`、`https://`、`rcode://`；`#PROXY` 后缀**仅**对 plain 形式（裸/`udp://`/`tcp://`）表示"经名为 PROXY 的出站转发"；`tls://`/`https://` 中的 `#` 被解析为 SNI。
+- `dns:`：`enable/listen/enhanced-mode/nameserver/nameserver-policy/default-nameserver/proxy-server-nameserver/fallback-filter/fake-ip*`。nameserver 条目支持裸 IP/hostname、`udp://`、`tcp://`、`tls://`、`https://`、`rcode://`；`#PROXY` 后缀**仅**对 plain 形式（裸/`udp://`/`tcp://`）表示"经名为 PROXY 的出站转发"；`tls://`/`https://` 中的 `#` 被解析为 SNI，加密形式的代理标签改用 `?proxy=NAME` 参数段——须位于条目**绝对末尾**、在 `#sni` 之后（规范形 `https://h/p#sni?proxy=NAME`）；plain 形式上任何 `?` 均为硬错误。
 - `nameserver-policy` key 支持域名、`geosite:`、`rule-set:`（引用 `rule-providers` 条目）。
 - `rule-providers` `type: file` 的 `path` 相对配置 home 目录解析（未传 `-d` 时取配置文件父目录），有 safe-path 包含性检查；`SKIP_SAFE_PATH_CHECK=1` 可关（本规范不依赖）。
 - 代理类型（`full`）：`ss/trojan/vless/vmess/snell/http/socks5/anytls/hysteria2/direct`。`smux:`（别名 `mux:`，二者同存时 `smux` 赢）块字段：`enabled/protocol(smux|yamux|h2mux|muxcool)/max-connections/max-streams/min-streams/padding/only-tcp`；标量值报错；`padding+muxcool` 报错；`statistic`/`brutal-opts` warn-and-ignore。
@@ -61,7 +61,7 @@
 | D5 | `config.proxy_mode` | 新词表 `{redirect, tproxy, redirect_tproxy}`；含义=TCP 接管臂 × UDP 接管臂正交组合；**TUN 全部移除** | §3.4 |
 | D6 | IPv6 | `ipv6_support=1` → 第二个 TCP-only listener `[::]:5334` + ip6tables REDIRECT 镜像；**IPv6 UDP 一律不接管**（v0.24.0 UDP TPROXY 仅 v4） | §6.5 |
 | D7 | 路由器自身流量 | **取消 OUTPUT 链 self-steering**；需要走代理的自身流量显式用 mixed 口 `127.0.0.1:5330`（`curl -x`/`http_proxy`） | meow 无法给 proxy-adapter 出站打标，OUTPUT 接管会产生不可判定的回环风险；§6.4 |
-| D8 | DNS | 保留 dnsmasq 前置（域名分流 + ipset 填充）；meow `dns:` 提供解析，`enhanced-mode: redir-host`；走代理的上游只用 `udp://`/`tcp://`+`#main-out` | §7 |
+| D8 | DNS | 保留 dnsmasq 前置（域名分流 + ipset 填充）；meow `dns:` 提供解析，`enhanced-mode: redir-host`；走代理的上游：plain 形式用 `#main-out` 后缀，`tls://`/`https://` 用绝对末尾的 `?proxy=main-out`（`#sni` 在前，meow ≥ 0.26.1） | §7 |
 | D9 | `routing-mark` | 仍发 `routing-mark: <self_mark>`（只管 DIRECT socket，advisory）；`self_mark` RETURN 规则保留于链首 | §6.2 |
 | D10 | 节点 tag | `cfg-<md5>-out`（materialize）、`main-out`、`main-udp-out`、组同名 | 与现 CLI/API 兼容 |
 | D11 | 不支持节点 | 生成期 quarantine：跳过 + stderr warn + `/var/run/homeproxy/unsupported-nodes.json` | §4.6 |
@@ -475,7 +475,7 @@ LAN client → dnsmasq :53
    ├─ 本地域名/静态 lease → 本地应答
    ├─ 分流命中（server=/domain/…） → meow DNS 127.0.0.1:5333  或  直连上游
    └─ 默认 → meow DNS 127.0.0.1:5333（bypass/global/custom）或 china 上游（gfw/proxy_mainland 未命中项）
-meow DNS → 按 nameserver-policy 选 udp://china_dns（直连）或 udp://dns_server#main-out（经代理）
+meow DNS → 按 nameserver-policy 选 china_dns（直连）或 dns_server+detour（经代理：plain 形式 `#main-out`，`tls://`/`https://` 形式末尾 `?proxy=main-out`）
 ```
 
 dnsmasq 继续承担：**按域名分流**与 **ipset 填充**（`ipset=/<domain>/<set4>,<set6>`），这是 meow 替代不了的（meow 不操作 ipset）。
@@ -498,14 +498,14 @@ dnsmasq 继续承担：**按域名分流**与 **ipset 填充**（`ipset=/<domain
 
 ### 7.3 各 mode 的 nameserver 与 dnsmasq 生成项
 
-记 `CD=china_dns_server`（默认 `223.5.5.5`），`RS=dns_server`（默认 `8.8.8.8`）。`https://`/`tls://` 型上游的代理经 `?proxy=<tag>` 参数携带（meow ≥ 0.26.1，`#` 在加密形式上是 SNI）；plain 形式用 `#<tag>`。经代理的池自动追加 `https://1.1.1.1/dns-query?proxy=<tag>` 作 Cloudflare DoH 备份（纯 DoH 冗余，不作 TCP 降级）。
+记 `CD=china_dns_server`（默认 `https://223.5.5.5/dns-query#dns.alidns.com`），`RS=dns_server`（默认 `https://8.8.8.8/dns-query`）。`https://`/`tls://` 型上游的代理经 `?proxy=<tag>` 参数携带（meow ≥ 0.26.1，`#` 在加密形式上是 SNI）——`?proxy=` 恒在条目**绝对末尾**、位于 `#sni` 之后（规范形 `https://h/p#sni?proxy=<tag>`）；`<RS>` 已含 `?` query 时 `?proxy=` 无法表达，生成器 warn 并按直连（无 tag）发射。plain 形式用 `#<tag>`，且不接受任何 `?`（内核硬错误，生成器剥除并 warn）。下表 `<X>+tag` 表示按此规则对 X 附加 detour 标记。经代理的池自动追加 `https://1.1.1.1/dns-query?proxy=<tag>` 作 Cloudflare DoH 备份（纯 DoH 冗余，不作 TCP 降级；`<RS>` 的 host 命中 Cloudflare 集合 {1.1.1.1, 1.0.0.1, cloudflare-dns.com, one.one.one.one} 时跳过备份腿去重）。
 
 | mode | meow `nameserver` | meow `nameserver-policy` | dnsmasq conf 追加 |
 |---|---|---|---|
-| bypass_mainland_china | `["<CD>"]`（国内解析器直连） | `"rule-set:china-domain":"<CD>"`; `"rule-set:direct-domain":"<CD>"`(DL); `"rule-set:proxy-domain"`/`"rule-set:gfw-domain"`→`<RS>#main-out`（名单内被墙域直送链上解析，跳过注定被污染的国内查询）；`fallback:[<RS>#main-out 池]` + `fallback-filter` ipcidr bogon 门兜底未列名域的伪造答案 | `server=127.0.0.1#5333`（全局转发）；`ipset=` china_ip4/6 已含 |
-| proxy_mainland_china | `["udp://<RS>#main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | 仅 `server=/domain(china_list)/127.0.0.1#5333`；默认走 resolv.conf 直连 |
-| gfwlist | `["udp://<RS>#main-out"]` | 同左 | `server=/domain(gfw_list)/127.0.0.1#5333` + `ipset=/…/homeproxy_gfw4,homeproxy_gfw6` |
-| global | `["udp://<RS>#main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | `server=127.0.0.1#5333` |
+| bypass_mainland_china | `["<CD>"]`（国内解析器直连） | `"rule-set:china-domain":"<CD>"`; `"rule-set:direct-domain":"<CD>"`(DL); `"rule-set:proxy-domain"`/`"rule-set:gfw-domain"`→`<RS>+main-out`（名单内被墙域直送链上解析，跳过注定被污染的国内查询）；`fallback:[<RS>+main-out 池]` + `fallback-filter` ipcidr bogon 门兜底未列名域的伪造答案 | `server=127.0.0.1#5333`（全局转发）；`ipset=` china_ip4/6 已含 |
+| proxy_mainland_china | `["<RS>+main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | 仅 `server=/domain(china_list)/127.0.0.1#5333`；默认走 resolv.conf 直连 |
+| gfwlist | `["<RS>+main-out"]` | 同左 | `server=/domain(gfw_list)/127.0.0.1#5333` + `ipset=/…/homeproxy_gfw4,homeproxy_gfw6` |
+| global | `["<RS>+main-out"]` | `"rule-set:direct-domain":"udp://<CD>"`(DL) | `server=127.0.0.1#5333` |
 | custom | `dns_rule`/`dns_server` 段翻译（§7.4） | 同左 | 按 UCI `dns_rule` 生成 |
 
 `china_dns_server` 出现在 `proxy-server-nameserver`/`default-nameserver` 时用 `wan_dns`（系统上游，恒直连），不用 CD（CD 本身可能也是需要解析的域名时由 default-nameserver 兜底，防环同 meow 语义）。

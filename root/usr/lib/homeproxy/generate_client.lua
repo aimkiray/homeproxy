@@ -973,27 +973,59 @@ local function dns_pool_url(name, owner)
 	return url
 end
 
--- Non-custom mode upstreams: tls://https:// degrade to plain udp:// (the '#'
--- suffix is a proxy tag only on plain forms; on encrypted ones it is SNI).
+-- Reserved keywords that are not URLs (sing-box vocabulary): mapped to wan
+-- DNS like dns_server_url / dns_pool_url do, so a bare 'system' does not
+-- become udp://system -- a fake hostname that only fails at resolve time
+-- while `meow -t` stays green.
+local NONURL_DNS_KEYWORDS = {
+	wan = true, ["local"] = true, system = true, dhcp = true,
+	["system-dns"] = true, ["default-dns"] = true,
+}
+
+-- Non-custom mode upstreams: plain forms (bare/udp://tcp://) carry the
+-- detour as '#tag' (the '#' fragment IS the plain-form proxy marker);
+-- tls://https:// keep their scheme and take '?proxy=tag' at the absolute
+-- tail, after any '#sni'.
 local function plain_dns_url(v, proxy_tag)
 	if isEmpty(v) then return nil end
 	local u = tostring(v)
-	local scheme, rest = u:match("^([a-z][a-z0-9+%.%-]*)://(.+)$")
+	if NONURL_DNS_KEYWORDS[u:lower()] then
+		warn("dns server '%s' is a reserved keyword, not a URL -- using wan DNS.", u)
+		u = wan_dns_url()
+		if proxy_tag then u = u .. "#" .. proxy_tag end
+		return u
+	end
+	local scheme = u:match("^([a-z][a-z0-9+%.%-]*)://(.+)$")
 	if scheme == "tls" or scheme == "https" then
 		-- Encrypted upstreams carry the proxy as ?proxy=NAME (meow >= 0.26.1,
-		-- issue #67); '#' stays reserved for the TLS SNI. Older kernels
-		-- reject the parameter outright — `meow -t` catches that. The
-		-- parameter must precede the '#': appended after the fragment it
-		-- would corrupt the SNI instead.
+		-- issue #67); '#' stays reserved for the TLS SNI. The kernel cuts
+		-- the parameter section at the LAST '?' (upstream.rs rfind), so
+		-- ?proxy= must be the absolute tail -- canonical '#sni?proxy=NAME';
+		-- a '#' inside the tail lands in the proxy value -> InvalidParams.
+		-- Older kernels reject the parameter outright -- `meow -t` catches
+		-- that.
 		if proxy_tag then
-			local base, frag = u:match("^(.-)#(.*)$")
-			base = base or u
-			u = base .. (base:find("?", 1, true) and "&" or "?")
-				.. "proxy=" .. proxy_tag
-			if frag then u = u .. "#" .. frag end
+			if u:find("?", 1, true) then
+				-- A real query already occupies the '?' section: neither a
+				-- second '?' nor '&proxy=' is expressible to the kernel --
+				-- keep the URL direct (untagged) instead of emitting a
+				-- hard InvalidParams.
+				warn("dns server '%s': pre-existing '?query' leaves no room for '?proxy=' -- used without detour.", u)
+			else
+				u = u .. "?proxy=" .. proxy_tag
+			end
 		end
 		return u
-	elseif not scheme then
+	end
+	-- Plain forms take no query at all: any '?' is a hard InvalidParams on
+	-- the kernel (upstream.rs), so strip '?...' tails before they can hide
+	-- inside v6 brackets or the hostname. A '#frag' survives the strip --
+	-- it is the legal detour marker on these forms.
+	if u:find("?", 1, true) then
+		warn("dns server '%s': '?...' is invalid on a plain DNS URL -- stripped.", u)
+		u = u:gsub("%?[^#]*", "")
+	end
+	if not scheme then
 		-- bracket bare IPv6 literals so the URL parser sees host[:port]
 		u = bracket_v6(u)
 		u = "udp://" .. u
@@ -1347,10 +1379,17 @@ if routing_mode ~= "custom" then
 	-- or flaky through the chain, the pool's first-answer-wins races the
 	-- backup leg -- pure-DoH redundancy, no plain-DNS fallback.
 	local CF_DOH = "https://1.1.1.1/dns-query"
+	-- Dedup on the URL host, not a string prefix: 'https://1.1.1.1' (no
+	-- path), 'https://1.1.1.1:443/dns-query' and the two Cloudflare aliases
+	-- are all the same resolver leg as the backup.
+	local CF_HOSTS = {
+		["1.1.1.1"] = true, ["1.0.0.1"] = true,
+		["cloudflare-dns.com"] = true, ["one.one.one.one"] = true,
+	}
 	local function chain_pool(u, proxy_tag)
 		local pool = { u }
-		if proxy_tag and not u:match("^https?://1%.[01]%.[01]%.[01]/")
-			and not u:match("^https?://cloudflare%-dns%.com/") then
+		local host = (u:match("^https?://([^/%?#:]+)") or ""):lower()
+		if proxy_tag and not CF_HOSTS[host] then
 			push(pool, CF_DOH .. "?proxy=" .. proxy_tag)
 		end
 		return pool
@@ -1364,26 +1403,26 @@ if routing_mode ~= "custom" then
 		or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 	dns.nameserver = { rs }
 	with_tcp_twin(dns.nameserver, rs)
-	local fb, fb_pool
+	local fb_pool
 	if bypass then
-		fb = plain_dns_url(dns_server, main_detour)
-			or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or ""))
 		-- Same resolver on both sides means no distinct foreign vantage to
 		-- fall back to; compare the bare URLs -- an appended detour tag
 		-- alone would fake a difference.
-		if plain_dns_url(dns_server) == plain_dns_url(china_dns_server) then
-			fb = nil
-		else
-			fb_pool = chain_pool(fb, main_detour)
+		if plain_dns_url(dns_server) ~= plain_dns_url(china_dns_server) then
+			fb_pool = chain_pool(
+				plain_dns_url(dns_server, main_detour)
+					or (wan_dns_url() .. (main_detour and ("#" .. main_detour) or "")),
+				main_detour)
 			dns.fallback = fb_pool
 			-- bogon gate (no GeoIP/mmdb): answers inside forged
 			-- null/reserved ranges are replaced by the chained fallback's
 			-- answer. Known-proxy domains never reach this gate -- the
-			-- nameserver-policy below sends them straight to fb.
+			-- nameserver-policy below sends them straight to fb_pool.
 			dns["fallback-filter"] = {
 				geoip = false,
 				ipcidr = { "0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16",
-					"224.0.0.0/3", "::/128", "::1/128", "2001::/32" },
+					"224.0.0.0/3", "::/128", "::1/128", "fc00::/7",
+					"fe80::/10", "ff00::/8", "2001::/32", "2001:db8::/32" },
 			}
 		end
 	end
