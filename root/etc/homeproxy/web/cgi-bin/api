@@ -91,6 +91,21 @@ read_body() {
 	[ "$n" -gt 0 ] 2>/dev/null && head -c "$n" 2>/dev/null || true
 }
 
+# Real section names of type=node, in config order. 'uci show' prints
+# @type[idx] selector syntax for anonymous sections on this uci build, but
+# meow tags are cfg-<internal name>-out — only the Lua binding exposes the
+# internal name (e.g. cfg1246ab) the generator uses.
+node_sections() {
+	HP_LUAPATH="$HP_LIB_DIR" lua -e '
+		package.path = (os.getenv("HP_LUAPATH") or "/usr/lib/homeproxy") .. "/?.lua;" .. package.path
+		local uci = require("uci").cursor()
+		uci:load("homeproxy")
+		uci:foreach("homeproxy", "node", function(s)
+			if s[".name"] then io.write(s[".name"], "\n") end
+		end)
+	' 2>/dev/null
+}
+
 # Range-checked octets: the old regex accepted 999.999.999.999, which UCI
 # then stored and the Lua generator later rejected -- a config saved OK but
 # failing generation on the next restart.
@@ -559,7 +574,7 @@ ping_nodes|ping_all)
 	curl -sf --max-time 2 "$API/version" >/dev/null 2>&1 || json_err "clash api not reachable (run: homeproxy generate && homeproxy restart)"
 	tmp=$(mktemp -d 2>/dev/null) || tmp=/tmp/hp_ping.$$ ; mkdir -p "$tmp" 2>/dev/null
 	tags="main-out main-udp-out"
-	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
+	for sect in $(node_sections); do
 		tags="$tags cfg-$sect-out"
 	done
 	for tag in $tags; do
@@ -569,7 +584,7 @@ ping_nodes|ping_all)
 	first=1
 	hdr 'Content-Type: application/json'
 	printf '{"ok":true,"results":{'
-	for sect in $(uci -q show $CONF 2>/dev/null | sed -n 's/^homeproxy\.\([^.]*\)=node$/\1/p'); do
+	for sect in $(node_sections); do
 		[ "$first" -eq 0 ] && printf ','
 		first=0
 		ms=null
