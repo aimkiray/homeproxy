@@ -11,6 +11,25 @@ local hp   = require("homeproxy")
 local sp   = require("subscription_parser")
 local uci  = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 
+-- Same dual-source JSON resolution as homeproxy.lua: whichever module it
+-- bound is already in package.loaded, so this reuses that instance. Needed
+-- for scalar/array encoding at the nameserver-policy emission point (tail).
+local json
+do
+	local ok, mod = pcall(require, "luci.json")
+	if ok and type(mod) == "table" then
+		json = mod
+	else
+		local ok2, jc = pcall(require, "luci.jsonc")
+		if ok2 and type(jc) == "table" then
+			json = { encode = function(t) return jc.stringify(t) end }
+		end
+	end
+end
+if not json then
+	error("no JSON module available (need luci.json or luci.jsonc)")
+end
+
 local UCICONFIG = "homeproxy"
 uci:load(UCICONFIG)
 
@@ -1351,6 +1370,22 @@ local dns = {
 	["proxy-server-nameserver"] = { wan_dns_url() },
 }
 
+-- nameserver-policy key order is semantic (first matching arm wins on
+-- overlapping names), but `policy` is a hash map whose luci.json emission
+-- follows pairs() order. Record the intent order alongside the map and
+-- swap an ordered object literal in for a placeholder string after
+-- encoding (see the file tail). Shared by both routing modes.
+local NSPOLICY_PLACEHOLDER = "__NSPOLICY_PLACEHOLDER__"
+local policy, policy_order = {}, {}
+local function set_policy(k, v)
+	-- First sight wins for BOTH position and value: later duplicates are
+	-- ignored entirely, matching the kernel's first-match-wins arm order.
+	if policy[k] == nil then
+		policy_order[#policy_order + 1] = k
+		policy[k] = v
+	end
+end
+
 if routing_mode ~= "custom" then
 	-- The #detour must name an EMITTED proxy/group: a block main_node makes
 	-- emit_as return the REJECT builtin (nothing materialized as "main-out"),
@@ -1427,9 +1462,14 @@ if routing_mode ~= "custom" then
 		end
 	end
 	local cd = plain_dns_url(china_dns_server, nil) or (wan_dns_url())
-	local policy = {}
+	-- Intent order: direct-domain -> proxy-domain -> gfw-domain ->
+	-- china-domain. A china-domain arm ahead of gfw-domain would hand
+	-- CN∩GFW overlap names to the domestic resolver where GFW injection
+	-- still lands; gfw-domain first sends them to the chained DoH leg.
+	if DL then
+		set_policy("rule-set:direct-domain", cd)
+	end
 	if routing_mode == "bypass_mainland_china" then
-		policy["rule-set:china-domain"] = cd
 		-- Known-bad domains (gfw list + user proxy list) go straight to the
 		-- chained resolver: the domestic answer would be poisoned anyway,
 		-- so skip the wasted primary query instead of fixing it up
@@ -1438,15 +1478,13 @@ if routing_mode ~= "custom" then
 		if fb_pool then
 			for _, name in ipairs({ "proxy-domain", "gfw-domain" }) do
 				if rule_providers[name] then
-					policy["rule-set:" .. name] = fb_pool
+					set_policy("rule-set:" .. name, fb_pool)
 				end
 			end
 		end
+		set_policy("rule-set:china-domain", cd)
 	end
-	if DL then
-		policy["rule-set:direct-domain"] = cd
-	end
-	if next(policy) then dns["nameserver-policy"] = policy end
+	if next(policy) then dns["nameserver-policy"] = NSPOLICY_PLACEHOLDER end
 else
 	-- custom mode (§7.4): dns_server sections form the nameserver pool;
 	-- dns_rule sections become nameserver-policy entries.
@@ -1469,7 +1507,6 @@ else
 	if not seen[default_dns_url] then push(pool, default_dns_url) end
 	dns.nameserver = pool
 
-	local policy = {}
 	uci:foreach(UCICONFIG, UCIDNSRULE, function(cfg)
 		if cfg.enabled ~= "1" then return end
 		local owner = "dns_rule " .. tostring(cfg[".name"])
@@ -1523,9 +1560,9 @@ else
 				end
 			end
 		end
-		for _, k in ipairs(keys) do policy[k] = url end
+		for _, k in ipairs(keys) do set_policy(k, url) end
 	end)
-	if next(policy) then dns["nameserver-policy"] = policy end
+	if next(policy) then dns["nameserver-policy"] = NSPOLICY_PLACEHOLDER end
 end
 config.dns = dns
 
@@ -1595,4 +1632,27 @@ end
 
 hp.mkdir_p(hp.RUN_DIR)
 flush_unsupported()
-atomic_write(MEOW_FILE, hp.encode_json(config))
+
+-- `dns["nameserver-policy"]` was emitted as a placeholder string: rebuild
+-- the object in recorded intent order and swap it into the encoded blob
+-- (luci.json has no ordered-map capability). The placeholder survives
+-- clean() untouched and appears exactly once as a quoted literal.
+local blob = hp.encode_json(config)
+if next(policy) then
+	local parts = {}
+	for _, k in ipairs(policy_order) do
+		parts[#parts + 1] = json.encode(k) .. ":" .. json.encode(policy[k])
+	end
+	local ordered = "{" .. table.concat(parts, ",") .. "}"
+	local n
+	-- Function form: a plain replacement string would reinterpret '%' in
+	-- values (e.g. percent-encoded URLs) as gsub captures. Zero value
+	-- assumptions is the point of the placeholder scheme.
+	blob, n = blob:gsub('"' .. NSPOLICY_PLACEHOLDER .. '"', function()
+		return ordered
+	end, 1)
+	if n == 0 then
+		warn("nameserver-policy placeholder not found in emitted config")
+	end
+end
+atomic_write(MEOW_FILE, blob)
