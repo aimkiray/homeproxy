@@ -10,6 +10,12 @@ local hp  = require("homeproxy")
 local uci = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config")
 
 local CFG = "homeproxy"
+
+-- Whole-body pcall: a mid-run error (or a commit failure below) must not
+-- leak staged deltas — /tmp/.uci persists across processes and the NEXT
+-- writer's `uci commit` would otherwise flush a half-applied migration.
+local ok_run, run_err = pcall(function()
+
 uci:load(CFG)
 
 local function isEmpty(v) return hp.isEmpty(v) end
@@ -287,7 +293,14 @@ end
 
 if changed() then
     if not uci:commit(CFG) then
-        io.stderr:write("homeproxy: migration commit failed\n")
-        os.exit(1)
+        error("migration commit failed")
     end
+end
+
+end) -- pcall(migrate body)
+
+if not ok_run then
+    pcall(function() uci:revert(CFG) end)
+    io.stderr:write("homeproxy: migration failed: " .. tostring(run_err) .. "\n")
+    os.exit(1)
 end

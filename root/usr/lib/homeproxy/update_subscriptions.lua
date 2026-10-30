@@ -28,37 +28,72 @@ local function log(msg) hp.log(msg, "SUBSCRIBE") end
 -- Concurrency lock: prevent cron + manual update from clobbering each other.
 -- mkdir() is the only atomic check-and-create primitive available here --
 -- the old timestamp file could be written simultaneously by two updaters
--- (check passes for both, both write, both proceed).  Stale detection uses
--- the directory's mtime: locks older than MAX_LOCK_AGE are presumed dead
--- (SIGKILL, power loss) and reclaimed.  RUN_DIR is tmpfs so a stale lock
--- can never survive a reboot.
--- Shared with add_nodes.lua: serializes all writers to the homeproxy UCI
--- package, not just subscription updates.
+-- (check passes for both, both write, both proceed).  Stale detection is
+-- pid-liveness FIRST: this run legitimately holds the lock past 120s
+-- (multi-URL fetches), so mtime alone must never kill a live holder. A dead
+-- pid -> reclaim at once; a pid-less lock (older build, or the window
+-- before the holder writes its pid) falls back to the >120s mtime
+-- heuristic. RUN_DIR is tmpfs so a stale lock never survives a reboot.
+-- Shared with cgi-bin/api, init.d, the homeproxy CLI, update_crond.sh and
+-- add_nodes.lua: serializes all writers to the homeproxy UCI package.
 local lock_dir = hp.RUN_DIR .. "/uci-write.lock.d"
-local MAX_LOCK_AGE = 120  -- seconds
+local MAX_LOCK_AGE = 120  -- seconds, pid-less fallback only
+local lock_held = false
 hp.mkdir_p(hp.RUN_DIR)
-local function acquire_lock()
-	if os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0 then
-		return true
+local function self_pid()
+	local f = io.open("/proc/self/status")
+	if not f then return nil end
+	local s = f:read("*a"); f:close()
+	return s and s:match("Pid:%s*(%d+)")
+end
+local function lock_is_live()
+	local pf = io.open(lock_dir .. "/pid")
+	local pid = pf and tonumber((pf:read("*a") or ""):match("%d+"))
+	if pf then pf:close() end
+	if pid then
+		if os.execute("kill -0 " .. pid .. " 2>/dev/null") == 0 then
+			return true
+		end
+		-- Holder is provably dead: reclaim regardless of lock age.
+		os.execute("rm -f " .. hp.shellQuote(lock_dir .. "/pid"))
+		os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+		return false
 	end
+	-- No pid to check: fall back to the mtime heuristic.
 	local h = io.popen("stat -c %Y " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
 	local mt = h and tonumber(hp.trim(h:read("*a") or "")) or nil
 	if h then h:close() end
-	if mt == nil then
-		-- Cannot age it; assume a live updater owns it.
-		return false
-	end
+	if mt == nil then return true end  -- cannot age it; assume live
 	local age = os.time() - mt
-	if age >= 0 and age < MAX_LOCK_AGE then
-		log("Another subscription update is running (started " .. age .. "s ago), aborting.")
-		return false
+	if age < MAX_LOCK_AGE then
+		-- A negative age (backward clock step) is treated as live too:
+		-- never reclaim a lock we cannot prove dead.
+		return true
 	end
-	-- Stale (or timestamp in the future after a clock step): reclaim once.
 	os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
-	return os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0
+	return false
+end
+local function acquire_lock()
+	for _ = 1, 15 do
+		if os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0 then
+			local pid = self_pid()
+			if pid then
+				local f = io.open(lock_dir .. "/pid", "w")
+				if f then f:write(tostring(pid)); f:close() end
+			end
+			lock_held = true
+			return true
+		end
+		if lock_is_live() then os.execute("sleep 1") end
+	end
+	return false
 end
 local function release_lock()
-	os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+	if lock_held then
+		os.execute("rm -f " .. hp.shellQuote(lock_dir .. "/pid"))
+		os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+		lock_held = false
+	end
 end
 if not acquire_lock() then
 	-- Nonzero: a skipped update is NOT a success -- callers (web/CLI) must
@@ -315,6 +350,30 @@ local function ipv4_from_host(h)
 		math.floor(n / 256) % 256, n % 256
 end
 
+-- The router's own interface addresses, normalized the same way hosts are
+-- (lowercase, %-zone stripped, leading hextet zeros removed): same rule as
+-- the CGI's is_own_ip — a subscription pointed back at the box is
+-- SSRF/DNS-loop surface regardless of subnet class.
+local own_ip_set
+local function is_own_ip_addr(ip)
+	if not own_ip_set then
+		own_ip_set = {}
+		local h = io.popen("ip -o addr show 2>/dev/null")
+		if h then
+			for l in h:lines() do
+				local a = l:match("inet6?%s+(%S+)")
+				if a then
+					a = a:gsub("/.*$", ""):gsub("%%.*$", ""):lower()
+					own_ip_set[a] = true
+					own_ip_set[a:gsub("0*(%x+)", "%1")] = true
+				end
+			end
+			h:close()
+		end
+	end
+	return own_ip_set[tostring(ip)] == true
+end
+
 local function is_local_url(url)
 	local u = hp.parseURL(url)
 	local h = u and u.hostname or nil
@@ -330,15 +389,85 @@ local function is_local_url(url)
 	end
 	if not h or h == "" then return false end
 	-- A DNS resolver treats "X." as "X" and is case-insensitive; normalize
-	-- both before comparing (L27).
+	-- both before comparing (L27). IPv6 hextets additionally lose leading
+	-- zeros so "00::1", "::0001" and expanded v4-mapped spellings cannot
+	-- evade the literal checks below (mirrors cgi-bin/api is_local_addr).
 	h = h:gsub("^%[(.*)%]$", "%1"):gsub("%.$", ""):lower()
-	if h == "localhost" or h == "::" or h == "::1"
-		or h:match("^fe80:") or h:match("^[fc][cd]%x*:") then
+	local hn = h:gsub("0*(%x+)", "%1")
+	if h == "localhost" or h:match("%.localhost$") then
 		return true
 	end
-	local a, b = ipv4_from_host(h)
-	-- 127/8 loopback, 169.254/16 link-local, 0/8 "this host".
-	return a == 0 or a == 127 or (a == 169 and b == 254)
+	if is_own_ip_addr(h) or is_own_ip_addr(hn) then
+		return true
+	end
+	-- v6 arms apply only to colon-bearing candidates, so a hostname like
+	-- "ff.example.com" can never trip the ranges below.
+	if h:find(":", 1, true) then
+		local g0 = tonumber(hn:match("^(%x+)") or "", 16)
+		if hn:match("^[0:]*:1$") or hn:match("^[0:]*$")
+			or (g0 and ((g0 >= 0xfe80 and g0 <= 0xfeff)      -- link-local + site-local
+				or (g0 >= 0xfc00 and g0 <= 0xfdff)           -- ULA
+				or g0 >= 0xff00)) then                       -- multicast
+			return true
+		end
+	end
+	-- v4-mapped (::ffff:a.b.c.d and hex-group ::ffff:XXXX:XXXX) plus
+	-- v4-compatible and NAT64-WKP embeddings: judge the embedded v4 too.
+	-- Hex-group decode comes FIRST — a dotted tail only exists in
+	-- spelled-out forms, and decoding "0:0:0:0:0:ffff:808:808" via its
+	-- last group would misread it as a /8-class address.
+	local o1, o2, o3, o4
+	if h:find(":", 1, true) then
+		local g7, g8 = hn:match("^[0:]*:ffff:(%x+):(%x+)$")
+		if not g7 then g7, g8 = hn:match("^[0:]*:(%x+):(%x+)$") end
+		if not g7 then g7, g8 = hn:match("^64:ff9b:[0:]*:(%x+):(%x+)$") end
+		if g7 then
+			local x, y = tonumber(g7, 16), tonumber(g8, 16)
+			if x and y and x <= 65535 and y <= 65535 then
+				o1, o2 = math.floor(x / 256) % 256, x % 256
+				o3, o4 = math.floor(y / 256) % 256, y % 256
+			end
+		else
+			-- Dotted tail only, and only behind the real embedding
+			-- prefixes — "[abcd::ef01:192.168.0.1]" is an ordinary v6
+			-- address, not an embedding (decoding its tail would desync
+			-- from the CGI: stored in UCI yet silently skipped here).
+			local head = hn:match("^(.-):%d+%.[%d%.]*$")
+			if head then
+				local hz = head:gsub("ffff$", "")
+				if hz ~= head then
+					if hz:match("^[0:]*$") then
+						o1, o2, o3, o4 = ipv4_from_host(h:match(":([%d]+%.[%d%.]*)$") or "")
+					end
+				elseif head:match("^[0:]+$") or head:match("^64:ff9b:[0:]*$") then
+					o1, o2, o3, o4 = ipv4_from_host(h:match(":([%d]+%.[%d%.]*)$") or "")
+				end
+			end
+		end
+	end
+	if not o1 then o1, o2, o3, o4 = ipv4_from_host(h) end
+	-- Embedded-v4 spelling of an own address (e.g. ::ffff:<wan-ip>).
+	if o1 and is_own_ip_addr(o1 .. "." .. o2 .. "." .. o3 .. "." .. o4) then
+		return true
+	end
+	-- 127/8 loopback, 169.254/16 link-local, 0/8 "this host", plus the
+	-- private/bogon space a blind router-side fetch must never target —
+	-- identical ranges to the CGI's is_private4.
+	if o1 and (o1 == 0 or o1 == 10 or o1 == 127 or o1 >= 224
+		or (o1 == 169 and o2 == 254)
+		or (o1 == 172 and o2 >= 16 and o2 <= 31)
+		or (o1 == 192 and (o2 == 168
+			or (o2 == 0 and (o3 == 0 or o3 == 2))
+			or (o2 == 88 and o3 == 99)
+			or (o2 == 31 and o3 == 196)
+			or (o2 == 52 and o3 == 193)
+			or (o2 == 175 and o3 == 48)))
+		or (o1 == 100 and o2 >= 64 and o2 <= 127)
+		or (o1 == 198 and (o2 == 18 or o2 == 19 or (o2 == 51 and o3 == 100)))
+		or (o1 == 203 and o2 == 0 and o3 == 113)) then
+		return true
+	end
+	return false
 end
 
 local function have_cmd(bin)
@@ -647,6 +776,9 @@ local function main()
 		log("Failed to update subscriptions: no valid node found.")
 		if via_proxy ~= "1" then
 			log("Starting service...")
+			-- Hold time ends here: init.d re-enters the same lockdir for
+			-- migrate, and a held lock would cost it the full retry budget.
+			release_lock()
 			os.execute("/etc/init.d/homeproxy start >/dev/null 2>&1")
 		end
 		-- Failure must reach the caller: previously this returned normally
@@ -801,6 +933,11 @@ local function main()
 	-- Single atomic commit for all node + main_node + urltest changes (H4).
 	commit_uci()
 
+	-- Nothing UCI-bound remains: release BEFORE the service restart so
+	-- init.d's migrate step can take the lock instead of spinning its full
+	-- retry budget and then running unlocked.
+	release_lock()
+
 	if need_restart then
 		log("Restarting service...")
 		os.execute("/etc/init.d/homeproxy restart >/dev/null 2>&1")
@@ -809,13 +946,15 @@ local function main()
 end
 
 local ok, res = pcall(main)
-if not ok then
+if not ok and lock_held then
 	-- Drop staged uci deltas: /tmp/.uci persists across processes, so the
 	-- next `uci commit homeproxy` by an unrelated caller would otherwise
-	-- flush our half-written node set.
+	-- flush our half-written node set. Skipped once the lock was released
+	-- early (post-commit nothing of ours is staged; a revert then would
+	-- wipe ANOTHER writer's staged work).
 	pcall(function() uci:revert(CFG) end)
 end
--- Always release the concurrency lock.
+-- Always release the concurrency lock (no-op if already released early).
 release_lock()
 if not ok then
 	log("[FATAL ERROR] " .. tostring(res))

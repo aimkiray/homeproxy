@@ -196,8 +196,36 @@ start_service() {
     # captured by config_load, so migrating afterwards would leave this run
     # using pre-migration values (e.g. a legacy proxy_mode or tun_* option
     # the migrator just rewrote) while the generators see the migrated ones.
-    if ! lua "$HP_LUA_DIR/migrate_config.lua" 2>>"$LOG_PATH"; then
-        log "Warning: config migration failed (continuing with current config)."
+    # The migrator commits UCI and staged deltas are global — it must hold
+    # the shared writer lock or a restart would flush a concurrent writer's
+    # half-staged changes. Same lockdir + 120s stale-reclaim as the Lua side.
+    _mig_lk="$RUN_DIR/uci-write.lock.d"; _mig_i=0; _mig_held=0
+    mkdir -p "$RUN_DIR" 2>/dev/null
+    while [ "$_mig_i" -lt 15 ]; do
+        mkdir "$_mig_lk" 2>/dev/null && { echo $$ >"$_mig_lk/pid" 2>/dev/null; _mig_held=1; break; }
+        # pid-liveness first: a live holder can legitimately hold past 120s
+        # (subscription runs hold across multi-URL fetches). A dead pid is
+        # reclaimed at once; a pid-less lock falls back to the mtime rule.
+        _p=$(cat "$_mig_lk/pid" 2>/dev/null)
+        case "$_p" in ''|*[!0-9]*) _p= ;; esac
+        if [ -n "$_p" ]; then
+            kill -0 "$_p" 2>/dev/null || { rm -f "$_mig_lk/pid"; rmdir "$_mig_lk" 2>/dev/null; }
+        else
+            _mt=$(stat -c %Y "$_mig_lk" 2>/dev/null) || _mt=0
+            [ "${_mt:-0}" -gt 0 ] && [ $(($(date +%s) - _mt)) -gt 120 ] && rmdir "$_mig_lk" 2>/dev/null
+        fi
+        _mig_i=$((_mig_i + 1))
+        sleep 1
+    done
+    if [ "$_mig_held" = 1 ]; then
+        if ! lua "$HP_LUA_DIR/migrate_config.lua" 2>>"$LOG_PATH"; then
+            log "Warning: config migration failed (continuing with current config)."
+        fi
+        rm -f "$_mig_lk/pid"; rmdir "$_mig_lk" 2>/dev/null
+    else
+        # Never migrate unlocked: its commit would flush a live writer's
+        # half-staged delta. Idempotent -- the next start retries.
+        log "Config migration skipped: writer lock held by another process."
     fi
 
     config_load "$CONF"

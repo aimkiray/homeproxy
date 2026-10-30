@@ -80,9 +80,10 @@ case "$Q_lines" in ''|*[!0-9]*) Q_lines=80 ;; esac
 # read_body is always invoked inside $( ) or a pipeline where exit would only
 # kill the subshell and leak the error text into the body variable.
 require_body_size() {
-	local n="${CONTENT_LENGTH:-0}"
-	case "$n" in ''|*[!0-9]*) n=0 ;; esac
-	[ "$n" -le 262144 ] 2>/dev/null || json_err "request body too large"
+	# A missing/non-numeric CONTENT_LENGTH is NOT an empty body: chunked or
+	# client-broken requests must not degrade to "clear the list" semantics.
+	case "${CONTENT_LENGTH-}" in ''|*[!0-9]*) json_err "missing or invalid Content-Length" ;; esac
+	[ "$CONTENT_LENGTH" -le 262144 ] 2>/dev/null || json_err "request body too large"
 }
 read_body() {
 	local n="${CONTENT_LENGTH:-0}"
@@ -110,7 +111,10 @@ node_sections() {
 # then stored and the Lua generator later rejected -- a config saved OK but
 # failing generation on the next restart.
 is_ipv4() {
-	printf '%s' "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i+0 > 255) exit 1; exit 0}'
+	# Octets must be canonical decimal — "0177"/"08" are rejected, not merely
+	# range-checked: inet_aton reads leading zeros as OCTAL, so "0177.0.0.1"
+	# would land as 127.0.0.1 and slip past the private-range globs.
+	printf '%s' "$1" | awk -F. 'NF!=4 {exit 1} {for(i=1;i<=4;i++) if ($i !~ /^(0|[1-9][0-9]*)$/ || $i+0 > 255) exit 1; exit 0}'
 }
 is_ipv6() {
 	case "$1" in *:*) ;; *) return 1 ;; esac
@@ -131,7 +135,7 @@ is_ipv6() {
 				if (i != n) exit 1
 				m = split(a[i], b, ".")
 				if (m != 4) exit 1
-				for (j = 1; j <= 4; j++) if (b[j] !~ /^[0-9]+$/ || b[j]+0 > 255) exit 1
+				for (j = 1; j <= 4; j++) if (b[j] !~ /^(0|[1-9][0-9]*)$/ || b[j]+0 > 255) exit 1
 				groups += 2; continue
 			}
 			if (a[i] !~ /^[0-9A-Fa-f]+$/ || length(a[i]) > 4) exit 1
@@ -140,31 +144,287 @@ is_ipv6() {
 		if (dbl > 0) { if (groups > 7) exit 1 } else if (groups != 8) exit 1
 	}'
 }
-# Single-label or dotted hostname; rejects empty labels, leading dots and
-# leading/trailing hyphens inside labels.
+# inet_aton-style encoded literals a hostname check would otherwise accept:
+# pure decimal ("2130706433"), hex ("0x7f000001"), all-numeric dotted forms
+# ("127.1", "0177.0.0.1", "0x7f.0.0.1"). No DNS TLD is all-numeric, so
+# rejecting loses nothing — while a downstream resolver decodes these to
+# real addresses (loopback included).
+is_numeric_addr_form() {
+	# Component-wise: every dot-separated part must be pure decimal or
+	# 0x-hex — exactly the shapes inet_aton decodes. "0xdeadbeef.example.com"
+	# or "163.com" keep their letters and pass through to the hostname check.
+	printf '%s' "$1" | grep -qE '^(([0-9]+)|(0[xX][0-9A-Fa-f]+))(\.(([0-9]+)|(0[xX][0-9A-Fa-f]+)))*$'
+}
+# Single-label or dotted hostname; rejects empty labels, leading dots,
+# leading/trailing hyphens inside labels, and numeric-encoded address forms.
 is_hostname() {
-	printf '%s' "$1" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$' \
+	is_numeric_addr_form "$1" && return 1
+	# '_' inside labels: homeproxy.lua's is_hostname allows it (SRV/TXT and
+	# real-world configs) — keep the two validators aligned.
+	printf '%s' "$1" | grep -qE '^[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?(\.[A-Za-z0-9_]([A-Za-z0-9_-]*[A-Za-z0-9_])?)*$' \
 		&& [ ${#1} -le 253 ]
 }
-# loopback / unspecified / link-local / ULA -- never a legitimate upstream
-# or subscription host (DNS via these loops back through dnsmasq/meow,
-# and blind router-side fetches of them are pure SSRF surface).
+# Canonicalize an IPv6 literal into eight lower-hex groups — no "::"
+# compression, no leading zeros ("00::1" -> "0:0:0:0:0:0:0:1"), embedded
+# dotted-v4 tails become hex groups — so the literal-pattern checks in
+# is_local_addr cannot be evaded by spelling.
+canon_v6() {
+	printf '%s\n' "$1" | awk '
+	function norm(g) {
+		g = tolower(g)
+		if (g !~ /^[0-9a-f]{1,4}$/) exit 1
+		sub(/^0+/, "", g)
+		return g == "" ? "0" : g
+	}
+	function expand(A, k,   V, i) {
+		# A[k] is a dotted-v4 tail -> becomes two hex groups, list grows by 1
+		if (split(A[k], V, ".") != 4) exit 1
+		for (i = 1; i <= 4; i++)
+			if (V[i] !~ /^[0-9]+$/ || V[i]+0 > 255) exit 1
+		A[k]   = sprintf("%x", V[1]*256 + V[2])
+		A[k+1] = sprintf("%x", V[3]*256 + V[4])
+		return k + 1
+	}
+	{
+		n = split($0, P, "::")
+		if (n > 2) exit 1
+		hn = 0; tn = 0
+		if (P[1] != "") hn = split(P[1], H, ":")
+		if (n == 2 && P[2] != "") tn = split(P[2], T, ":")
+		# a dotted-v4 tail is always the LAST group — tail side when "::"
+		# is present, head side otherwise
+		if (n == 2) { if (tn > 0 && index(T[tn], ".") > 0) tn = expand(T, tn) }
+		else        { if (hn > 0 && index(H[hn], ".") > 0) hn = expand(H, hn) }
+		if (n == 2) { fill = 8 - hn - tn; if (fill < 1) exit 1 }
+		else        { if (hn != 8) exit 1; fill = 0 }
+		out = ""
+		for (i = 1; i <= hn; i++)   out = out norm(H[i]) ":"
+		for (i = 1; i <= fill; i++) out = out "0:"
+		for (i = 1; i <= tn; i++)   out = out norm(T[i]) ":"
+		sub(/:$/, "", out)
+		print out
+	}'
+}
+# loopback / unspecified / link-local / ULA / multicast / embedded-v4 forms --
+# never a legitimate upstream or subscription host (DNS via these loops back
+# through dnsmasq/meow, and blind router-side fetches of them are pure SSRF
+# surface). IPv6 input is canonicalized first; the ff* multicast pattern
+# lives only in the v6 arm so "ff.example.com" stays a legal hostname.
 is_local_addr() {
-	case "$1" in
-		*:*.*)
-			# v4-mapped tail (e.g. ::ffff:127.0.0.1): apply the v4 check too.
-			case "${1##*:}" in 0.0.0.0|127.*|169.254.*) return 0 ;; esac ;;
+	local a=$1 canon g1 g2 g0n
+	case "$a" in \[*\]) a=${a#\[}; a=${a%%\]*} ;; esac
+	# A resolver folds case and ignores one trailing dot — normalize before
+	# comparing ("LOCALHOST." must not escape the name checks).
+	a=$(printf '%s' "$a" | tr 'A-Z' 'a-z')
+	a=${a%.}
+	case "$a" in
+		*:*)
+			canon=$(canon_v6 "$a") || return 1
+			case "$canon" in
+				0:0:0:0:0:0:0:0|0:0:0:0:0:0:0:1) return 0 ;;      # :: / ::1
+				0:0:0:0:0:ffff:*|0:0:0:0:0:0:*|64:ff9b:0:0:0:0:*)
+					# v4-mapped / v4-compatible / NAT64-WKP: judge the embedded v4
+					g1=${canon##*:}; canon=${canon%:*}; g2=${canon##*:}
+					a=$((0x$g2 / 256)).$((0x$g2 % 256)).$((0x$g1 / 256)).$((0x$g1 % 256))
+					is_local_addr "$a" && return 0
+					is_private4 "$a" && return 0 ;;
+				*)
+					# Numeric first-group ranges — prefix globs on the
+					# canonical spelling would misread hextets like 0x0fe8
+					# as fe80::/10 and miss nothing real.
+					g0n=$((0x${canon%%:*}))
+					[ "$g0n" -ge 65152 ] && [ "$g0n" -le 65279 ] && return 0   # fe80-feff link+site local
+					[ "$g0n" -ge 64512 ] && [ "$g0n" -le 65023 ] && return 0   # fc00-fdff ULA
+					[ "$g0n" -ge 65280 ] && return 0 ;;                       # ff00-ffff multicast
+			esac
+			return 1 ;;
 	esac
-	case "$1" in
-		""|0.0.0.0|::|::1|0:0:0:0:0:0:0:1|127.*|169.254.*|[fF][eE]80:*|[fF][cCdD]*:*) return 0 ;;
+	case "$a" in
+		""|localhost|*.localhost) return 0 ;;
+		# Dotted-prefix arms only apply to all-numeric spellings — a real
+		# hostname like "127.evil.com" is NOT the loopback prefix.
+		*[!0-9.]*) return 1 ;;
+		0.*|127.*|169.254.*) return 0 ;;
 		*) return 1 ;;
 	esac
+}
+
+# Private/reserved v4 — these lists only ever steer WAN-bound traffic, and a
+# private or bogon range in the *proxy* set precedes emit_local's RETURN.
+is_private4() {
+	case "$1" in
+		0.*|10.*|127.*|169.254.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*|192.168.*|192.0.0.*|192.0.2.*|192.88.99.*|192.31.196.*|192.52.193.*|192.175.48.*|198.1[89].*|198.51.100.*|203.0.113.*|100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*|22[4-9].*|2[3-5][0-9].*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+# The router's own interface addresses — a subscription/DNS URL pointed back
+# at the box itself is SSRF/DNS-loop surface regardless of subnet class.
+is_own_ip() {
+	if [ -z "${OWN_IPS+x}" ]; then
+		OWN_IPS=" $(ip -o addr show 2>/dev/null | awk '{sub(/\/.*/,"",$4); print $4}' | tr '\n' ' ')"
+	fi
+	case "$OWN_IPS" in *" $1 "*) return 0 ;; esac
+	return 1
+}
+
+# Serialized UCI writer lock shared with the Lua writers (same lockdir).
+# Staged deltas are global per-package — any commit or revert flushes/wipes
+# every staged change — so every writer must hold it. Stale detection is
+# pid-liveness FIRST: a live holder may legitimately keep the lock past 120s
+# (a subscription run holds it across multi-URL fetches), so mtime alone
+# must never kill it. A dead pid -> reclaim at once; a pid-less lock (older
+# build, or the small window before the holder writes its pid) falls back
+# to the >120s mtime heuristic.
+uci_lock_acquire() {
+	local lk="$RUN_DIR/uci-write.lock.d" i=0 p mt
+	mkdir -p "$RUN_DIR" 2>/dev/null
+	while ! mkdir "$lk" 2>/dev/null; do
+		p=$(cat "$lk/pid" 2>/dev/null)
+		case "$p" in ''|*[!0-9]*) p= ;; esac
+		if [ -n "$p" ]; then
+			kill -0 "$p" 2>/dev/null || { rm -f "$lk/pid"; rmdir "$lk" 2>/dev/null; }
+		else
+			mt=$(stat -c %Y "$lk" 2>/dev/null) || mt=0
+			[ "${mt:-0}" -gt 0 ] && [ $(($(date +%s) - mt)) -gt 120 ] && rmdir "$lk" 2>/dev/null
+		fi
+		i=$((i + 1)); [ "$i" -ge 15 ] && return 1
+		sleep 1
+	done
+	echo $$ >"$lk/pid" 2>/dev/null
+	return 0
+}
+uci_lock_release() {
+	rm -f "$RUN_DIR/uci-write.lock.d/pid"
+	rmdir "$RUN_DIR/uci-write.lock.d" 2>/dev/null
+}
+# revert staged deltas + release + error — the only failure path allowed
+# once the lock is held.
+uci_fail() {
+	uci revert "$CONF" 2>/dev/null
+	uci_lock_release
+	json_err "$1"
 }
 
 valid_mode() {
 	case "$1" in
 		bypass_mainland_china|global|gfwlist|proxy_mainland_china|custom) return 0 ;;
 		*) return 1 ;;
+	esac
+}
+
+# '#tag' on a PLAIN dns URL (udp://tcp://) is emitted verbatim as the dialer
+# detour — a name meow cannot resolve makes `meow -t` fail and the service
+# never comes back. Resolvable names: the kernel GLOBAL selector, DIRECT,
+# main-out/main-udp-out (non-custom modes), cfg-<node|routing_node>-out.
+# (On tls://https:// the '#' is TLS SNI, charset-only.)
+dns_detour_ok() {
+	local t=$1 n mun mnode mtype rmode
+	case "$t" in GLOBAL|DIRECT) return 0 ;; esac
+	rmode=$(uci -q get $CONF.config.routing_mode 2>/dev/null)
+	case "$t" in
+		main-out)
+			[ "$rmode" = "custom" ] && return 1
+			mnode=$(uci -q get $CONF.config.main_node 2>/dev/null)
+			case "$mnode" in ""|nil|urltest) return 0 ;; esac
+			# emit_as skips the tag only for a block-type node (REJECT
+			# carries no DNS).
+			[ "$(uci -q get "$CONF.$mnode.type" 2>/dev/null)" = "block" ] && return 1
+			return 0 ;;
+		main-udp-out)
+			[ "$rmode" = "custom" ] && return 1
+			mun=$(uci -q get $CONF.config.main_udp_node 2>/dev/null)
+			case "$mun" in
+				urltest) return 0 ;;
+				""|nil|same) return 1 ;;   # not dedicated -> tag not emitted
+			esac
+			mnode=$(uci -q get $CONF.config.main_node 2>/dev/null)
+			[ "$mun" = "$mnode" ] && return 1
+			[ "$(uci -q show "$CONF.$mun" 2>/dev/null | awk -F= 'NR==1{print $2}')" = "node" ] || return 1
+			[ "$(uci -q get "$CONF.$mun.type" 2>/dev/null)" = "block" ] && return 1
+			return 0 ;;
+		cfg-*-out)
+			n=${t#cfg-}; n=${n%-out}
+			mtype=$(uci -q get "$CONF.$n.type" 2>/dev/null)
+			case "$(uci -q show "$CONF.$n" 2>/dev/null | awk -F= 'NR==1{print $2}')" in
+				node)
+					# materialize-all skips pseudo/block/direct nodes.
+					case "$mtype" in ""|direct|block|dns) return 1 ;; esac
+					return 0 ;;
+				routing_node)
+					# cfg-<rn>-out only materializes in custom mode, and
+					# only when the section actually names a node/group.
+					[ "$rmode" = "custom" ] || return 1
+					[ -n "$(uci -q get "$CONF.$n.node" 2>/dev/null)" ] ;;
+				*) return 1 ;;
+			esac ;;
+	esac
+	return 1
+}
+# Validate one DNS server value against the generator's vocabulary
+# (plain_dns_url + NONURL_DNS_KEYWORDS): keyword | bare IP | bare hostname |
+# proto://host[:port][/path][#tag] with proto in udp/tcp/tls/https. A stored
+# bad value is rendered into meow's dns.nameserver where `meow -t` fails and
+# the service never comes back — validate strictly (H2/A1).
+valid_dns_server() {
+	local v=$1 proto rest dtag dha dh dport
+	[ -n "$v" ] || json_err "DNS server is required"
+	case "$v" in
+		*[\\\"\'\ ]*|*'	'*) json_err "bad characters in DNS URL" ;;
+	esac
+	# NONURL_DNS_KEYWORDS is matched case-insensitively by the generator.
+	case "$(printf '%s' "$v" | tr 'A-Z' 'a-z')" in
+		wan|local|system|dhcp|system-dns|default-dns) return 0 ;;
+	esac
+	case "$v" in
+		*://*)
+			proto=${v%%://*}
+			case "$proto" in udp|tcp|tls|https) : ;; *) json_err "unsupported DNS protocol: $proto" ;; esac
+			rest=${v#*://}
+			# optional trailing '#tag' — at most one, and for plain protos
+			# it must resolve to a real emitted outbound (detour wedge).
+			case "$rest" in
+				*\#*)	dtag=${rest##*#}; rest=${rest%#*}
+					case "$dtag" in ""|*[!A-Za-z0-9_.-]*) json_err "bad DNS URL tag: $dtag" ;; esac
+					case "$rest" in *\#*) json_err "bad DNS URL: extra '#'" ;; esac
+					case "$proto" in
+						udp|tcp) dns_detour_ok "$dtag" || json_err "unknown DNS detour: $dtag" ;;
+					esac ;;
+			esac
+			# path/query is meaningless (and wedge-prone) on raw protos; on
+			# https only a path is allowed — a '?query' would desync the
+			# generator's own ?proxy= tail into an InvalidParams wedge.
+			case "$proto" in
+				udp|tcp|tls) case "$rest" in */*|*\?*) json_err "bad DNS URL path for $proto" ;; esac ;;
+				https) case "$rest" in *\?*) json_err "bad DNS URL: '?query' is not supported" ;; esac ;;
+			esac
+			dha=${rest%%/*}
+			case "$dha" in *\?*) json_err "bad DNS authority: $dha" ;; esac
+			case "$dha" in *:|*\]:) json_err "empty DNS port: $dha" ;; esac
+			# Split host/port: bracketed IPv6 may carry :port after ']';
+			# unbracketed multi-colon is unparseable -> reject.
+			case "$dha" in
+				\[*\]*) dh=${dha#\[}; dh=${dh%%\]*}; dport=${dha#*\]}; dport=${dport#:} ;;
+				*:*:*) json_err "IPv6 DNS host must be [bracketed]: $dha" ;;
+				*:*)   dh=${dha%%:*}; dport=${dha##*:} ;;
+				*)     dh=$dha; dport= ;;
+			esac
+			case "$dport" in
+				"") : ;;
+				*[!0-9]*) json_err "bad DNS port: $dport" ;;
+				*) [ "$dport" -ge 1 ] && [ "$dport" -le 65535 ] 2>/dev/null || json_err "bad DNS port: $dport" ;;
+			esac
+			is_local_addr "$dh" && json_err "DNS host must not be loopback/link-local: $dh"
+			is_own_ip "$dh" && json_err "DNS host must not be this router: $dh"
+			is_ipv4 "$dh" || is_ipv6 "$dh" || is_hostname "$dh" \
+				|| json_err "bad DNS host: $dh"
+			;;
+		*)
+			is_local_addr "$v" && json_err "DNS server must not be loopback/link-local: $v"
+			is_own_ip "$v" && json_err "DNS server must not be this router: $v"
+			is_ipv4 "$v" || is_ipv6 "$v" || is_hostname "$v" \
+				|| json_err "DNS must be an IP, hostname, keyword or proto:// URL (got: $v)"
+			;;
 	esac
 }
 
@@ -208,7 +468,7 @@ esac
 # Write endpoints require POST -- this is an unauthenticated LAN API, so
 # guard against an accidental GET clearing a list or triggering a restart.
 case "$Q_action" in
-	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_subscription_urls|set_dns|subscribe|restart|add_node)
+	set_main_node|set_routing_mode|set_lan_proxy|set_direct_list|set_proxy_list|set_direct_ips|set_proxy_ips|set_subscription_urls|set_dns|subscribe|restart|add_node)
 		[ "${REQUEST_METHOD:-POST}" = "POST" ] || json_err "POST required (got ${REQUEST_METHOD:-none})"
 		case "${CONTENT_TYPE:-}" in
 			application/json*) : ;;
@@ -266,7 +526,10 @@ config|settings)
 				packet_encoding=1, filter_nodes=1, filter_keywords=1, allow_insecure=1 },
 			control = { lan_proxy_mode=1, lan_proxy_ipv4_ips=1, lan_proxy_ipv6_ips=1,
 				lan_proxy_mac_addrs=1, lan_direct_ipv4_ips=1, lan_direct_ipv6_ips=1,
-				lan_direct_mac_addrs=1 },
+				lan_direct_mac_addrs=1, lan_global_proxy_ipv4_ips=1,
+				lan_global_proxy_ipv6_ips=1, lan_global_proxy_mac_addrs=1,
+				wan_proxy_ipv4_ips=1,
+				wan_proxy_ipv6_ips=1, wan_direct_ipv4_ips=1, wan_direct_ipv6_ips=1 },
 			node = { label=1, type=1, grouphash=1 },
 			infra = { mixed_port=1, redirect_port=1, dns_port=1,
 				v6_port=1, dns_redirect=1, udp_timeout=1 },
@@ -326,12 +589,18 @@ set_main_node)
 		nil|urltest) : ;;
 		"") json_err "missing node" ;;
 		*[!A-Za-z0-9_-]*) json_err "invalid node name" ;;
-		*)
-			sec_type=$(uci -q show "$CONF.$body" 2>/dev/null | awk -F= 'NR==1{print $2}'); [ "$sec_type" = "node" ] || json_err "no such node: $body"
-			;;
 	esac
-	uci set $CONF.config.main_node="$body" 2>/dev/null || json_err "uci set failed"
-	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	uci_lock_acquire || json_err "uci lock busy — retry"
+	# Existence re-check happens INSIDE the lock: a concurrent subscription
+	# update can garbage-collect the node between validation and commit.
+	case "$body" in
+		nil|urltest) : ;;
+		*)	sec_type=$(uci -q show "$CONF.$body" 2>/dev/null | awk -F= 'NR==1{print $2}')
+			[ "$sec_type" = "node" ] || uci_fail "no such node: $body" ;;
+	esac
+	uci set $CONF.config.main_node="$body" 2>/dev/null || uci_fail "uci set failed"
+	uci commit $CONF 2>/dev/null || uci_fail "uci commit failed"
+	uci_lock_release
 	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"main_node":"'"$(jesc "$body")"'"}'
 	;;
@@ -341,8 +610,10 @@ set_routing_mode)
 	body=$(read_body | tr -d '\r\n')
 	body=${body#mode=}
 	valid_mode "$body" || json_err "bad routing_mode: $body"
-	uci set $CONF.config.routing_mode="$body" 2>/dev/null || json_err "uci set failed"
-	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	uci_lock_acquire || json_err "uci lock busy — retry"
+	uci set $CONF.config.routing_mode="$body" 2>/dev/null || uci_fail "uci set failed"
+	uci commit $CONF 2>/dev/null || uci_fail "uci commit failed"
+	uci_lock_release
 	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"routing_mode":"'"$(jesc "$body")"'"}'
 	;;
@@ -355,8 +626,10 @@ set_lan_proxy)
 		disabled|only_proxy|listed_only|except_listed) : ;;
 		*) json_err "bad lan_proxy_mode: $body" ;;
 	esac
-	uci set $CONF.control.lan_proxy_mode="$body" 2>/dev/null || json_err "uci set failed"
-	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	uci_lock_acquire || json_err "uci lock busy — retry"
+	uci set $CONF.control.lan_proxy_mode="$body" 2>/dev/null || uci_fail "uci set failed"
+	uci commit $CONF 2>/dev/null || uci_fail "uci commit failed"
+	uci_lock_release
 	do_restart || json_err "config saved but service restart failed"
 	json_ok '{"ok":true,"lan_proxy_mode":"'"$(jesc "$body")"'"}'
 	;;
@@ -365,8 +638,52 @@ get_domain_lists)
 	RES_DIR="$HP_RES_DIR"
 	d=$(cat "$RES_DIR/direct_list.txt" 2>/dev/null)
 	x=$(cat "$RES_DIR/proxy_list.txt" 2>/dev/null)
+	# WAN-IP steering surfaces: the UCI lists are the static half of
+	# homeproxy_wan_direct4/6 + wan_proxy4/6, while the domain files above
+	# feed dnsmasq ipset=/meow rule-sets. Project both, plus the live set
+	# members not covered by the static list (subscription-seeded IPs and
+	# dnsmasq-learned answers) so the page shows the full bypass state.
+	d4=$(uci -q get $CONF.control.wan_direct_ipv4_ips | tr ' ' '\n')
+	d6=$(uci -q get $CONF.control.wan_direct_ipv6_ips | tr ' ' '\n')
+	p4=$(uci -q get $CONF.control.wan_proxy_ipv4_ips | tr ' ' '\n')
+	p6=$(uci -q get $CONF.control.wan_proxy_ipv6_ips | tr ' ' '\n')
+	di=$(printf '%s\n%s\n' "$d4" "$d6" | grep .)
+	pi=$(printf '%s\n%s\n' "$p4" "$p6" | grep .)
+	canon_ips() {
+		# Canonicalize v4 to ipset's render form: host entries bare
+		# ("x/32" -> "x"), CIDRs to their network address ("a.b.c.7/22" ->
+		# "a.b.c.0/22"). Without this every /32 or host-bits-set static entry
+		# masquerades as a dynamic member. v6 passes through (compressed
+		# forms may still diff — display-only).
+		awk '
+		function canon(ip,  a,o,m,x,q,nx,n1,n2,n3,n4) {
+			n = split(ip, a, "/")
+			if (n != 2 || a[2]+0 >= 32 || a[2]+0 < 1) return a[1]
+			m = a[2] + 0
+			split(a[1], o, ".")
+			x = o[1]*16777216 + o[2]*65536 + o[3]*256 + o[4]
+			q = 2^(32-m)
+			nx = int(x/q)*q
+			n1 = int(nx/16777216); nx -= n1*16777216
+			n2 = int(nx/65536);    nx -= n2*65536
+			n3 = int(nx/256);      n4  = nx - n3*256
+			return n1 "." n2 "." n3 "." n4 "/" m
+		}
+		{ ip = $1; if (index(ip, ":")) print ip; else print canon(ip) }'
+	}
+	set_extras() {
+		# $1=ipset $2=static-lines -> live members absent from the static list
+		ipset -q list "$1" >/dev/null 2>&1 || return 0
+		local sf="$RUN_DIR/.ips.$$.$1"
+		printf '%s\n' $2 | canon_ips | grep . >"$sf"
+		ipset list "$1" | awk '/^Members:/{m=1;next} m{print $1}' | canon_ips | grep -vxFf "$sf"
+		rm -f "$sf"
+	}
+	sd=$( set_extras homeproxy_wan_direct4 "$d4"; set_extras homeproxy_wan_direct6 "$d6" )
+	sp=$( set_extras homeproxy_wan_proxy4 "$p4";  set_extras homeproxy_wan_proxy6 "$p6" )
 	hdr 'Content-Type: application/json'
-	printf '{"ok":true,"direct":"%s","proxy":"%s"}\n' "$(jesc "$d")" "$(jesc "$x")"
+	printf '{"ok":true,"direct":"%s","proxy":"%s","direct_ips":"%s","proxy_ips":"%s","seeded_direct":"%s","seeded_proxy":"%s"}\n' \
+		"$(jesc "$d")" "$(jesc "$x")" "$(jesc "$di")" "$(jesc "$pi")" "$(jesc "$sd")" "$(jesc "$sp")"
 	;;
 
 set_direct_list|set_proxy_list)
@@ -413,6 +730,65 @@ set_direct_list|set_proxy_list)
 	json_ok '{"ok":true,"file":"'"$file"'"}'
 	;;
 
+set_direct_ips|set_proxy_ips)
+	case "$Q_action" in
+		set_direct_ips) k4=wan_direct_ipv4_ips; k6=wan_direct_ipv6_ips ;;
+		set_proxy_ips)  k4=wan_proxy_ipv4_ips;  k6=wan_proxy_ipv6_ips ;;
+	esac
+	# One IPv4/IPv6 or CIDR per line — exactly what load_list_ipset feeds
+	# `ipset add`. v6 entries split on ':'; validation reuses is_ipv4/is_ipv6
+	# (real shape checks, not a charset sieve). Domains are rejected outright.
+	# Private/bogon ranges are refused too: WAN sets only ever see WAN-bound
+	# traffic, and a private or /0 entry in the *proxy* list precedes the
+	# emit_local RETURN — it would hijack LAN traffic into the proxy.
+	# Comments cannot live in UCI lists; they are dropped. Empty body clears.
+	require_body_size
+	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.list.$$"
+	badf="${tmp}.bad"; v4f="${tmp}.4"; v6f="${tmp}.6"
+	: >"$badf"; : >"$v4f"; : >"$v6f"
+	read_body | tr -d '\r' | while IFS= read -r line || [ -n "$line" ]; do
+		line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+		[ -z "$line" ] && continue
+		case "$line" in '#'*) continue ;; esac
+		base="$line"; mask=
+		case "$line" in
+			*/*)	base="${line%%/*}"; mask="${line#*/}"
+				case "$mask" in ""|*[!0-9]*|0[0-9]*) echo "$line" >>"$badf"; continue ;; esac ;;
+		esac
+		if is_ipv4 "$base"; then
+			{ [ -n "$mask" ] && { [ "$mask" -lt 1 ] || [ "$mask" -gt 32 ]; }; } && { echo "$line" >>"$badf"; continue; }
+			is_private4 "$base" && { echo "$line" >>"$badf"; continue; }
+			echo "$line" >>"$v4f"
+		elif is_ipv6 "$base"; then
+			{ [ -n "$mask" ] && { [ "$mask" -lt 1 ] || [ "$mask" -gt 128 ]; }; } && { echo "$line" >>"$badf"; continue; }
+			is_local_addr "$base" && { echo "$line" >>"$badf"; continue; }
+			echo "$line" >>"$v6f"
+		else
+			echo "$line" >>"$badf"
+		fi
+	done
+	if [ -s "$badf" ]; then
+		msg=$(tr '\n' ',' < "$badf" | sed 's/,$//; s/[^A-Za-z0-9:.,/-]/?/g')
+		rm -f "$tmp" "$v4f" "$v6f" "$badf"
+		json_err "invalid line(s) — global IP/CIDR only, no private/bogon: $msg"
+	fi
+	# Serialize with the Lua UCI writers (add_nodes/update_subscriptions use
+	# the same lock dir): a parallel write would merge staged deltas. Wait
+	# briefly, then fail loudly — never race.
+	uci_lock_acquire || { rm -f "$tmp" "$v4f" "$v6f" "$badf"; json_err "uci lock busy — retry"; }
+	uci -q delete $CONF.control.$k4; uci -q delete $CONF.control.$k6
+	fail=0
+	while IFS= read -r line; do uci add_list $CONF.control.$k4="$line" 2>/dev/null || fail=1; done <"$v4f"
+	while IFS= read -r line; do uci add_list $CONF.control.$k6="$line" 2>/dev/null || fail=1; done <"$v6f"
+	rm -f "$tmp" "$v4f" "$v6f" "$badf"
+	if [ "$fail" = 1 ] || ! uci commit $CONF 2>/dev/null; then
+		uci_fail "uci write failed — nothing saved"
+	fi
+	uci_lock_release
+	do_restart || json_err "list saved but service restart failed"
+	json_ok '{"ok":true,"list":"'"$k4"'"}'
+	;;
+
 set_subscription_urls)
 	# Replace the subscription_url UCI list from a newline-separated
 	# body.  Two-pass: validate-all-then-save so a single bad line
@@ -432,11 +808,19 @@ set_subscription_urls)
 			https://*|http://*|sip008://*)
 				# Validate the authority host: a garbage host would only fail
 				# at fetch time, and a credentialed/odd authority should never
-				# be stored. Strip userinfo and :port / /path first.
+				# be stored. Reject backslashes outright (fetcher URL parsers
+				# disagree on them), normalize #/? out of the authority, then
+				# strip userinfo and :port / /path.
+				case "$line" in
+					*\\*) bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"; continue ;;
+				esac
 				local_h=${line#*://}; local_h=${local_h%%/*}
+				local_h=${local_h%%[?#]*}
 				local_h=${local_h##*@}
 				case "$local_h" in \[*\]*) local_h=${local_h#\[}; local_h=${local_h%%\]*} ;; *) local_h=${local_h%%:*} ;; esac
-				is_local_addr "$local_h" && bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"
+				{ is_local_addr "$local_h" || is_own_ip "$local_h" \
+					|| { is_ipv4 "$local_h" && is_private4 "$local_h"; }; } \
+					&& bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"
 				{ is_ipv4 "$local_h" || is_ipv6 "$local_h" || is_hostname "$local_h"; } \
 					|| bad="${bad:+$bad,}$(printf '%s' "$line" | sed 's/[^A-Za-z0-9._:/?=&%~-]/?/g')"
 				;;
@@ -447,28 +831,32 @@ set_subscription_urls)
 		rm -f "$tmp"
 		json_err "invalid URL(s): $bad (must start with http(s):// or sip008://)"
 	fi
+	uci_lock_acquire || { rm -f "$tmp"; json_err "uci lock busy — retry"; }
 	uci -q delete $CONF.subscription.subscription_url 2>/dev/null
-	cnt=0
+	cnt=0; fail=0
 	while IFS= read -r line || [ -n "$line" ]; do
 		line=$(printf '%s' "$line" | sed 's/^[ \t\r]*//;s/[ \t\r]*$//')
 		[ -z "$line" ] && continue
-		uci add_list $CONF.subscription.subscription_url="$line"
-		cnt=$((cnt+1))
+		if uci add_list $CONF.subscription.subscription_url="$line" 2>/dev/null; then
+			cnt=$((cnt+1))
+		else
+			fail=1
+		fi
 	done <"$tmp"
 	rm -f "$tmp"
-	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	[ "$fail" = 0 ] || uci_fail "uci write failed — nothing saved"
+	uci commit $CONF 2>/dev/null || uci_fail "uci commit failed"
+	uci_lock_release
 	json_ok "{\"ok\":true,\"count\":$cnt}"
 	;;
 
 set_dns)
 	# Set proxy DNS and China DNS servers.
 	# Body: two lines -- proxy_dns on line 1, china_dns on line 2.
-	# proxy_dns: IP or proto://host/path -- upstream for non-CN domains.
-	# Plain forms (bare IP, udp://, tcp://) detour via the proxy node as a
-	# '#<tag>' suffix; tls://https:// stay encrypted and carry the detour as
-	# '?proxy=<tag>' at the absolute tail, after any '#sni' (canonical
-	# '#sni?proxy=<tag>', meow >= 0.26.1).
-	# china_dns:  IP only (UDP, direct)
+	# Both accept the generator's full vocabulary: keyword (wan/local/...),
+	# bare IP or hostname (UDP direct), or proto://host[:port][/path][#tag].
+	# Plain forms detour via the proxy node as a '#<tag>' suffix; tls://
+	# https:// stay encrypted ('#sni' for SNI, generator adds ?proxy=<tag>).
 	require_body_size
 	tmp=$(mktemp 2>/dev/null) || tmp="$RUN_DIR/.dns.$$"
 	read_body >"$tmp"
@@ -478,53 +866,13 @@ set_dns)
 	proxy_dns=$(printf '%s' "$proxy_dns" | sed 's/^[ \t]*//;s/[ \t]*$//')
 	china_dns=$(printf '%s' "$china_dns" | sed 's/^[ \t]*//;s/[ \t]*$//')
 	rm -f "$tmp"
-	# Validate proxy_dns strictly (H2): anything stored here is rendered into
-	# meow's dns.nameserver list, where a bad value makes `meow -t` fail and
-	# the service never comes back up. Accept a bare IP (UDP) or a
-	# proto://host[:port][/path] with a proto meow understands (spec 0.3:
-	# udp/tcp/tls/https -- quic/h3 were kernel-specific and dropped). rcode://
-	# is excluded on purpose: it only exists as a dns_server section type, and
-	# stored here plain_dns_url would silently swap it for wan DNS.
-	case "$proxy_dns" in
-		"") json_err "proxy DNS is required" ;;
-		*://*)
-			proto=${proxy_dns%%://*}
-			case "$proto" in udp|tcp|tls|https) : ;; *) json_err "unsupported DNS protocol: $proto" ;; esac
-			dha=${proxy_dns#*://}; dha=${dha%%/*}
-			# Split host/port: bracketed IPv6 may carry :port after ']';
-			# unbracketed multi-colon is unparseable -> reject.
-			case "$dha" in
-				\[*\]*) dh=${dha#\[}; dh=${dh%%\]*}; dport=${dha#*\]}; dport=${dport#:} ;;
-				*:*:*) json_err "IPv6 DNS host must be [bracketed]: $dha" ;;
-				*:*)   dh=${dha%%:*}; dport=${dha##*:} ;;
-				*)     dh=$dha; dport= ;;
-			esac
-			case "$dport" in
-				"") : ;;
-				*[!0-9]*) json_err "bad DNS port: $dport" ;;
-				*) [ "$dport" -ge 1 ] && [ "$dport" -le 65535 ] 2>/dev/null || json_err "bad DNS port: $dport" ;;
-			esac
-			is_local_addr "$dh" && json_err "DNS host must not be loopback/link-local: $dh"
-			is_ipv4 "$dh" || is_ipv6 "$dh" || is_hostname "$dh" \
-				|| json_err "bad DNS host: $dh"
-			;;
-		*)
-			is_local_addr "$proxy_dns" && json_err "DNS server must not be loopback/link-local: $proxy_dns"
-			is_ipv4 "$proxy_dns" || is_ipv6 "$proxy_dns" \
-				|| json_err "proxy DNS must be an IP or proto:// URL (got: $proxy_dns)"
-			;;
-	esac
-	# Validate china_dns: must be a plain IP address (UDP, direct)
-	case "$china_dns" in
-		"") json_err "china DNS is required" ;;
-		*)
-			is_local_addr "$china_dns" && json_err "china DNS must not be loopback/link-local: $china_dns"
-			is_ipv4 "$china_dns" || is_ipv6 "$china_dns" \
-				|| json_err "china DNS must be an IP address (got: $china_dns)" ;;
-	esac
-	uci set $CONF.config.dns_server="$proxy_dns" 2>/dev/null || json_err "uci set failed"
-	uci set $CONF.config.china_dns_server="$china_dns" 2>/dev/null || json_err "uci set failed"
-	uci commit $CONF 2>/dev/null || json_err "uci commit failed"
+	valid_dns_server "$proxy_dns"
+	valid_dns_server "$china_dns"
+	uci_lock_acquire || json_err "uci lock busy — retry"
+	uci set $CONF.config.dns_server="$proxy_dns" 2>/dev/null || uci_fail "uci set failed"
+	uci set $CONF.config.china_dns_server="$china_dns" 2>/dev/null || uci_fail "uci set failed"
+	uci commit $CONF 2>/dev/null || uci_fail "uci commit failed"
+	uci_lock_release
 	do_restart || json_err "config saved but service restart failed"
 	json_ok "{\"ok\":true,\"proxy_dns\":\"$(jesc "$proxy_dns")\",\"china_dns\":\"$(jesc "$china_dns")\"}"
 	;;
@@ -648,9 +996,16 @@ subscribe)
 	# Run the node-name migration first (same ordering as CLI/cron): without
 	# it, an update fired between a package upgrade and the first service
 	# start treats old-style node sections as foreign and rebuilds them,
-	# losing the selected main_node.
-	if HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/migrate_config.lua" >>"$tmp" 2>&1 \
-		&& HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/update_subscriptions.lua" >>"$tmp" 2>&1; then
+	# losing the selected main_node. migrate commits UCI, so it must hold
+	# the shared writer lock; if the lock stays busy a writer is mid-flight
+	# and the migration is skipped — it is idempotent defaults cleanup.
+	if uci_lock_acquire; then
+		HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/migrate_config.lua" >>"$tmp" 2>&1
+		uci_lock_release
+	else
+		echo "migrate skipped: uci lock busy" >>"$tmp"
+	fi
+	if HP_LUAPATH="$HP_LIB_DIR" lua "$HP_LIB_DIR/update_subscriptions.lua" >>"$tmp" 2>&1; then
 		tail -n 20 "$tmp" 2>/dev/null > "$tmp.short"
 		hdr 'Content-Type: application/json'
 		printf '{"ok":true,"output":"%s"}\n' "$(jesc "$(cat "$tmp.short" 2>/dev/null)")"
@@ -684,7 +1039,7 @@ $(tail -n "$n" "$LOG_PATH" 2>/dev/null)"
 	;;
 
 ""|help)
-	text_out "HomeProxy API. actions: state status config settings set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_subscription_urls set_dns add_node ping_node ping_nodes ping_all connectivity subscribe restart log"
+	text_out "HomeProxy API. actions: state status config settings set_main_node set_routing_mode set_lan_proxy get_domain_lists set_direct_list set_proxy_list set_direct_ips set_proxy_ips set_subscription_urls set_dns add_node ping_node ping_nodes ping_all connectivity subscribe restart log"
 	;;
 
 *)

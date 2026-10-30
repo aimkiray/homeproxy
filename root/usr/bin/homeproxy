@@ -41,8 +41,54 @@ HP_DIR=/etc/homeproxy
 RUN_DIR=/var/run/homeproxy
 LOG_PATH=$RUN_DIR/$CONF.log
 
-die() { echo "homeproxy: $*" >&2; exit 1; }
-uci_set() { uci set "$CONF.$1=$2" 2>/dev/null && uci commit "$CONF"; }
+# Shared UCI writer lock — the same lockdir/protocol as cgi-bin/api,
+# init.d, update_subscriptions.lua, add_nodes.lua and update_crond.sh.
+# Staged deltas are global per-package: an unlocked CLI write could be
+# flushed by another holder's commit (or wiped by its revert). Stale
+# detection is pid-liveness first (long subscription holds are legitimate);
+# a pid-less lock falls back to the >120s mtime rule.
+HP_LOCK_HELD=0
+LK_DIR="$RUN_DIR/uci-write.lock.d"
+uci_lock_acquire() {
+    [ "$HP_LOCK_HELD" = "1" ] && return 0
+    mkdir -p "$RUN_DIR" 2>/dev/null
+    local i=0 p mt
+    while ! mkdir "$LK_DIR" 2>/dev/null; do
+        p=$(cat "$LK_DIR/pid" 2>/dev/null)
+        case "$p" in ''|*[!0-9]*) p= ;; esac
+        if [ -n "$p" ]; then
+            kill -0 "$p" 2>/dev/null || { rm -f "$LK_DIR/pid"; rmdir "$LK_DIR" 2>/dev/null; }
+        else
+            mt=$(stat -c %Y "$LK_DIR" 2>/dev/null) || mt=0
+            [ "${mt:-0}" -gt 0 ] && [ $(($(date +%s) - mt)) -gt 120 ] && rmdir "$LK_DIR" 2>/dev/null
+        fi
+        i=$((i + 1)); [ "$i" -ge 15 ] && return 1
+        sleep 1
+    done
+    echo $$ >"$LK_DIR/pid" 2>/dev/null
+    HP_LOCK_HELD=1
+    return 0
+}
+uci_lock_release() {
+    [ "$HP_LOCK_HELD" = "1" ] || return 0
+    HP_LOCK_HELD=0
+    rm -f "$LK_DIR/pid"; rmdir "$LK_DIR" 2>/dev/null
+}
+die() {
+    # Held-lock death must not leak our half-staged delta into the next
+    # writer's commit — revert ours, then release.
+    [ "$HP_LOCK_HELD" = "1" ] && uci -q revert "$CONF" 2>/dev/null
+    uci_lock_release
+    echo "homeproxy: $*" >&2; exit 1
+}
+uci_set() {
+    uci_lock_acquire || { echo "homeproxy: uci lock busy -- retry" >&2; return 1; }
+    uci set "$CONF.$1=$2" 2>/dev/null && uci commit "$CONF"
+    local rc=$?
+    [ "$rc" = "0" ] || uci -q revert "$CONF" 2>/dev/null
+    uci_lock_release
+    return "$rc"
+}
 uci_get() { uci -q get "$CONF.$1" 2>/dev/null; }
 
 # uci truth-table (same vocabulary as init.d's config_get_bool / install.sh
@@ -267,6 +313,9 @@ cmd_add() {
     case "$port" in ''|*[!0-9]*) die "invalid port: $port" ;; esac
     [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "port out of range: $port"
     name="$(printf '%s' "$label" | md5sum | cut -c1-32)"
+    # Multi-statement staging (delete/upsert + N sets + commit) is only
+    # atomic under the shared writer lock; die() reverts+releases on bail.
+    uci_lock_acquire || die "uci lock busy -- retry"
     if uci -q get "$CONF.$name" >/dev/null 2>&1; then
         # Upsert (same semantics as `homeproxy import`): wipe the old options
         # first so switching node type can't leave stale fields behind (e.g.
@@ -291,6 +340,7 @@ cmd_add() {
         esac
     done
     uci commit "$CONF" || die "commit failed"
+    uci_lock_release
     echo "Added node '$label' as section $name. Run 'homeproxy generate' then restart."
 }
 
@@ -309,8 +359,10 @@ cmd_del() {
         *)
             echo "warning: $1 is still referenced by $ref" >&2 ;;
     esac
+    uci_lock_acquire || die "uci lock busy -- retry"
     uci delete "$CONF.$1" 2>/dev/null || die "delete failed: $1"
     uci commit "$CONF" || die "commit failed"
+    uci_lock_release
     echo "Deleted node $1."
 }
 
@@ -402,7 +454,14 @@ firewall-stop)
     ;;
 generate)
     mkdir -p "$RUN_DIR"
-    lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
+    # migrate commits UCI — run it under the shared writer lock like init.d
+    # and the CGI do; a busy lock skips it (idempotent, next run retries).
+    if uci_lock_acquire; then
+        lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
+        uci_lock_release
+    else
+        echo "homeproxy: migrate skipped (uci writer lock busy)" >&2
+    fi
     gen_c=0; gen_s=0; cprev=0; sprev=0
     # In custom routing mode the client config is needed even with main_node
     # unset: routing rules point at nodes directly.
@@ -509,11 +568,25 @@ check)
     fi
     exit "$rc"
     ;;
-migrate) lua "$LUA_DIR/migrate_config.lua" && echo "Migration applied." ;;
+migrate)
+    uci_lock_acquire || die "uci lock busy -- retry"
+    lua "$LUA_DIR/migrate_config.lua"; rc=$?
+    uci_lock_release
+    [ "$rc" = "0" ] && echo "Migration applied." || die "migrate failed"
+    ;;
 # Run the node-name migration first: an update fired between a package
 # upgrade and the first service start would otherwise see only old-style
 # section names and rebuild every node (losing the selected main_node).
-subscribe) lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"; lua "$LUA_DIR/update_subscriptions.lua" ;;
+# migrate commits UCI -> hold the shared writer lock; the updater below
+# acquires the same lock itself, so release before invoking it.
+subscribe)
+    if uci_lock_acquire; then
+        lua "$LUA_DIR/migrate_config.lua" || die "migrate failed"
+        uci_lock_release
+    else
+        echo "homeproxy: migrate skipped (uci writer lock busy)" >&2
+    fi
+    lua "$LUA_DIR/update_subscriptions.lua" ;;
 update-resources)
     shift
     if [ -z "${1:-}" ] || [ "${1:-}" = "all" ]; then

@@ -24,19 +24,52 @@ local uci       = require("uci").cursor(os.getenv("HP_CONFDIR") or "/etc/config"
 local CFG = "homeproxy"
 local UCINODE = "node"
 
--- Serialize UCI writes against update_subscriptions.lua (same lock dir):
--- two processes staging+committing the same package could interleave
--- /tmp/.uci delta writes.  Manual import is quick; wait briefly, then fail
--- loudly rather than racing or blocking a subscription run for ages.
+-- Serialize UCI writes against update_subscriptions.lua (same lock dir +
+-- same pid-liveness protocol as cgi-bin/api / init.d / the CLI): a live
+-- holder may hold past 120s, so stale detection checks the holder's pid
+-- first; a dead pid is reclaimed at once, a pid-less lock falls back to
+-- the >120s mtime rule.
 local lock_dir = hp.RUN_DIR .. "/uci-write.lock.d"
 local lock_held = false
 hp.mkdir_p(hp.RUN_DIR)
-for _ = 1, 10 do
+local function self_pid()
+	local f = io.open("/proc/self/status")
+	if not f then return nil end
+	local s = f:read("*a"); f:close()
+	return s and s:match("Pid:%s*(%d+)")
+end
+local function lock_is_live()
+	local pf = io.open(lock_dir .. "/pid")
+	local pid = pf and tonumber((pf:read("*a") or ""):match("%d+"))
+	if pf then pf:close() end
+	if pid then
+		if os.execute("kill -0 " .. pid .. " 2>/dev/null") == 0 then
+			return true
+		end
+		os.execute("rm -f " .. hp.shellQuote(lock_dir .. "/pid"))
+		os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+		return false
+	end
+	local h = io.popen("stat -c %Y " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+	local mt = h and tonumber(hp.trim(h:read("*a") or "")) or nil
+	if h then h:close() end
+	if mt == nil then return true end
+	local age = os.time() - mt
+	if age < 120 then return true end  -- negative age counts as live
+	os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
+	return false
+end
+for _ = 1, 15 do
 	if os.execute("mkdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null") == 0 then
+		local pid = self_pid()
+		if pid then
+			local f = io.open(lock_dir .. "/pid", "w")
+			if f then f:write(tostring(pid)); f:close() end
+		end
 		lock_held = true
 		break
 	end
-	os.execute("sleep 1")
+	if lock_is_live() then os.execute("sleep 1") end
 end
 if not lock_held then
 	io.write(hp.encode_json({ ok = false, error = "another update is in progress",
@@ -47,12 +80,11 @@ end
 
 local function release_lock()
 	if lock_held then
+		os.execute("rm -f " .. hp.shellQuote(lock_dir .. "/pid"))
 		os.execute("rmdir " .. hp.shellQuote(lock_dir) .. " 2>/dev/null")
 		lock_held = false
 	end
 end
-
-uci:load(CFG)
 
 -- Reuse the subscription meow feature cache when present (written by
 -- update_subscriptions.lua, keyed by path + `meow --version` + mtime).
@@ -122,6 +154,12 @@ local function detect_features()
 	}
 end
 
+local added, skipped, rejected = {}, {}, {}
+-- Everything that can hard-error sits inside the pcall: a death between
+-- acquire and here would otherwise leak the lock (stale reclaim would
+-- cover it eventually, but instantly is better) and leave staged deltas.
+local ok_run, run_err = pcall(function()
+uci:load(CFG)
 local parser_opts = {
 	log = function() end,
 	features = detect_features(),
@@ -136,8 +174,6 @@ else
 	input = io.read("*a") or ""
 end
 
-local added, skipped, rejected = {}, {}, {}
-local ok_run, run_err = pcall(function()
 for line in input:gmatch("[^\r\n]+") do
 	line = hp.trim(line)
 	if line ~= "" then

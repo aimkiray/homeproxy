@@ -99,7 +99,27 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
    <textarea id="proxyList" rows="5" placeholder="one domain per line (e.g. google.com)"></textarea>
    <button id="applyProxy" class="ghost">Apply</button>
   </div>
-  <div class="sub" style="margin-top:8px">Direct = always bypass proxy · Proxy = always through proxy. Restart regenerates dnsmasq rules.</div>
+  <h2 style="margin-top:16px">IP lists</h2>
+  <div class="row" style="align-items:flex-start">
+   <label>Direct IPs</label>
+   <textarea id="directIps" rows="4" placeholder="one IP/CIDR per line (e.g. 1.2.3.4, 91.108.0.0/16, 2001:db8::/32)"></textarea>
+   <button id="applyDirectIps" class="ghost">Apply</button>
+  </div>
+  <div class="row" style="align-items:flex-start;margin-top:10px">
+   <label>Proxy IPs</label>
+   <textarea id="proxyIps" rows="4" placeholder="one IP/CIDR per line"></textarea>
+   <button id="applyProxyIps" class="ghost">Apply</button>
+  </div>
+  <div class="row" style="align-items:flex-start;margin-top:10px">
+   <label>Dynamic</label>
+   <div style="flex:1">
+    <div class="sub">Direct set (subscription-seeded / DNS-learned)</div>
+    <textarea id="seededDirect" rows="3" readonly placeholder="(none yet — populated at runtime)" style="width:100%;box-sizing:border-box"></textarea>
+    <div class="sub" style="margin-top:6px">Proxy set (DNS-learned)</div>
+    <textarea id="seededProxy" rows="3" readonly placeholder="(none yet — populated at runtime)" style="width:100%;box-sizing:border-box"></textarea>
+   </div>
+  </div>
+  <div class="sub" style="margin-top:8px">Direct = bypass proxy · Proxy = through proxy (proxy wins if an IP appears in both) · IP lists → UCI wan_direct/wan_proxy ipsets (global addresses only) · Dynamic = live members added at runtime (subscription seeds, dnsmasq-learned) — read-only, and cleared on every restart until re-learned. Saving restarts the proxy stack.</div>
  </div>
 
  <div class="card">
@@ -129,11 +149,11 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
     <option value="8.8.8.8">Google DNS (8.8.8.8)</option>
     <option value="1.1.1.1">Cloudflare DNS (1.1.1.1)</option>
     <option value="9.9.9.9">Quad9 DNS (9.9.9.9)</option>
-    <option value="https://dns.adguard-dns.com/dns-query">AdGuard DoH → UDP</option>
-    <option value="https://dns.cloudflare.com/dns-query">Cloudflare DoH (host) → UDP</option>
-    <option value="https://dns.google/dns-query">Google DoH (host) → UDP</option>
+    <option value="https://dns.adguard-dns.com/dns-query">AdGuard DoH</option>
+    <option value="https://dns.cloudflare.com/dns-query">Cloudflare DoH</option>
+    <option value="https://dns.google/dns-query">Google DoH</option>
    </select>
-   <input id="proxyDns" placeholder="IP or URL (https:// degrades to udp://)">
+   <input id="proxyDns" placeholder="IP, udp://|tcp://|tls://|https:// URL, or 'wan'">
   </div>
   <div class="row">
    <label>China DNS</label>
@@ -150,7 +170,7 @@ pre{background:#0d0f12;border:1px solid var(--bd);border-radius:7px;padding:12px
   <div class="row" style="margin-top:8px">
    <button id="applyDns" class="ghost">Apply</button>
   </div>
-  <div class="sub" style="margin-top:8px">Proxy DNS = plain UDP/TCP to the configured address for non-CN domains, queries detour via the proxy node; https:// and tls:// are downgraded to udp://host. China DNS = UDP direct (CN domains). Apply restarts the proxy. Unused in custom mode (dns_server sections apply).</div>
+  <div class="sub" style="margin-top:8px">Proxy DNS = upstream for non-CN domains, queries detour via the proxy node; bare IP/udp:// detour as UDP, tls:///https:// stay encrypted (DoT/DoH). 'wan' uses the WAN-provided resolver. China DNS = UDP direct (CN domains). Apply restarts the proxy. Unused in custom mode (dns_server sections apply).</div>
  </div>
 
  <div class="card">
@@ -287,9 +307,11 @@ async function applyLanProxy(){
  if(busy.applyLanProxy)return;const v=$('lanproxy').value;setBusy('applyLanProxy',true);
  try{const r=await apiJson('set_lan_proxy',{method:'POST',body:v});toast(r.ok?'LAN proxy set':('failed: '+(r.error||'')));await refresh()}catch(e){toast('set failed: '+e.message)}finally{setBusy('applyLanProxy',false)}
 }
-async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||''}catch(e){toast('domain lists: '+e.message)}}
+async function loadDomainLists(){try{const r=await apiJson('get_domain_lists');$('directList').value=r.direct||'';$('proxyList').value=r.proxy||'';$('directIps').value=r.direct_ips||'';$('proxyIps').value=r.proxy_ips||'';$('seededDirect').value=r.seeded_direct||'';$('seededProxy').value=r.seeded_proxy||''}catch(e){toast('domain lists: '+e.message)}}
 async function applyDirectList(){if(busy.applyDirect)return;const v=$('directList').value;setBusy('applyDirect',true);try{const r=await apiJson('set_direct_list',{method:'POST',body:v});toast(r.ok?'Direct list saved':('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirect',false)}}
 async function applyProxyList(){if(busy.applyProxy)return;const v=$('proxyList').value;setBusy('applyProxy',true);try{const r=await apiJson('set_proxy_list',{method:'POST',body:v});toast(r.ok?'Proxy list saved':('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxy',false)}}
+async function applyDirectIps(){if(busy.applyDirectIps)return;const v=$('directIps').value;setBusy('applyDirectIps',true);try{const r=await apiJson('set_direct_ips',{method:'POST',body:v});toast(r.ok?'Direct IPs saved':('failed: '+(r.error||'')));if(r.ok)setTimeout(refresh,3000)}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyDirectIps',false)}}
+async function applyProxyIps(){if(busy.applyProxyIps)return;const v=$('proxyIps').value;setBusy('applyProxyIps',true);try{const r=await apiJson('set_proxy_ips',{method:'POST',body:v});toast(r.ok?'Proxy IPs saved':('failed: '+(r.error||'')));if(r.ok)setTimeout(refresh,3000)}catch(e){toast('save failed: '+e.message)}finally{setBusy('applyProxyIps',false)}}
 async function applySubUrls(){if(busy.applySubUrls)return;const v=$('subUrls').value;setBusy('applySubUrls',true);try{const r=await apiJson('set_subscription_urls',{method:'POST',body:v});toast(r.ok?('Saved '+r.count+' URL(s)'):('failed: '+(r.error||'')))}catch(e){toast('save failed: '+e.message)}finally{setBusy('applySubUrls',false)}}
 async function applyNodeLinks(){if(busy.applyNodeLinks)return;const v=$('nodeLinks').value.trim();if(!v){toast('paste at least one share link');return}setBusy('applyNodeLinks',true);try{const r=await apiJson('add_node',{method:'POST',body:v});if(r.ok){const n=(r.added||[]).length,s=(r.skipped||[]).length;toast('Added '+n+' node(s)'+(s?(', skipped '+s+' unparsed'):''));if(n){$('nodeLinks').value='';await refresh()}if(s&&r.skipped)console.log('skipped:',r.skipped)}else toast('add failed: '+(r.error||''))}catch(e){toast('add failed: '+e.message)}finally{setBusy('applyNodeLinks',false)}}
 async function applyDns(){
@@ -321,6 +343,8 @@ $('applyMode').onclick=applyMode;
 $('applyLanProxy').onclick=applyLanProxy;
 $('applyDirect').onclick=applyDirectList;
 $('applyProxy').onclick=applyProxyList;
+$('applyDirectIps').onclick=applyDirectIps;
+$('applyProxyIps').onclick=applyProxyIps;
 $('applySubUrls').onclick=applySubUrls;
 $('applyNodeLinks').onclick=applyNodeLinks;
 $('applyDns').onclick=applyDns;
