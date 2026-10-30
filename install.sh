@@ -486,12 +486,42 @@ uci -q set firewall.homeproxy.enabled=1
 uci -q commit firewall
 
 # -- migrate + start ---------------------------------------------------------
-log "running config migration..."
-HP_LUAPATH="$LIB" lua "$LIB/migrate_config.lua" >>"$LOG" 2>&1 || log "WARN: migration rc=$?"
-
-log "starting services..."
+# Stop first so init.d can't race the migration, then run it under the same
+# shared UCI writer lock the cgi/updater/CLI/cron use -- a cron-triggered
+# subscription run can still be holding a staged delta right now.
+log "stopping services for migration..."
 /etc/init.d/homeproxy stop 2>/dev/null
 /etc/init.d/homeproxy-web stop 2>/dev/null
+
+log "running config migration..."
+_RUN_DIR=/var/run/homeproxy
+_LK_DIR="$_RUN_DIR/uci-write.lock.d"
+mkdir -p "$_RUN_DIR" 2>/dev/null
+_held=0; _i=0
+while [ "$_i" -lt 15 ]; do
+    if mkdir "$_LK_DIR" 2>/dev/null; then
+        echo $$ >"$_LK_DIR/pid" 2>/dev/null
+        _held=1; break
+    fi
+    _p=$(cat "$_LK_DIR/pid" 2>/dev/null)
+    case "$_p" in ''|*[!0-9]*) _p= ;; esac
+    if [ -n "$_p" ]; then
+        kill -0 "$_p" 2>/dev/null || { rm -f "$_LK_DIR/pid"; rmdir "$_LK_DIR" 2>/dev/null; }
+    else
+        _mt=$(stat -c %Y "$_LK_DIR" 2>/dev/null) || _mt=0
+        [ "${_mt:-0}" -gt 0 ] && [ $(($(date +%s) - _mt)) -gt 120 ] && rmdir "$_LK_DIR" 2>/dev/null
+    fi
+    _i=$((_i + 1))
+    sleep 1
+done
+if [ "$_held" = 1 ]; then
+    HP_LUAPATH="$LIB" lua "$LIB/migrate_config.lua" >>"$LOG" 2>&1 || log "WARN: migration rc=$?"
+    rm -f "$_LK_DIR/pid"; rmdir "$_LK_DIR" 2>/dev/null
+else
+    log "WARN: uci lock busy -- skipped migration (init.d retries on start)"
+fi
+
+log "starting services..."
 /etc/init.d/homeproxy start >>"$LOG" 2>&1
 /etc/init.d/homeproxy-web start >>"$LOG" 2>&1
 
