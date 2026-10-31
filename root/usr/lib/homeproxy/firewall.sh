@@ -55,6 +55,7 @@ common_port=$(uci_get "infra.common_port");     common_port=${common_port:-22,53
 
 lan_proxy_mode=$(uci_get "control.lan_proxy_mode"); lan_proxy_mode=${lan_proxy_mode:-disabled}
 dns_redirect=$(uci_get "infra.dns_redirect"); dns_redirect=${dns_redirect:-1}
+ntp_redirect=$(uci_get "infra.ntp_redirect"); ntp_redirect=${ntp_redirect:-1}
 
 # LAN interface + subnet
 # Interfaces to steer: control.listen_interfaces (UCI list) takes priority,
@@ -129,7 +130,7 @@ IP6=ip6tables
 # All chains we may have created -- including ones only older revisions emit
 # (homeproxy_tun*/homeproxy_mangle_out/_mark from the removed TUN and
 # TCP-TPROXY arms) -- so stop_fw can flush+delete them unconditionally.
-ALL_CHAINS_NAT="homeproxy_dns homeproxy_redir homeproxy_redir_port homeproxy_redir_act homeproxy_redir_lanac"
+ALL_CHAINS_NAT="homeproxy_dns homeproxy_ntp homeproxy_redir homeproxy_redir_port homeproxy_redir_act homeproxy_redir_lanac"
 ALL_CHAINS_MANGLE="homeproxy_mangle homeproxy_mangle_port homeproxy_mangle_act homeproxy_mangle_lanac homeproxy_mangle_mark homeproxy_mangle_out homeproxy_tun homeproxy_tun_mark homeproxy_tun_lanac"
 ALL_IPSETS="homeproxy_cn4 homeproxy_cn6 homeproxy_gfw4 homeproxy_gfw6 homeproxy_wan_proxy4 homeproxy_wan_proxy6 homeproxy_wan_direct4 homeproxy_wan_direct6"
 
@@ -213,7 +214,63 @@ stop_fw() {
 	while ip -6 rule del fwmark "$tproxy_mark" table "$table_mark" 2>/dev/null; do :; done
 	ip route flush table "$table_mark" 2>/dev/null
 	ip -6 route flush table "$table_mark" 2>/dev/null
+	ntp_responder_stop
 	cleanup_legacy_tun
+}
+
+# --- LAN NTP (udp/123) ----------------------------------------------------
+# LAN clients NTPing foreign servers would otherwise have their UDP
+# blackholed (GFW drop or -- on Qualcomm NSS/ECM builds -- the UDP-TPROXY
+# attach being stripped on the bridge pass-up path). The homeproxy_ntp nat
+# arm REDIRECTs such queries to a tiny local responder, and conntrack maps
+# the reply source back onto the queried server, so clients see a normal
+# NTP response stamped with the router's vendor-synced clock. LAN-local
+# NTP stays reachable: emit_local returns private/local destinations first,
+# and the mangle gate exempts :123 from UDP TPROXY so this arm is the sole
+# handler. Only installed while a responder socket can actually own :123 --
+# on failure the arm is skipped (fail-open: NTP keeps its old direct path).
+NTP_RESP_LUA="$(dirname "$0")/ntp_responder.lua"
+NTP_RESP_PID="$RUN_DIR/ntp_responder.pid"
+
+ntp_responder_stop() {
+	if [ -f "$NTP_RESP_PID" ]; then
+		kill "$(cat "$NTP_RESP_PID" 2>/dev/null)" 2>/dev/null
+		rm -f "$NTP_RESP_PID"
+	fi
+	local _p
+	for _p in $(pgrep -f ntp_responder.lua 2>/dev/null); do kill "$_p" 2>/dev/null; done
+	return 0
+}
+
+# Start the responder supervisor unless a wildcard v4 socket already owns
+# udp/123 (an existing listener serves the arm just as well). rc: 0 when
+# some responder is guaranteed bound, 1 when the arm must not install.
+ntp_responder_start() {
+	ntp_responder_stop
+	# A non-loopback socket already owning udp/123 serves the arm just as
+	# well (a 127.0.0.1-bound one cannot see redirected LAN traffic).
+	awk 'NR>1 && $2 ~ /:007B$/ && $2 != "0100007F:007B" {f=1} END{exit !f}' \
+		/proc/net/udp 2>/dev/null && return 0
+	if [ ! -f "$NTP_RESP_LUA" ] || ! lua -e 'require("socket")' >/dev/null 2>&1; then
+		return 1
+	fi
+	mkdir -p "$RUN_DIR" 2>/dev/null
+	# Fully detached: without the outer redirect the subshell inherits our
+	# stdout/stderr and every invoking session (ssh, uci-cgi, procd) hangs
+	# on close waiting for the daemon to release the pipe.
+	( while :; do lua "$NTP_RESP_LUA" "$lan_ip" >/dev/null 2>&1; sleep 1; done ) >/dev/null 2>&1 </dev/null &
+	echo $! > "$NTP_RESP_PID"
+	sleep 1
+	# The responder's own wildcard bind is the proof of life.
+	awk 'NR>1 && $2 ~ /:007B$/ {f=1} END{exit !f}' /proc/net/udp 2>/dev/null
+}
+
+apply_ntp() {
+	local ip="$1"
+	$ip -t nat -N homeproxy_ntp 2>/dev/null || $ip -t nat -F homeproxy_ntp
+	emit_local "$ip" nat homeproxy_ntp
+	$ip -t nat -A homeproxy_ntp -p udp --dport 123 -j REDIRECT --to-ports 123 2>/dev/null
+	hook_prerouting "$ip" nat "-p udp --dport 123" homeproxy_ntp
 }
 
 # --- filter-table accepts (mirror upstream firewall_pre.uc) -------------
@@ -546,6 +603,10 @@ emit_gate() {
 	$ip -t "$tbl" -A "$ch" -m mark --mark "$self_mark" -j RETURN 2>/dev/null
 	# do not steer DNS over UDP here -- the nat-table homeproxy_dns handles it.
 	[ "$tbl" = "mangle" ] && $ip -t "$tbl" -A "$ch" -p udp --dport 53 -j RETURN 2>/dev/null
+	# NTP likewise: while the homeproxy_ntp arm owns :123, tproxying it would
+	# deliver a REDIRECT-rewritten orig-dst (rejected as unsafe) anyway.
+	[ "$tbl" = "mangle" ] && [ "$ntp_arm" = "1" ] && \
+		$ip -t "$tbl" -A "$ch" -p udp --dport 123 -j RETURN 2>/dev/null
 	if [ "$lan_proxy_mode" = "listed_only" ]; then
 		local src_list d
 		if [ "$ip" = "$IP6" ]; then src_list=$(list_ipv6); else src_list=$(list_ipv4); fi
@@ -663,6 +724,15 @@ apply_tcp() {
 # so ip6tables never gets a mangle rule (v6 UDP/QUIC stays direct).
 apply_tproxy() {
 	local ip="$1" rset="$2"
+	# Qualcomm NSS/PPE ECM acceleration strips the TPROXY socket attach on
+	# the bridge pass-up path (attach succeeds at the target, packets never
+	# reach the listener) -- every steered UDP flow silently blackholes on
+	# stock MiWiFi images. No selective ECM exemption exists; warn loudly so
+	# the dead arm is at least visible (remedy: stop qca-nss-ecm, at the
+	# cost of hardware forwarding acceleration).
+	if [ -d /sys/module/ecm ]; then
+		echo "homeproxy: WARNING: qca-nss-ecm hardware acceleration is loaded -- it breaks UDP TPROXY delivery on this platform; steered UDP may be dead (LAN NTP is unaffected via homeproxy_ntp)." >&2
+	fi
 	$ip -t mangle -N homeproxy_mangle_act 2>/dev/null || $ip -t mangle -F homeproxy_mangle_act
 	$ip -t mangle -A homeproxy_mangle_act -p udp -j TPROXY --on-ip 0.0.0.0 --on-port "$redirect_port" --tproxy-mark "$tproxy_mark/0xffffffff"
 	$ip -t mangle -N homeproxy_mangle_port 2>/dev/null || $ip -t mangle -F homeproxy_mangle_port
@@ -704,6 +774,20 @@ udp_arm=0
 case "$proxy_mode" in
 	tproxy|redirect_tproxy) [ "$udp_want" = "1" ] && udp_arm=1 ;;
 esac
+
+# LAN NTP arm -- a purely local service, independent of the outbound arms.
+# Decided BEFORE apply_tproxy runs so emit_gate can exempt udp/123 from the
+# TPROXY chain only when the nat arm is really installed (ntp_arm feeds the
+# gate under `set -u`, so it must always be initialized).
+ntp_arm=0
+if [ "$ntp_redirect" = "1" ]; then
+	if ntp_responder_start; then
+		apply_ntp "$IP4"
+		ntp_arm=1
+	else
+		echo "homeproxy: WARNING: ntp_redirect=1 but no responder could own udp/123 (lua/luasocket missing?) -- LAN NTP keeps its direct path." >&2
+	fi
+fi
 
 # Takeover arms run only with a real outbound; server-only already warned.
 if [ "$outbound_node" != "nil" ]; then

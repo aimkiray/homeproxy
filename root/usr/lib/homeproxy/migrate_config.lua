@@ -57,6 +57,9 @@ if uci:get_all(CFG, "infra") then
     ensure("infra", "tproxy_mark", "101")
     ensure("infra", "table_mark", "100")
     ensure("infra", "ntp_server", "nil")
+    -- LAN NTP hijack: answer client udp/123 locally (firewall.sh homeproxy_ntp
+    -- arm) instead of letting foreign-NTP queries die on the UDP path.
+    ensure("infra", "ntp_redirect", "1")
     -- G0 opt-out: watchdog enabled by default (spec-recovery-hardening 7.1)
     ensure("infra", "watchdog", "1")
     -- udp_timeout feeds listeners[].udp-timeout (integer seconds). Accept

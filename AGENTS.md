@@ -13,7 +13,8 @@ Target environment verified on a Xiaomi router (OpenWrt 18.06 base, kernel 5.4, 
   - `migrate_config.lua` — idempotent defaults/deprecated-option cleanup.
   - `update_subscriptions.lua` — fetch subscriptions, detect meow features (cached in `meow-features.json`), write nodes to UCI; delegates protocol parsing to `subscription_parser.lua`.
   - `subscription_parser.lua` — pure share-link/SIP008 parser, node normalizer, subscription body decoder, and filter matcher; no UCI/service/IO dependencies.
-  - `firewall.sh` — iptables+ipset rules (TCP redirect, UDP tproxy, DNS hijack, CN bypass).
+  - `firewall.sh` — iptables+ipset rules (TCP redirect, UDP tproxy, DNS hijack, CN bypass) plus the LAN NTP hijack (nat REDIRECT udp/123 -> local responder, gated on `infra.ntp_redirect`). NOTE: Qualcomm NSS/PPE ECM (`/sys/module/ecm`) strips the UDP-TPROXY socket attach on the bridge pass-up path — all steered UDP silently blackholes on stock MiWiFi images; no selective exemption exists. The script warns when ECM is loaded; NTP is unaffected (it uses REDIRECT, not TPROXY).
+  - `ntp_responder.lua` — minimal LAN NTP server (LuaSocket, spawned/supervised by firewall.sh) answering redirected udp/123 from the router's clock.
 - `root/usr/bin/homeproxy` — CLI (`start/stop/generate/subscribe/nodes/add/set/...`).
 - `root/etc/init.d/homeproxy` — procd service: runs lua generators, `meow -t` validates configs, starts meow-c/meow-s instances, applies firewall.
 - `root/etc/config/homeproxy` — UCI default config.
