@@ -25,6 +25,20 @@ local function strToInt(v) return hp.strToInt(v) end
 local function isEmpty(v) return hp.isEmpty(v) end
 local function push(t, v) t[#t + 1] = v end
 
+-- Normalize "60"/"60s"/"2m"/"1h"/"1d" to integer seconds; meow wants u64.
+-- Same helper as generate_client.lua.
+local function secs(v)
+	if isEmpty(v) then return nil end
+	if type(v) == "number" then return math.floor(v) end
+	local n, unit = tostring(v):match("^%s*(%d+)%s*([smhd]?)%s*$")
+	if not n then return nil end
+	n = tonumber(n)
+	if unit == "m" then n = n * 60
+	elseif unit == "h" then n = n * 3600
+	elseif unit == "d" then n = n * 86400 end
+	return n
+end
+
 local log_level = uci:get(UCICONFIG, UCISERVER, "log_level") or "warn"
 -- Same mapping as the client generator (spec 4.2): meow's tracing
 -- EnvFilter has no fatal/panic levels; they degrade to error. "trace" is
@@ -43,6 +57,17 @@ if self_mark < 0 or self_mark > 4294967295 then
 	self_mark = 100
 end
 local ipv6_support = uci:get(UCICONFIG, "config", "ipv6_support") == "1"
+
+-- RAM hardening knobs (meow-oomfix spec U2), same reads as
+-- generate_client.lua: 0 is a legal operator value here --
+-- max_connections=0 means unlimited, tcp_idle_timeout=0 disables.
+local max_connections = strToInt(uci:get(UCICONFIG, "infra", "max_connections")) or 192
+if max_connections < 0 then max_connections = 192 elseif max_connections > 1024 then max_connections = 1024 end
+local tcp_idle_timeout = secs(uci:get(UCICONFIG, "infra", "tcp_idle_timeout")) or 1800
+-- secs() on a UCI string yields nil or a non-negative integer, so only the
+-- upper clamp is reachable here.
+if tcp_idle_timeout > 86400 then tcp_idle_timeout = 86400 end
+local tcp_keepalive = uci:get(UCICONFIG, "infra", "tcp_keepalive") ~= "0"
 
 -- Ports the co-located client instance already owns (spec 5): a listener
 -- asked to bind one would fail at runtime (meow skips the listener, the
@@ -288,6 +313,18 @@ local config = {
 	["log-level"] = log_level,
 	ipv6 = ipv6_support,
 	["routing-mark"] = self_mark,
+	-- RAM hardening, same top-level keys as meow-c.yaml
+	-- (generate_client.lua): logbook persists events under <home>, which
+	-- is tmpfs (= RAM) on this target -- ~3-4MB for a record nothing on
+	-- the router reads. max-connections/tcp-keepalive/tcp-idle-timeout
+	-- bound zombie TCP conns. The SS listener entries carry no
+	-- per-listener max-connections: the client emits that only on its
+	-- tproxy entries, and the top-level value is already the named-
+	-- listener default these entries inherit.
+	logbook = { enable = false },
+	["max-connections"] = max_connections,
+	["tcp-keepalive"] = tcp_keepalive,
+	["tcp-idle-timeout"] = tcp_idle_timeout,
 	-- No external-controller: it would collide with the client instance on
 	-- 127.0.0.1:19290 (spec 5). dns.listen is likewise omitted -- the
 	-- resolver exists for SS target domain resolution only (12-Q8:
