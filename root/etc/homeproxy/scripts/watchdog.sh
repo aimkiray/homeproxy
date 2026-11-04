@@ -67,7 +67,7 @@ api_alive() {
 # --- 内存水位防线(U4):vm.panic_on_oom=2 + kernel.panic=3 —— OOM 即
 #     panic+3s 重启、零日志。监视 MemAvailable,抢在内核 OOM-killer 之前
 #     重启耗内存的 meow 实例。只用 /proc/meminfo+logger+init.d,不新增依赖;
-#     任何一步失败不得中断 tick 其余检查(调用点 `|| true`,函数内全程容错)。
+#     任何一步失败不得中断 tick 其余检查(函数内全程容错,调用点按 rc 分流)。
 mem_restart_service() {   # $1=init 脚本(-x):rc.common 靠 shebang 分发,
 	                      # `sh script restart` 是静默 no-op(2026-11 实测)
 	                      # ——必须直接 exec;9>&- 不把锁 fd 漏进服务链。
@@ -78,7 +78,7 @@ mem_restart_service() {   # $1=init 脚本(-x):rc.common 靠 shebang 分发,
 	fi
 }
 mem_guard() {
-	local up avail now last count cooling f init_c init_l _k _v
+	local up avail now last count cooling f init_c init_l did _k _v
 
 	# 开机宽限:启动期分配未稳定,此时重启服务只会放大抖动。
 	up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
@@ -116,16 +116,23 @@ mem_guard() {
 		# crit 水位:立即动作(不计数)——meow-c 与 meow-los(init 存在才动)
 		# 一起重启;冷却期内跳过。
 		[ "$cooling" = "1" ] && return 0
-		logger -t homeproxy-watchdog "mem crit: ${avail}kB, restarting meow-c + meow-los" 2>/dev/null || true
-		echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
-		rm -f "$MEMLOW_COUNT" 2>/dev/null
-		[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; }
 		init_l=""
 		for f in /etc/init.d/meow-los /data/other_vol/meow-los/init.d/meow-los; do
 			[ -x "$f" ] && { init_l=$f; break; }
 		done
-		[ -n "$init_l" ] && { mem_restart_service "$init_l" || log "WARN: meow-los restart rc=$?"; }
-		log "mem crit (${avail}kB): restarted meow-c + meow-los"
+		# init 全缺时不写冷却戳、不误报 restarted——凭空 arm 10min 冷却
+		# 会压住随后真正可执行的 restart;记一行日志说明本轮放弃。
+		if [ -z "$init_c" ] && [ -z "$init_l" ]; then
+			log "mem crit (${avail}kB) but no init script found -- restart skipped, no cooldown armed."
+			return 0
+		fi
+		logger -t homeproxy-watchdog "mem crit: ${avail}kB, restarting meow services" 2>/dev/null || true
+		echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
+		rm -f "$MEMLOW_COUNT" 2>/dev/null
+		did=""
+		[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; did="meow-c"; }
+		[ -n "$init_l" ] && { mem_restart_service "$init_l" || log "WARN: meow-los restart rc=$?"; did="${did:+$did + }meow-los"; }
+		log "mem crit (${avail}kB): restarted $did"
 		return 10
 	fi
 
@@ -136,10 +143,15 @@ mem_guard() {
 	echo "$count" >"$MEMLOW_COUNT" 2>/dev/null || true
 	[ "$count" -lt 2 ] && return 0
 	[ "$cooling" = "1" ] && return 0
+	# init 缺失同上:不写冷却戳、不误报 restarted。
+	if [ -z "$init_c" ]; then
+		log "mem low (${avail}kB) on $count consecutive ticks but no init script -- restart skipped."
+		return 0
+	fi
 	logger -t homeproxy-watchdog "mem low: ${avail}kB, restarting meow" 2>/dev/null || true
 	echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
 	rm -f "$MEMLOW_COUNT" 2>/dev/null
-	[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; }
+	mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"
 	log "mem low (${avail}kB) on $count consecutive ticks: restarted meow-c"
 	return 10
 }
@@ -236,13 +248,6 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 bool_off "$(uci_get config.enabled)" && exit 0            # G5 总开关
 bool_off "$(uci_get infra.watchdog)" && exit 0            # 看门狗 opt-out(默认 1)
 
-# --- 内存水位防线:每个启用 tick 都跑(与 meow-c 健康状态无关)-------------
-#     rc=10 = 本轮已执行内存触发的 restart:刚拉起的服务必然后续探活失败,
-#     继续本 tick 只会污染 fails 甚至误入 degrade——直接收尾。其它 rc
-#     (含函数内单点失败)照常落入既有检查。
-mem_guard
-[ "$?" = "10" ] && exit 0
-
 # meow-c 预期判定(与 init.d/install.sh/firewall.sh 同一公式)
 routing_mode=$(uci_get config.routing_mode); routing_mode=${routing_mode:-bypass_mainland_china}
 if [ "$routing_mode" = "custom" ]; then
@@ -257,6 +262,19 @@ outbound_node=${outbound_node:-nil}
 if [ -f "$DEGRADED" ]; then
 	[ -f "$RUN_DIR/firewall.active" ] && rm -f "$DEGRADED" || exit 0
 fi
+
+# --- 内存水位防线:每个启用 tick 都跑(与 meow-c 健康状态无关)-------------
+#     rc=10 = 本轮已执行内存触发的 restart:刚拉起的服务必然后续探活失败,
+#     继续本 tick 只会污染 fails 甚至误入 degrade——直接收尾。其它 rc
+#     (含函数内单点失败)照常落入既有检查。
+#     位置刻意在 sticky-degraded 门之后:degraded 是"等人工介入"状态,内存
+#     触发的整服务 restart 会重挂 firewall.active,下一 tick 静默清掉
+#     DEGRADED 标记——看门狗自己解除降级,违背"stays out of the way until
+#     a human restarts"契约。代价是降级期间放弃内存防线,可接受:能进
+#     degraded 说明服务级 restart 已失败一次,meow-c 多半已死/无救,真正
+#     的内存压力不在它身上;panic_on_oom 仍是兜底。
+mem_guard
+[ "$?" = "10" ] && exit 0
 
 # 有接管事实才有降级对象(不误伤:dns_redirect=0 / lan_proxy_mode=disabled /
 # 纯 server 部署时,meow-c 死了也不影响 LAN,看门狗全程静默)。

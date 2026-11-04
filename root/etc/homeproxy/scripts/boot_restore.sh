@@ -154,13 +154,32 @@ fi
 #    steering LAN traffic at it. check.sh is self-contained and idempotent
 #    (it re-pins the /etc/init.d + rc.d links and the dropbear host key
 #    unconditionally, exits early when the process is alive, and fail-
-#    counters start attempts), so it is safe to run on every pass.
+#    counters start attempts), so it is safe to run when needed.
 #    Missing LOS tree -> silent skip; a failing check only gets logged --
 #    the relay must never block or fail the homeproxy restore above.
 #    9>&- keeps the restore-lock fd out of the service chain it may spawn.
+#    Gate on "something actually missing": this script runs on the same
+#    */5 cron minute as check.sh's own cron, and check.sh takes no lock --
+#    in the dead case both would run `init.d start` and the FAIL counter
+#    loses an update (benign direction but avoidable). Link present AND
+#    process alive means nothing to restore: leave that pass to the cron.
+_los_call=0
 if [ -d /data/other_vol/meow-los ] && [ -f /data/other_vol/meow-los/check.sh ]; then
-	los_out=$(sh /data/other_vol/meow-los/check.sh 2>&1 9>&-); los_rc=$?
-	[ -n "$los_out" ] && log "meow-los check: $los_out"
-	[ "$los_rc" != "0" ] && log "WARN: meow-los check.sh returned $los_rc"
+	[ -e /etc/init.d/meow-los ] || _los_call=1
+	if [ "$_los_call" = 0 ]; then
+		# same /proc-cmdline liveness shape as check.sh (case pattern so our
+		# own argv never matches)
+		_los_call=1
+		for _f in /proc/[0-9]*/cmdline; do
+			case "$(tr '\000' ' ' <"$_f" 2>/dev/null)" in
+				*meow-los.yaml*) _los_call=0; break ;;
+			esac
+		done
+	fi
+	if [ "$_los_call" = 1 ]; then
+		los_out=$(sh /data/other_vol/meow-los/check.sh 2>&1 9>&-); los_rc=$?
+		[ -n "$los_out" ] && log "meow-los check: $los_out"
+		[ "$los_rc" != "0" ] && log "WARN: meow-los check.sh returned $los_rc"
+	fi
 fi
 exit 0
