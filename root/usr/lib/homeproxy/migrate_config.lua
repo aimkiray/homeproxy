@@ -87,6 +87,57 @@ if uci:get_all(CFG, "infra") then
         end
     end
 
+    -- RAM-hardening knobs (meow-oomfix spec U2): feed the generator's
+    -- max-connections/tcp-idle-timeout/tcp-keepalive emission. Unlike
+    -- udp_timeout, 0 is legal for the first two: max_connections=0 means
+    -- unlimited (kernel contract) and tcp_idle_timeout=0 disables the
+    -- relay idle reaper.
+    ensure("infra", "max_connections", "128")
+    do
+        local raw = uci:get(CFG, "infra", "max_connections")
+        local n
+        if type(raw) == "string" then
+            n = tonumber(raw:match("^%s*(%-?%d+)%s*$"))
+        end
+        if not n or n < 0 or n > 1024 then
+            logwarn("infra.max_connections='" .. tostring(raw) .. "' is invalid; reset to 128")
+            uci:set(CFG, "infra", "max_connections", "128")
+        elseif tostring(n) ~= raw then
+            uci:set(CFG, "infra", "max_connections", tostring(n))
+        end
+    end
+    -- Same secs() vocabulary as infra.udp_timeout above: bare seconds or
+    -- an Ns/Nm/Nh/Nd suffix, normalized to integer seconds 0..86400.
+    ensure("infra", "tcp_idle_timeout", "600")
+    do
+        local raw = uci:get(CFG, "infra", "tcp_idle_timeout")
+        local secs
+        if type(raw) == "string" then
+            local n, unit = raw:match("^%s*(%d+)%s*([smhd]?)%s*$")
+            if n then
+                secs = tonumber(n)
+                if unit == "m" then secs = secs * 60
+                elseif unit == "h" then secs = secs * 3600
+                elseif unit == "d" then secs = secs * 86400 end
+            end
+        end
+        if not secs or secs < 0 or secs > 86400 then
+            logwarn("infra.tcp_idle_timeout='" .. tostring(raw) .. "' is invalid; reset to 600")
+            uci:set(CFG, "infra", "tcp_idle_timeout", "600")
+        elseif tostring(secs) ~= raw then
+            uci:set(CFG, "infra", "tcp_idle_timeout", tostring(secs))
+        end
+    end
+    -- Config-level kill switch for U1's accept-time TCP keepalive.
+    ensure("infra", "tcp_keepalive", "1")
+    do
+        local raw = uci:get(CFG, "infra", "tcp_keepalive")
+        if raw ~= "0" and raw ~= "1" then
+            logwarn("infra.tcp_keepalive='" .. tostring(raw) .. "' is invalid; reset to 1")
+            uci:set(CFG, "infra", "tcp_keepalive", "1")
+        end
+    end
+
     -- meow: infra.tproxy_port is removed -- the single tproxy listener serves
     -- TCP REDIRECT and UDP TPROXY on redirect_port (spec 3.3).
     local tp = uci:get(CFG, "infra", "tproxy_port")

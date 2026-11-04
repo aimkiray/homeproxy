@@ -257,6 +257,14 @@ local udp_timeout = (routing_mode == "custom")
 udp_timeout = secs(udp_timeout) or 60
 if udp_timeout < 1 then udp_timeout = 1 elseif udp_timeout > 86400 then udp_timeout = 86400 end
 
+-- RAM hardening knobs (meow-oomfix spec U2): 0 is a legal operator value
+-- here -- max_connections=0 means unlimited, tcp_idle_timeout=0 disables.
+local max_connections = strToInt(uget(UCIINFRA, "max_connections")) or 128
+if max_connections < 0 then max_connections = 128 elseif max_connections > 1024 then max_connections = 1024 end
+local tcp_idle_timeout = secs(uget(UCIINFRA, "tcp_idle_timeout")) or 600
+if tcp_idle_timeout < 0 then tcp_idle_timeout = 0 elseif tcp_idle_timeout > 86400 then tcp_idle_timeout = 86400 end
+local tcp_keepalive = uget(UCIINFRA, "tcp_keepalive") ~= "0"
+
 local log_level = uget(UCIMAIN, "log_level") or "warn"
 -- meow's level whitelist is {debug,info,warning,warn,error,silent}: trace
 -- has no equivalent and degrades to debug; fatal/panic degrade to error
@@ -1068,6 +1076,15 @@ local config = {
 	["bind-address"] = "*",
 	["external-controller"] = "127.0.0.1:19290",
 	["routing-mark"] = self_mark,
+	-- RAM hardening: logbook persists events under <home>, which is tmpfs
+	-- (= RAM) on this target -- ~3-4MB per meow instance for a record
+	-- nothing on the router reads. max-connections/tcp-keepalive/
+	-- tcp-idle-timeout bound zombie TCP conns; kernels that predate the
+	-- keys ignore them silently.
+	logbook = { enable = false },
+	["max-connections"] = max_connections,
+	["tcp-keepalive"] = tcp_keepalive,
+	["tcp-idle-timeout"] = tcp_idle_timeout,
 	strict = false,
 	-- meow hard-fails `meow -t` when enable=true carries no sniff map
 	-- (lib.rs: "sniffer.enable is true but sniffer.sniff map is absent or
@@ -1345,6 +1362,7 @@ config.listeners = {
 		firewall = false,
 		udp = udp_listener and true or false,
 		["udp-timeout"] = udp_timeout,
+		["max-connections"] = max_connections,
 	}
 }
 if ipv6_support == "1" then
@@ -1355,6 +1373,7 @@ if ipv6_support == "1" then
 		port = v6_port,
 		firewall = false,
 		udp = false,
+		["max-connections"] = max_connections,
 	})
 end
 
