@@ -24,6 +24,13 @@ FAILS_BEFORE_RESTART=2    # 连续 N 次探测失败 -> 服务级 restart 一次
 FAILS_BEFORE_DEGRADE=3    # restart 后再连续 N 次失败 -> degrade
 DEGRADE_LOCK_WAIT=130     # degrade 等锁上限(秒);须大于 restart 的 timeout 120
 
+MEM_WARN_KB=81920         # 连续 2 tick MemAvailable < 80MB -> restart meow-c
+MEM_CRIT_KB=49152         # MemAvailable < 48MB -> 立即 restart meow-c + meow-los
+MEM_RESTART_COOLDOWN=600  # 两次内存触发的 restart 全局最小间隔(秒,防抖)
+MEM_BOOT_GRACE=180        # 开机 3min 内不检查(启动期分配未稳定)
+MEMLOW_COUNT=/tmp/hp_memlow.count    # 连续低水位 tick 计数
+MEMRESTART_TS=/tmp/hp_memrestart.ts  # 上次内存触发 restart 的 epoch
+
 mkdir -p "$RUN_DIR" 2>/dev/null
 log() { echo "$(date '+%H:%M:%S') [hp-watchdog] $*" >>"$LOG_PATH" 2>/dev/null; }
 uci_get() { uci -q get "homeproxy.$1" 2>/dev/null; }
@@ -55,6 +62,86 @@ proc_running() {   # install.sh 同款 pgrep/ps 双 fallback
 api_alive() {
 	command -v curl >/dev/null 2>&1 || return 0   # 无 curl 退化为纯进程探测
 	curl -sf --max-time 3 "$API/version" >/dev/null 2>&1
+}
+
+# --- 内存水位防线(U4):vm.panic_on_oom=2 + kernel.panic=3 —— OOM 即
+#     panic+3s 重启、零日志。监视 MemAvailable,抢在内核 OOM-killer 之前
+#     重启耗内存的 meow 实例。只用 /proc/meminfo+logger+init.d,不新增依赖;
+#     任何一步失败不得中断 tick 其余检查(调用点 `|| true`,函数内全程容错)。
+mem_restart_service() {   # $1=init 脚本(-x):rc.common 靠 shebang 分发,
+	                      # `sh script restart` 是静默 no-op(2026-11 实测)
+	                      # ——必须直接 exec;9>&- 不把锁 fd 漏进服务链。
+	if command -v timeout >/dev/null 2>&1; then
+		timeout 120 "$1" restart >>"$LOG_PATH" 2>&1 9>&-
+	else
+		"$1" restart >>"$LOG_PATH" 2>&1 9>&-
+	fi
+}
+mem_guard() {
+	local up avail now last count cooling f init_c init_l _k _v
+
+	# 开机宽限:启动期分配未稳定,此时重启服务只会放大抖动。
+	up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	case "$up" in ''|*[!0-9]*) return 0 ;; esac
+	[ "$up" -lt "$MEM_BOOT_GRACE" ] && return 0
+
+	# 纯 shell 读 /proc/meminfo(直接重定向,不进子壳);无该字段即放弃。
+	avail=""
+	while read -r _k _v _; do
+		[ "$_k" = "MemAvailable:" ] && { avail=$_v; break; }
+	done </proc/meminfo 2>/dev/null
+	case "$avail" in ''|*[!0-9]*) return 0 ;; esac
+
+	# 回到 warn 水位之上=已恢复:连续低水位计数清零,本轮无动作。
+	if [ "$avail" -ge "$MEM_WARN_KB" ]; then
+		rm -f "$MEMLOW_COUNT" 2>/dev/null
+		return 0
+	fi
+
+	# 全局冷却:距上次内存触发的 restart <10min 本轮只计数不动作。
+	now=$(date +%s 2>/dev/null || echo 0)
+	case "$now" in ''|*[!0-9]*) now=0 ;; esac
+	last=$(cat "$MEMRESTART_TS" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	cooling=0
+	[ "$now" -gt 0 ] && [ "$last" -gt 0 ] \
+		&& [ $((now - last)) -lt "$MEM_RESTART_COOLDOWN" ] && cooling=1
+
+	init_c=""
+	for f in /etc/init.d/homeproxy /data/other_vol/homeproxy/init.d/homeproxy; do
+		[ -x "$f" ] && { init_c=$f; break; }
+	done
+
+	if [ "$avail" -lt "$MEM_CRIT_KB" ]; then
+		# crit 水位:立即动作(不计数)——meow-c 与 meow-los(init 存在才动)
+		# 一起重启;冷却期内跳过。
+		[ "$cooling" = "1" ] && return 0
+		logger -t homeproxy-watchdog "mem crit: ${avail}kB, restarting meow-c + meow-los" 2>/dev/null || true
+		echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
+		rm -f "$MEMLOW_COUNT" 2>/dev/null
+		[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; }
+		init_l=""
+		for f in /etc/init.d/meow-los /data/other_vol/meow-los/init.d/meow-los; do
+			[ -x "$f" ] && { init_l=$f; break; }
+		done
+		[ -n "$init_l" ] && { mem_restart_service "$init_l" || log "WARN: meow-los restart rc=$?"; }
+		log "mem crit (${avail}kB): restarted meow-c + meow-los"
+		return 10
+	fi
+
+	# warn 水位:连续 2 tick 低于才动作;恢复即清零见上面的 warn 分支。
+	count=$(cat "$MEMLOW_COUNT" 2>/dev/null || echo 0)
+	case "$count" in ''|*[!0-9]*) count=0 ;; esac
+	count=$((count + 1))
+	echo "$count" >"$MEMLOW_COUNT" 2>/dev/null || true
+	[ "$count" -lt 2 ] && return 0
+	[ "$cooling" = "1" ] && return 0
+	logger -t homeproxy-watchdog "mem low: ${avail}kB, restarting meow" 2>/dev/null || true
+	echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
+	rm -f "$MEMLOW_COUNT" 2>/dev/null
+	[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; }
+	log "mem low (${avail}kB) on $count consecutive ticks: restarted meow-c"
+	return 10
 }
 
 # --- degrade(§3.3 撤接管契约顺序:flag -> firewall.sh stop -> dnsmasq)------
@@ -140,6 +227,13 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 # --- 门控(§2.1.2;不满足任一即 exit 0,不写状态文件)-----------------------
 bool_off "$(uci_get config.enabled)" && exit 0            # G5 总开关
 bool_off "$(uci_get infra.watchdog)" && exit 0            # 看门狗 opt-out(默认 1)
+
+# --- 内存水位防线:每个启用 tick 都跑(与 meow-c 健康状态无关)-------------
+#     rc=10 = 本轮已执行内存触发的 restart:刚拉起的服务必然后续探活失败,
+#     继续本 tick 只会污染 fails 甚至误入 degrade——直接收尾。其它 rc
+#     (含函数内单点失败)照常落入既有检查。
+mem_guard
+[ "$?" = "10" ] && exit 0
 
 # meow-c 预期判定(与 init.d/install.sh/firewall.sh 同一公式)
 routing_mode=$(uci_get config.routing_mode); routing_mode=${routing_mode:-bypass_mainland_china}
