@@ -110,3 +110,20 @@ if [ "$need_start" = 1 ]; then
 	# homeproxy-web is NOT gated on config.enabled: it is the recovery channel.
 	"$INITD/homeproxy-web" start >/dev/null 2>&1 || log "homeproxy-web start returned $?"
 fi
+
+# 5. meow-los chained relay: its only restorer is a */5 cron running
+#    /data/other_vol/meow-los/check.sh, leaving up to 5min of dead upstream
+#    chain after a reboot -- exactly while homeproxy above is already
+#    steering LAN traffic at it. check.sh is self-contained and idempotent
+#    (it re-pins the /etc/init.d + rc.d links and the dropbear host key
+#    unconditionally, exits early when the process is alive, and fail-
+#    counters start attempts), so it is safe to run on every pass.
+#    Missing LOS tree -> silent skip; a failing check only gets logged --
+#    the relay must never block or fail the homeproxy restore above.
+#    9>&- keeps the restore-lock fd out of the service chain it may spawn.
+if [ -d /data/other_vol/meow-los ] && [ -f /data/other_vol/meow-los/check.sh ]; then
+	los_out=$(sh /data/other_vol/meow-los/check.sh 2>&1 9>&-); los_rc=$?
+	[ -n "$los_out" ] && log "meow-los check: $los_out"
+	[ "$los_rc" != "0" ] && log "WARN: meow-los check.sh returned $los_rc"
+fi
+exit 0
