@@ -92,7 +92,7 @@ if uci:get_all(CFG, "infra") then
     -- udp_timeout, 0 is legal for the first two: max_connections=0 means
     -- unlimited (kernel contract) and tcp_idle_timeout=0 disables the
     -- relay idle reaper.
-    ensure("infra", "max_connections", "128")
+    ensure("infra", "max_connections", "192")
     do
         local raw = uci:get(CFG, "infra", "max_connections")
         local n
@@ -100,15 +100,15 @@ if uci:get_all(CFG, "infra") then
             n = tonumber(raw:match("^%s*(%-?%d+)%s*$"))
         end
         if not n or n < 0 or n > 1024 then
-            logwarn("infra.max_connections='" .. tostring(raw) .. "' is invalid; reset to 128")
-            uci:set(CFG, "infra", "max_connections", "128")
+            logwarn("infra.max_connections='" .. tostring(raw) .. "' is invalid; reset to 192")
+            uci:set(CFG, "infra", "max_connections", "192")
         elseif tostring(n) ~= raw then
             uci:set(CFG, "infra", "max_connections", tostring(n))
         end
     end
     -- Same secs() vocabulary as infra.udp_timeout above: bare seconds or
     -- an Ns/Nm/Nh/Nd suffix, normalized to integer seconds 0..86400.
-    ensure("infra", "tcp_idle_timeout", "600")
+    ensure("infra", "tcp_idle_timeout", "1800")
     do
         local raw = uci:get(CFG, "infra", "tcp_idle_timeout")
         local secs
@@ -122,8 +122,8 @@ if uci:get_all(CFG, "infra") then
             end
         end
         if not secs or secs < 0 or secs > 86400 then
-            logwarn("infra.tcp_idle_timeout='" .. tostring(raw) .. "' is invalid; reset to 600")
-            uci:set(CFG, "infra", "tcp_idle_timeout", "600")
+            logwarn("infra.tcp_idle_timeout='" .. tostring(raw) .. "' is invalid; reset to 1800")
+            uci:set(CFG, "infra", "tcp_idle_timeout", "1800")
         elseif tostring(secs) ~= raw then
             uci:set(CFG, "infra", "tcp_idle_timeout", tostring(secs))
         end

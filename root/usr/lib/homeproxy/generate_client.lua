@@ -259,9 +259,9 @@ if udp_timeout < 1 then udp_timeout = 1 elseif udp_timeout > 86400 then udp_time
 
 -- RAM hardening knobs (meow-oomfix spec U2): 0 is a legal operator value
 -- here -- max_connections=0 means unlimited, tcp_idle_timeout=0 disables.
-local max_connections = strToInt(uget(UCIINFRA, "max_connections")) or 128
-if max_connections < 0 then max_connections = 128 elseif max_connections > 1024 then max_connections = 1024 end
-local tcp_idle_timeout = secs(uget(UCIINFRA, "tcp_idle_timeout")) or 600
+local max_connections = strToInt(uget(UCIINFRA, "max_connections")) or 192
+if max_connections < 0 then max_connections = 192 elseif max_connections > 1024 then max_connections = 1024 end
+local tcp_idle_timeout = secs(uget(UCIINFRA, "tcp_idle_timeout")) or 1800
 -- secs() on a UCI string yields nil or a non-negative integer, so only the
 -- upper clamp is reachable here.
 if tcp_idle_timeout > 86400 then tcp_idle_timeout = 86400 end
