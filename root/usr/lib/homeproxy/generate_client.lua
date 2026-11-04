@@ -262,7 +262,9 @@ if udp_timeout < 1 then udp_timeout = 1 elseif udp_timeout > 86400 then udp_time
 local max_connections = strToInt(uget(UCIINFRA, "max_connections")) or 128
 if max_connections < 0 then max_connections = 128 elseif max_connections > 1024 then max_connections = 1024 end
 local tcp_idle_timeout = secs(uget(UCIINFRA, "tcp_idle_timeout")) or 600
-if tcp_idle_timeout < 0 then tcp_idle_timeout = 0 elseif tcp_idle_timeout > 86400 then tcp_idle_timeout = 86400 end
+-- secs() on a UCI string yields nil or a non-negative integer, so only the
+-- upper clamp is reachable here.
+if tcp_idle_timeout > 86400 then tcp_idle_timeout = 86400 end
 local tcp_keepalive = uget(UCIINFRA, "tcp_keepalive") ~= "0"
 
 local log_level = uget(UCIMAIN, "log_level") or "warn"
@@ -1079,8 +1081,9 @@ local config = {
 	-- RAM hardening: logbook persists events under <home>, which is tmpfs
 	-- (= RAM) on this target -- ~3-4MB per meow instance for a record
 	-- nothing on the router reads. max-connections/tcp-keepalive/
-	-- tcp-idle-timeout bound zombie TCP conns; kernels that predate the
-	-- keys ignore them silently.
+	-- tcp-idle-timeout bound zombie TCP conns; a kernel that predates
+	-- the tcp-* keys ignores just those silently (logbook/
+	-- max-connections are already honored at the baseline kernel).
 	logbook = { enable = false },
 	["max-connections"] = max_connections,
 	["tcp-keepalive"] = tcp_keepalive,
