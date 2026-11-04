@@ -356,19 +356,23 @@ log "meow-c probe failed (proc=$([ "$p_ok" = "1" ] && echo up || echo down), api
 if [ "$restarts" -eq 0 ] && [ "$fails" -ge "$FAILS_BEFORE_RESTART" ]; then
 	INIT=""
 	for f in /etc/init.d/homeproxy /data/other_vol/homeproxy/init.d/homeproxy; do
-		[ -f "$f" ] && { INIT="$f"; break; }
+		[ -x "$f" ] && { INIT="$f"; break; }
 	done
 	log "meow-c dead for $fails consecutive ticks -- restarting service once."
 	if [ -n "$INIT" ]; then
-		# 两条 restart 都带 9>&-:持锁状态下 spawn 的服务链(最终到
-		# ntp_responder 的永生 supervisor)不得继承 hp_watchdog.lock。
+		# 必须直接 exec init 脚本本体(mem_restart_service 同款):rc.common
+		# 靠 `#!/bin/sh /etc/rc.common` shebang 分发 start/stop/restart,
+		# `sh script restart` 把 shebang 当注释 -> 只跑变量赋值,静默
+		# no-op(2026-11 实测:此路径 restart 从未生效,死亡 episode 只能
+		# 滑向 degrade)。9>&-:持锁 spawn 的服务链(最终到 ntp_responder
+		# 的永生 supervisor)不得继承 hp_watchdog.lock。
 		if command -v timeout >/dev/null 2>&1; then
-			timeout 120 sh "$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
+			timeout 120 "$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
 		else
 			# W1-4:无 timeout applet(busybox 可不提供)时规格允许裸跑。
 			# init.d 若挂死会占住本 tick,但 degrade 子命令的
 			# DEGRADE_LOCK_WAIT 上限仍保证止血可以插队执行。
-			sh "$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
+			"$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
 		fi
 	else
 		log "WARN: no init script (/etc/init.d/homeproxy or /data/other_vol fallback); restart skipped."
