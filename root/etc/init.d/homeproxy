@@ -207,12 +207,23 @@ start_service() {
         # (subscription runs hold across multi-URL fetches). A dead pid is
         # reclaimed at once; a pid-less lock falls back to the mtime rule.
         _p=$(cat "$_mig_lk/pid" 2>/dev/null)
-        case "$_p" in ''|*[!0-9]*) _p= ;; esac
+        # '0' is dirty: kill -0 0 probes our own process group, always true.
+        case "$_p" in ''|0|*[!0-9]*) _p= ;; esac
         if [ -n "$_p" ]; then
-            kill -0 "$_p" 2>/dev/null || { rm -f "$_mig_lk/pid"; rmdir "$_mig_lk" 2>/dev/null; }
+            # Reclaim only the exact dir judged stale -- a recreated lockdir
+            # carries a different inode.
+            if ! kill -0 "$_p" 2>/dev/null; then
+                _ino=$(stat -c %i "$_mig_lk" 2>/dev/null)
+                [ -n "$_ino" ] && [ "$(stat -c %i "$_mig_lk" 2>/dev/null)" = "$_ino" ] \
+                    && { rm -f "$_mig_lk/pid"; rmdir "$_mig_lk" 2>/dev/null; }
+            fi
         else
             _mt=$(stat -c %Y "$_mig_lk" 2>/dev/null) || _mt=0
-            [ "${_mt:-0}" -gt 0 ] && [ $(($(date +%s) - _mt)) -gt 120 ] && rmdir "$_mig_lk" 2>/dev/null
+            if [ "${_mt:-0}" -gt 0 ] && [ $(($(date +%s) - _mt)) -gt 120 ]; then
+                _ino=$(stat -c %i "$_mig_lk" 2>/dev/null)
+                [ -n "$_ino" ] && [ "$(stat -c %i "$_mig_lk" 2>/dev/null)" = "$_ino" ] \
+                    && rmdir "$_mig_lk" 2>/dev/null
+            fi
         fi
         _mig_i=$((_mig_i + 1))
         sleep 1

@@ -152,14 +152,15 @@ do_degrade() {
 	local fw out
 	if fw=$(resolve_fw); then
 		# 命令替换捕获输出:RUN_DIR 不可写/日志打不开也不能阻断 teardown(G1)。
-		out=$(sh "$fw" stop 2>&1)
+		# 9>&-: 别把 watchdog 锁 fd 漏进 firewall.sh 的常驻子进程(supervisor)。
+		out=$(sh "$fw" stop 2>&1 9>&-)
 		[ -n "$out" ] && printf '%s\n' "$out" >>"$LOG_PATH" 2>/dev/null
 	else
 		log "WARN: firewall.sh not found; skipped rule teardown."
 	fi
 	if ls /tmp/dnsmasq.d/homeproxy_*.conf >/dev/null 2>&1; then
 		rm -f /tmp/dnsmasq.d/homeproxy_*.conf
-		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1 9>&-
 	fi
 	# W1-8:marker 写失败不再静默——降级事实已生效,缺标记只会让后续
 	# tick 重复走 degrade 幂等路径,记 WARN 供排查。
@@ -191,16 +192,23 @@ lock_try() {
 	fi
 	mkdir_lock && return 0
 	# W1-3:锁目录里有 holder PID——kill -0 验活,死则回收重试一次;
-	# 无/脏 PID(holder 恰在 mkdir 与写 pid 之间)按"仍活"保守退出,
-	# 仍失败由调用方记 WARN——不再被 stale 锁永久静默卡死。
+	# 无/脏 PID(holder 恰在 mkdir 与写 pid 之间,或写失败)走与其它锁点
+	# 一致的 120s mtime 兜底——无 pid 不等于"仍活",stat 失败仍按活处理。
+	local lp _ino _mt
 	lp=$(cat "$LOCKD/pid" 2>/dev/null)
-	case "$lp" in ''|*[!0-9]*) lp="" ;; esac
+	case "$lp" in ''|0|*[!0-9]*) lp="" ;; esac   # '0' 也是脏值:kill -0 0 恒真
 	LOCK_PEER=$lp
-	if [ -z "$lp" ] || kill -0 "$lp" 2>/dev/null; then
-		return 1
+	if [ -n "$lp" ]; then
+		kill -0 "$lp" 2>/dev/null && return 1
+	else
+		_mt=$(stat -c %Y "$LOCKD" 2>/dev/null) || _mt=0
+		{ [ "${_mt:-0}" -eq 0 ] || [ $(($(date +%s) - _mt)) -le 120 ]; } && return 1
 	fi
-	rm -rf "$LOCKD" 2>/dev/null
-	mkdir_lock && { log "reclaimed stale watchdog lock (dead pid $lp)."; return 0; }
+	# 只回收被判死的那个目录本体:竞态新建的锁目录 inode 不同。
+	_ino=$(stat -c %i "$LOCKD" 2>/dev/null)
+	[ -n "$_ino" ] && [ "$(stat -c %i "$LOCKD" 2>/dev/null)" = "$_ino" ] \
+		&& { rm -f "$LOCKD/pid" 2>/dev/null; rmdir "$LOCKD" 2>/dev/null; }
+	mkdir_lock && { log "reclaimed stale watchdog lock${lp:+ (dead pid $lp)}."; return 0; }
 	return 1
 }
 
@@ -327,7 +335,8 @@ if [ "$p_ok" = "1" ] && [ "$a_ok" = "1" ]; then
 			# 已在、meow 活着,仅跳点被 fw3 冲掉;start 会销毁 ipset 使
 			# dnsmasq 已学动态成员蒸发。
 			fw=$(resolve_fw) && {
-				out=$(sh "$fw" reload 2>&1)
+				# 9>&-: 同上,reload 路径同样会 spawn NTP supervisor。
+				out=$(sh "$fw" reload 2>&1 9>&-)
 				[ -n "$out" ] && printf '%s\n' "$out" >>"$LOG_PATH" 2>/dev/null
 			}
 		fi
@@ -351,13 +360,15 @@ if [ "$restarts" -eq 0 ] && [ "$fails" -ge "$FAILS_BEFORE_RESTART" ]; then
 	done
 	log "meow-c dead for $fails consecutive ticks -- restarting service once."
 	if [ -n "$INIT" ]; then
+		# 两条 restart 都带 9>&-:持锁状态下 spawn 的服务链(最终到
+		# ntp_responder 的永生 supervisor)不得继承 hp_watchdog.lock。
 		if command -v timeout >/dev/null 2>&1; then
-			timeout 120 sh "$INIT" restart >>"$LOG_PATH" 2>&1
+			timeout 120 sh "$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
 		else
 			# W1-4:无 timeout applet(busybox 可不提供)时规格允许裸跑。
 			# init.d 若挂死会占住本 tick,但 degrade 子命令的
 			# DEGRADE_LOCK_WAIT 上限仍保证止血可以插队执行。
-			sh "$INIT" restart >>"$LOG_PATH" 2>&1
+			sh "$INIT" restart >>"$LOG_PATH" 2>&1 9>&-
 		fi
 	else
 		log "WARN: no init script (/etc/init.d/homeproxy or /data/other_vol fallback); restart skipped."

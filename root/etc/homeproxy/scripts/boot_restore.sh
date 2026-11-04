@@ -33,10 +33,44 @@ log() { echo "$(date '+%H:%M:%S') [hp-restore] $*" >>"$LOG" 2>/dev/null; }
 # restore -- fall back to an atomic mkdir lock (H7).
 if command -v flock >/dev/null 2>&1 && exec 9>/var/run/hp_restore.lock 2>/dev/null; then
 	flock -n 9 2>/dev/null || { log "another restore in progress, exiting."; exit 0; }
-elif ! mkdir /var/run/hp_restore.lock.d 2>/dev/null; then
-	log "another restore in progress, exiting."; exit 0
 else
-	trap 'rmdir /var/run/hp_restore.lock.d 2>/dev/null' EXIT
+	# flock-less fallback: atomic mkdir + pid/mtime stale-reclaim (a killed
+	# restore cannot auto-release a dir lock -- same protocol as init.d's
+	# uci-write.lock.d: a live holder pid wins, a dead pid reclaims at once,
+	# a pid-less lock falls back to a 120s mtime).
+	_lkd=/var/run/hp_restore.lock.d
+	_try=0
+	while [ "$_try" -lt 2 ]; do
+		mkdir "$_lkd" 2>/dev/null && break
+		# '0' is dirty: kill -0 0 probes our own process group and always
+		# succeeds -> a 0-pid lock would read as held forever.
+		_p=$(cat "$_lkd/pid" 2>/dev/null); case "$_p" in ''|0|*[!0-9]*) _p= ;; esac
+		_ino=$(stat -c %i "$_lkd" 2>/dev/null)
+		_mt=$(stat -c %Y "$_lkd" 2>/dev/null) || _mt=0
+		_stale=0
+		if [ -n "$_p" ]; then
+			kill -0 "$_p" 2>/dev/null && { log "another restore in progress, exiting."; exit 0; }
+			_stale=1
+		elif [ -z "$_ino" ] || [ "${_mt:-0}" -eq 0 ]; then
+			_stale=0   # stat inconclusive -> retry, do NOT reclaim (fail-closed)
+		elif [ $(($(date +%s) - _mt)) -le 120 ]; then
+			log "another restore in progress, exiting."; exit 0
+		else
+			_stale=1
+		fi
+		# Reclaim only the exact dir judged stale: a lockdir recreated by a
+		# racing holder carries a different inode.
+		[ "$_stale" = "1" ] && [ "$(stat -c %i "$_lkd" 2>/dev/null)" = "$_ino" ] \
+			&& { rm -f "$_lkd/pid" 2>/dev/null; rmdir "$_lkd" 2>/dev/null; }
+		_try=$((_try + 1))
+	done
+	[ "$_try" -ge 2 ] && { log "another restore in progress, exiting."; exit 0; }
+	echo $$ >"$_lkd/pid" 2>/dev/null
+	trap 'rm -f "$_lkd/pid" 2>/dev/null; rmdir "$_lkd" 2>/dev/null' EXIT
+	# An untrapped SIGTERM/SIGINT skips the EXIT trap in ash -- re-raise as
+	# exit so the lockdir is released. SIGKILL still stale-locks: covered by
+	# the dead-pid reclaim above.
+	trap 'exit 143' TERM; trap 'exit 130' INT
 fi
 
 # 1. /etc/homeproxy symlink (resources + scripts resolve through it)
@@ -98,7 +132,9 @@ if [ "$need_start" = 1 ]; then
 		;;
 		*)
 		log "starting homeproxy + homeproxy-web."
-		"$INITD/homeproxy" start >/dev/null 2>&1 || {
+		# 9>&-: never leak the restore-lock fd into service children -- a
+		# lingering descendant would hold the flock forever (2026-11 wedge).
+		"$INITD/homeproxy" start >/dev/null 2>&1 9>&- || {
 			rc=$?
 			# rc=2 = "nothing to run" (nil outbound / enabled=0): a defined
 			# no-op per G9, not a failure worth logging. rc=1 IS a real
@@ -108,7 +144,8 @@ if [ "$need_start" = 1 ]; then
 		;;
 	esac
 	# homeproxy-web is NOT gated on config.enabled: it is the recovery channel.
-	"$INITD/homeproxy-web" start >/dev/null 2>&1 || log "homeproxy-web start returned $?"
+	# 9>&-: same restore-lock fd guard as the homeproxy call above.
+	"$INITD/homeproxy-web" start >/dev/null 2>&1 9>&- || log "homeproxy-web start returned $?"
 fi
 
 # 5. meow-los chained relay: its only restorer is a */5 cron running
