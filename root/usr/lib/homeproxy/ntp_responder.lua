@@ -11,7 +11,8 @@ local socket = require("socket")
 local udp = assert(socket.udp())
 udp:setoption("reuseaddr", true)
 assert(udp:setsockname("*", 123))
-udp:settimeout(0) -- block forever; receivefrom errors just re-loop
+udp:settimeout(nil) -- truly block in receivefrom; settimeout(0) is NON-blocking
+-- (busy EAGAIN re-loop = ~100% CPU on the router core). nil = wait forever.
 
 local EPOCH = 2208988800 -- NTP epoch offset (seconds 1900 -> 1970)
 
