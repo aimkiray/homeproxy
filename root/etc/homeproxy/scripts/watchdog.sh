@@ -33,6 +33,15 @@ MEMRESTART_TS=/tmp/hp_memrestart.ts  # 上次内存触发 restart 的 epoch
 
 mkdir -p "$RUN_DIR" 2>/dev/null
 log() { echo "$(date '+%H:%M:%S') [hp-watchdog] $*" >>"$LOG_PATH" 2>/dev/null; }
+# mem_guard 触发事件持久化到 NAND:homeproxy.log 在 tmpfs,panic_on_oom
+# 重启即丢,宕机归因拿不到"谁因何水位在何时动了 restart"。此文件留证。
+# 256KB 截断保尾;任何写失败静默,绝不影响 restart 语义。
+mem_persist() {  # $1=avail(kB) $2=action $3=trigger
+	local f=/data/other_vol/homeproxy/mem_guard.log
+	[ -f "$f" ] && [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 262144 ] \
+		&& tail -50 "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
+	echo "$(date '+%F %T') avail=${1}kB action=$2 trigger=$3" >>"$f" 2>/dev/null || true
+}
 uci_get() { uci -q get "homeproxy.$1" 2>/dev/null; }
 # config_get_bool 同款"关"词表(W1-6):uci 布尔拼写不只字面 0。
 bool_off() { case "$1" in 0|no|off|false|disabled) return 0 ;; *) return 1 ;; esac }
@@ -133,6 +142,10 @@ mem_guard() {
 		[ -n "$init_c" ] && { mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"; did="meow-c"; }
 		[ -n "$init_l" ] && { mem_restart_service "$init_l" || log "WARN: meow-los restart rc=$?"; did="${did:+$did + }meow-los"; }
 		log "mem crit (${avail}kB): restarted $did"
+		case "$did" in
+			"meow-c + meow-los") mem_persist "$avail" "restart-meow-c|meow-los" crit ;;
+			*)                   mem_persist "$avail" "restart-$did" crit ;;
+		esac
 		return 10
 	fi
 
@@ -153,6 +166,7 @@ mem_guard() {
 	rm -f "$MEMLOW_COUNT" 2>/dev/null
 	mem_restart_service "$init_c" || log "WARN: meow-c restart rc=$?"
 	log "mem low (${avail}kB) on $count consecutive ticks: restarted meow-c"
+	mem_persist "$avail" restart-meow-c warn
 	return 10
 }
 
