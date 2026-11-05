@@ -1085,6 +1085,11 @@ local config = {
 	-- the tcp-* keys ignores just those silently (logbook/
 	-- max-connections are already honored at the baseline kernel).
 	logbook = { enable = false },
+	-- traffic-ledger (upstream >=0.27, on by default) records per-day
+	-- traffic under <home>/traffic/ -- tmpfs RAM burn for meow-c, NAND
+	-- wear for any instance whose -d lands on persistent storage. Same
+	-- "no consumer" argument as logbook; pre-0.27 kernels ignore the key.
+	["traffic-ledger"] = { enable = false },
 	["max-connections"] = max_connections,
 	["tcp-keepalive"] = tcp_keepalive,
 	["tcp-idle-timeout"] = tcp_idle_timeout,

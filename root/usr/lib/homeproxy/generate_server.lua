@@ -322,6 +322,9 @@ local config = {
 	-- tproxy entries, and the top-level value is already the named-
 	-- listener default these entries inherit.
 	logbook = { enable = false },
+	-- traffic-ledger (upstream >=0.27, on by default) records per-day
+	-- traffic under <home>/traffic/ -- NAND/tmpfs burn nothing reads.
+	["traffic-ledger"] = { enable = false },
 	["max-connections"] = max_connections,
 	["tcp-keepalive"] = tcp_keepalive,
 	["tcp-idle-timeout"] = tcp_idle_timeout,
