@@ -265,11 +265,34 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 #     (OOM trace/panic 头/驱动错误)。放在门控之前:homeproxy 关停时
 #     路由器照样可能 panic。~40KB/min NAND 写入可接受;失败静默,
 #     取证永不阻塞看门狗。
+#     rotate:覆写前若 dmesg.last 的 mtime 早于本 boot 起点(now-uptime),
+#     它是上个 boot 的遗留——panic 重启后第一个 tick 若直接覆写,宕前
+#     60s 证据窗即被冲掉(2026-11 实测)。先 mv 成 dmesg.prev 再写新
+#     .last:panic 后 .prev=上个 boot 宕前证据,.last=本 boot 滚动快照。
+#     rotate 后新 .last mtime 属本 boot,条件天然幂等不重复 rotate;
+#     stat/uptime 读取失败即跳过 rotate 照常写(取证优先,不阻塞)。
+#     空文件守卫:dmesg|tail 的 rc 取 tail,dmesg 失败也得 0——tmp 为空
+#     绝不 mv 覆盖既有快照。
 {
-	dmesg 2>/dev/null | tail -200 \
-		>/data/other_vol/homeproxy/.dmesg.last.tmp 2>/dev/null \
-		&& mv /data/other_vol/homeproxy/.dmesg.last.tmp \
-		      /data/other_vol/homeproxy/dmesg.last 2>/dev/null
+	_dm_dir=/data/other_vol/homeproxy
+	_dm_tmp=$_dm_dir/.dmesg.last.tmp
+	if dmesg 2>/dev/null | tail -200 >"$_dm_tmp" 2>/dev/null \
+		&& [ -s "$_dm_tmp" ]; then
+		if [ -f "$_dm_dir/dmesg.last" ]; then
+			_now=$(date +%s 2>/dev/null)
+			_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+			_mt=$(stat -c %Y "$_dm_dir/dmesg.last" 2>/dev/null)
+			case "$_now" in ''|*[!0-9]*) _now=0 ;; esac
+			case "$_up"  in ''|*[!0-9]*) _up=0  ;; esac
+			case "$_mt"  in ''|*[!0-9]*) _mt=0  ;; esac
+			[ "$_now" -gt "$_up" ] && [ "$_mt" -gt 0 ] \
+				&& [ "$_mt" -lt $((_now - _up)) ] \
+				&& mv "$_dm_dir/dmesg.last" "$_dm_dir/dmesg.prev" 2>/dev/null
+		fi
+		mv "$_dm_tmp" "$_dm_dir/dmesg.last" 2>/dev/null
+	else
+		rm -f "$_dm_tmp" 2>/dev/null
+	fi
 } || true
 
 # --- 门控(§2.1.2;不满足任一即 exit 0,不写状态文件)-----------------------
