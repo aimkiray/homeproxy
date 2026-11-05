@@ -11,6 +11,14 @@
 
 set -u
 
+# Drop every fd inherited from the caller (e.g. the hp-restore lockfile):
+# a lingering child (e.g. the NTP responder supervisor) must never hold
+# them past our exit -- that wedged hp-restore for days (2026-11).
+# BusyBox-ash only: ash relocates its hidden script-input fd when exec'd
+# closed, so the sweep cannot truncate this script; on dash/bash it would.
+# ''|*[!0-9]* also skips a literal unmatched glob (no /proc -> no `exec *`).
+for _fd in /proc/self/fd/*; do case "${_fd##*/}" in ''|*[!0-9]*|0|1|2) ;; *) eval "exec ${_fd##*/}>&-" 2>/dev/null ;; esac; done
+
 CFG=homeproxy
 HP_DIR=/etc/homeproxy
 RES_DIR="$HP_DIR/resources"
@@ -233,12 +241,29 @@ NTP_RESP_LUA="$(dirname "$0")/ntp_responder.lua"
 NTP_RESP_PID="$RUN_DIR/ntp_responder.pid"
 
 ntp_responder_stop() {
+	local _pid _p
 	if [ -f "$NTP_RESP_PID" ]; then
-		kill "$(cat "$NTP_RESP_PID" 2>/dev/null)" 2>/dev/null
+		_pid=$(cat "$NTP_RESP_PID" 2>/dev/null)
+		case "$_pid" in ''|0|*[!0-9]*) _pid= ;; esac
+		# Signal the pidfile owner only if it still looks like a responder
+		# supervisor (hp-ntp-super marker; a pre-marker supervisor shows
+		# 'firewall.sh'): a stale or recycled pid must never take an
+		# innocent process down -- never ourselves or our caller either.
+		if [ -n "$_pid" ] && [ "$_pid" != "$$" ] && [ "$_pid" != "$PPID" ]; then
+			case "$(cat "/proc/$_pid/cmdline" 2>/dev/null)" in
+				*hp-ntp-super*|*firewall.sh*) kill "$_pid" 2>/dev/null ;;
+			esac
+		fi
 		rm -f "$NTP_RESP_PID"
 	fi
-	local _p
-	for _p in $(pgrep -f ntp_responder.lua 2>/dev/null); do kill "$_p" 2>/dev/null; done
+	# The marked supervisor's argv carries the lua path as $1, so the first
+	# sweep already matches it; the hp-ntp-super sweep additionally covers
+	# a marked supervisor whose pidfile was lost -- an unmarked pre-2026-11
+	# zombie only dies via its pidfile entry above.
+	if command -v pgrep >/dev/null 2>&1; then
+		for _p in $(pgrep -f 'ntp_responder.lua' 2>/dev/null); do kill "$_p" 2>/dev/null; done
+		for _p in $(pgrep -f 'hp-ntp-super' 2>/dev/null); do kill "$_p" 2>/dev/null; done
+	fi
 	return 0
 }
 
@@ -247,6 +272,11 @@ ntp_responder_stop() {
 # some responder is guaranteed bound, 1 when the arm must not install.
 ntp_responder_start() {
 	ntp_responder_stop
+	# kill(2) only queues the signal: a just-stopped responder can still own
+	# :123 for a few ms and read as a live foreign socket -- we would then
+	# skip the spawn and install the NTP arm onto a dead port. One bounded
+	# beat covers the reap (a true foreign owner stays bound regardless).
+	sleep 1
 	# A non-loopback socket already owning udp/123 serves the arm just as
 	# well (a 127.0.0.1-bound one cannot see redirected LAN traffic).
 	awk 'NR>1 && $2 ~ /:007B$/ && $2 != "0100007F:007B" {f=1} END{exit !f}' \
@@ -258,7 +288,11 @@ ntp_responder_start() {
 	# Fully detached: without the outer redirect the subshell inherits our
 	# stdout/stderr and every invoking session (ssh, uci-cgi, procd) hangs
 	# on close waiting for the daemon to release the pipe.
-	( while :; do lua "$NTP_RESP_LUA" "$lan_ip" >/dev/null 2>&1; sleep 1; done ) >/dev/null 2>&1 </dev/null &
+	# exec sh -c tags the supervisor's argv with hp-ntp-super so stops and
+	# pgrep can tell it apart from a plain `sh firewall.sh start` -- an
+	# unmarked zombie used to respawn the responder after `stop` forever.
+	( exec sh -c 'while :; do lua "$1" "$2" >/dev/null 2>&1; sleep 1; done' \
+		hp-ntp-super "$NTP_RESP_LUA" "$lan_ip" ) >/dev/null 2>&1 </dev/null &
 	echo $! > "$NTP_RESP_PID"
 	sleep 1
 	# The responder's own wildcard bind is the proof of life.
