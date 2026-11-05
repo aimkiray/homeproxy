@@ -244,6 +244,20 @@ fi
 # --- tick:并发互斥 -------------------------------------------------------
 lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exiting."; exit 0; }
 
+# --- 内核日志持久化快照:panic_on_oom=2 + kernel.panic=3 -> 任何 panic
+#     3s 重启零日志,shm_log 与 log_recorder 的 zstd 缓冲尾段随 tmpfs
+#     蒸发(2026-11 两次重启归因真空实测)。每 tick 把内核 ring 尾 200 行
+#     落持久盘——panic 重启后 dmesg.last 保留宕前 <=60s 的 kmsg
+#     (OOM trace/panic 头/驱动错误)。放在门控之前:homeproxy 关停时
+#     路由器照样可能 panic。~40KB/min NAND 写入可接受;失败静默,
+#     取证永不阻塞看门狗。
+{
+	dmesg 2>/dev/null | tail -200 \
+		>/data/other_vol/homeproxy/.dmesg.last.tmp 2>/dev/null \
+		&& mv /data/other_vol/homeproxy/.dmesg.last.tmp \
+		      /data/other_vol/homeproxy/dmesg.last 2>/dev/null
+} || true
+
 # --- 门控(§2.1.2;不满足任一即 exit 0,不写状态文件)-----------------------
 bool_off "$(uci_get config.enabled)" && exit 0            # G5 总开关
 bool_off "$(uci_get infra.watchdog)" && exit 0            # 看门狗 opt-out(默认 1)
