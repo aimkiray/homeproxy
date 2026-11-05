@@ -261,8 +261,8 @@ ntp_responder_stop() {
 	# a marked supervisor whose pidfile was lost -- an unmarked pre-2026-11
 	# zombie only dies via its pidfile entry above.
 	if command -v pgrep >/dev/null 2>&1; then
-		for _p in $(pgrep -f 'ntp_responder.lua' 2>/dev/null); do kill "$_p" 2>/dev/null; done
 		for _p in $(pgrep -f 'hp-ntp-super' 2>/dev/null); do kill "$_p" 2>/dev/null; done
+		for _p in $(pgrep -f 'ntp_responder.lua' 2>/dev/null); do kill "$_p" 2>/dev/null; done
 	fi
 	return 0
 }

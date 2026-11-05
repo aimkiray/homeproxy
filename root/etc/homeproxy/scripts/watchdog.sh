@@ -271,6 +271,9 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 #     .last:panic 后 .prev=上个 boot 宕前证据,.last=本 boot 滚动快照。
 #     rotate 后新 .last mtime 属本 boot,条件天然幂等不重复 rotate;
 #     stat/uptime 读取失败即跳过 rotate 照常写(取证优先,不阻塞)。
+#     once-marker:RTC 掉电+ntpsetclock 大幅前跳的极端形态下,mtime
+#     判据会再次命中——tmpfs 标记 dmesg.rotated 保证每 boot 最多
+#     轮转一次,不依赖时钟行为。
 #     空文件守卫:dmesg|tail 的 rc 取 tail,dmesg 失败也得 0——tmp 为空
 #     绝不 mv 覆盖既有快照。
 {
@@ -278,16 +281,19 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 	_dm_tmp=$_dm_dir/.dmesg.last.tmp
 	if dmesg 2>/dev/null | tail -200 >"$_dm_tmp" 2>/dev/null \
 		&& [ -s "$_dm_tmp" ]; then
-		if [ -f "$_dm_dir/dmesg.last" ]; then
+		if [ -f "$_dm_dir/dmesg.last" ] \
+			&& [ ! -f "$RUN_DIR/dmesg.rotated" ]; then
 			_now=$(date +%s 2>/dev/null)
 			_up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
 			_mt=$(stat -c %Y "$_dm_dir/dmesg.last" 2>/dev/null)
 			case "$_now" in ''|*[!0-9]*) _now=0 ;; esac
 			case "$_up"  in ''|*[!0-9]*) _up=0  ;; esac
 			case "$_mt"  in ''|*[!0-9]*) _mt=0  ;; esac
-			[ "$_now" -gt "$_up" ] && [ "$_mt" -gt 0 ] \
-				&& [ "$_mt" -lt $((_now - _up)) ] \
-				&& mv "$_dm_dir/dmesg.last" "$_dm_dir/dmesg.prev" 2>/dev/null
+			if [ "$_now" -gt "$_up" ] && [ "$_mt" -gt 0 ] \
+				&& [ "$_mt" -lt $((_now - _up)) ]; then
+				mv "$_dm_dir/dmesg.last" "$_dm_dir/dmesg.prev" 2>/dev/null
+				: >"$RUN_DIR/dmesg.rotated" 2>/dev/null
+			fi
 		fi
 		mv "$_dm_tmp" "$_dm_dir/dmesg.last" 2>/dev/null
 	else
