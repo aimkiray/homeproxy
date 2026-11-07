@@ -279,8 +279,19 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 {
 	_dm_dir=/data/other_vol/homeproxy
 	_dm_tmp=$_dm_dir/.dmesg.last.tmp
-	if dmesg 2>/dev/null | tail -200 >"$_dm_tmp" 2>/dev/null \
-		&& [ -s "$_dm_tmp" ]; then
+	# 宕前快照载荷:dmesg 尾部 + 系统状态头(uptime/free/load/conntrack/全
+	# 量 ps)——软复位零日志场景下,仅 kmsg 尾部不足以区分 panic/饿死/
+	# 驱动 stall,进程态与内存水位才是判别证据。
+	if {
+		date '+# %Y-%m-%d %H:%M:%S'
+		printf '# uptime: '; cat /proc/uptime
+		free
+		printf '# loadavg: '; cat /proc/loadavg
+		printf '# nf_conntrack_count: %s\n' \
+			"$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+		ps w
+		dmesg | tail -200
+	} >"$_dm_tmp" 2>/dev/null && [ -s "$_dm_tmp" ]; then
 		if [ -f "$_dm_dir/dmesg.last" ] \
 			&& [ ! -f "$RUN_DIR/dmesg.rotated" ]; then
 			_now=$(date +%s 2>/dev/null)

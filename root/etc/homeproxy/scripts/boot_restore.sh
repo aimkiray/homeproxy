@@ -97,6 +97,12 @@ elif [ ! -e /etc/homeproxy ]; then
 	log "created /etc/homeproxy -> $HP"
 fi
 
+# 1b. Re-assert exec bits on every tick: a deploy via `cat >/tmp + mv`
+#     silently strips +x (umask 0644), and the watchdog cron's `[ -x ]`
+#     gate then no-ops with zero symptoms -- watchdog was dead 49h before
+#     anyone noticed (2026-11). Cheap self-heal; harmless if already 755.
+chmod +x "$HP"/scripts/*.sh "$HP"/lib/firewall.sh "$HP"/init.d/* 2>/dev/null
+
 # 2. init.d scripts -> persistent patched copies on /data/other_vol
 need_start=0
 for s in homeproxy homeproxy-web; do
