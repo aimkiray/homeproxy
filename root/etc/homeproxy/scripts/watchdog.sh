@@ -312,6 +312,33 @@ lock_try || { log "WARN: watchdog lock held${LOCK_PEER:+ by pid $LOCK_PEER}; exi
 	fi
 } || true
 
+# --- D-state 异常陷阱 ---------------------------------------------------
+# 2026-11-07 宕前快照实证:T-60s 存在 DW 态 kworker/u8:4+ec(ECM 工
+# 作队列)+load1≈1.03(单个阻塞任务特征)——非中断睡眠的内核线程是
+# procd 喂狗饿死的最强嫌疑(持锁导致 procd 网络路径 syscall 阻塞)。
+# 内核未编 DETECT_HUNG_TASK,这里补分钟级探测:发现 D 态进程即记
+# /proc/<pid>/stack+comm 到持久 anomaly.log;集合变化才追加(去重),
+# 同一 wedge 只记一次 onset+栈,下次复位即可指认楔死函数。
+{
+	_an=/data/other_vol/homeproxy/anomaly.log
+	_dset=$(ps w 2>/dev/null | awk '$4 ~ /^D/ {print $1}' | sort -n)
+	_dprev=$(cat "$RUN_DIR/dstate.last" 2>/dev/null)
+	if [ -n "$_dset" ] && [ "$_dset" != "$_dprev" ]; then
+		# 超 256KB 截断保尾(与 mem_guard.log 同策略)
+		if [ -f "$_an" ] && [ "$(wc -c <"$_an" 2>/dev/null)" -gt 262144 ]; then
+			tail -200 "$_an" >"$_an.tmp" 2>/dev/null && mv "$_an.tmp" "$_an"
+		fi
+		{
+			echo "=== $(date '+%Y-%m-%d %H:%M:%S') uptime=$(cut -d. -f1 /proc/uptime 2>/dev/null)s ==="
+			for _d in $_dset; do
+				echo "--- pid=$_d comm=$(cat /proc/$_d/comm 2>/dev/null) wchan=$(cat /proc/$_d/wchan 2>/dev/null)"
+				cat /proc/$_d/stack 2>/dev/null | head -12
+			done
+		} >>"$_an" 2>/dev/null
+	fi
+	echo "$_dset" >"$RUN_DIR/dstate.last" 2>/dev/null
+} || true
+
 # --- 门控(§2.1.2;不满足任一即 exit 0,不写状态文件)-----------------------
 bool_off "$(uci_get config.enabled)" && exit 0            # G5 总开关
 bool_off "$(uci_get infra.watchdog)" && exit 0            # 看门狗 opt-out(默认 1)
