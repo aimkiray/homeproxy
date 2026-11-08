@@ -170,6 +170,62 @@ mem_guard() {
 	return 10
 }
 
+# --- 单实例 RSS 防线:MemAvailable 阈值漏判的场景是"一个实例自己涨到
+#     数百 MB 而全局水位还没到 warn"——musl 分配器在探测/订阅刷新churn下
+#     只留不还(2026-11 实测 meow-los 20h 涨到 305MB,全局 MemAvail 92MB
+#     才触发,且 mem_guard 只会重启 meow-c,打错目标)。按 cmdline 模式找
+#     各实例 pid,读其 VmRSS,超限重启对应 init——绝不动无辜实例。
+#     复用 mem_guard 的开机宽限与全局冷却戳:restart 语义同源防抖。
+RSS_WARN_KB=131072    # 128MB:健康 meow-c ~30-64MB / meow-los ~16-38MB;观测泄漏 305MB
+rss_guard() {
+	local up now last spec name pat init pid rss f _k _v
+
+	up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
+	case "$up" in ''|*[!0-9]*) return 0 ;; esac
+	[ "$up" -lt "$MEM_BOOT_GRACE" ] && return 0
+	command -v pgrep >/dev/null 2>&1 || return 0
+
+	now=$(date +%s 2>/dev/null || echo 0)
+	case "$now" in ''|*[!0-9]*) now=0 ;; esac
+	last=$(cat "$MEMRESTART_TS" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ "$now" -gt 0 ] && [ "$last" -gt 0 ] \
+		&& [ $((now - last)) -lt "$MEM_RESTART_COOLDOWN" ] && return 0
+
+	for spec in "meow-c meow-c.yaml" "meow-los meow-los.yaml"; do
+		name=${spec%% *}; pat=${spec##* }
+		for pid in $(pgrep -f "$pat" 2>/dev/null); do
+			rss=""
+			while read -r _k _v _; do
+				[ "$_k" = "VmRSS:" ] && { rss=$_v; break; }
+			done </proc/$pid/status 2>/dev/null
+			case "$rss" in ''|*[!0-9]*) continue ;; esac
+			[ "$rss" -lt "$RSS_WARN_KB" ] && continue
+			init=""
+			if [ "$name" = meow-c ]; then
+				for f in /etc/init.d/homeproxy /data/other_vol/homeproxy/init.d/homeproxy; do
+					[ -x "$f" ] && { init=$f; break; }
+				done
+			else
+				for f in /etc/init.d/meow-los /data/other_vol/meow-los/init.d/meow-los; do
+					[ -x "$f" ] && { init=$f; break; }
+				done
+			fi
+			if [ -z "$init" ]; then
+				log "rss guard: $name pid=$pid ${rss}kB over ${RSS_WARN_KB}kB but no init script -- skipped"
+				continue
+			fi
+			logger -t homeproxy-watchdog "rss guard: $name pid=$pid ${rss}kB > ${RSS_WARN_KB}kB, restarting" 2>/dev/null || true
+			echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
+			mem_restart_service "$init" || log "WARN: $name restart rc=$?"
+			log "rss guard: restarted $name (pid=$pid ${rss}kB > ${RSS_WARN_KB}kB)"
+			mem_persist "$rss" "rss-restart-$name" "pid$pid"
+			return 10
+		done
+	done
+	return 0
+}
+
 # --- degrade(§3.3 撤接管契约顺序:flag -> firewall.sh stop -> dnsmasq)------
 do_degrade() {
 	# 顺序固定:先撤 flag 再清规则——否则 fw3 include 可能在半清空状态上
@@ -369,6 +425,10 @@ fi
 #     degraded 说明服务级 restart 已失败一次,meow-c 多半已死/无救,真正
 #     的内存压力不在它身上;panic_on_oom 仍是兜底。
 mem_guard
+[ "$?" = "10" ] && exit 0
+# 单实例 RSS 防线与 mem_guard 同位:同为 restart 触发器, degraded 门之
+# 后才有"整服务重启不清 DEGRADED 标记"的契约语义。
+rss_guard
 [ "$?" = "10" ] && exit 0
 
 # 有接管事实才有降级对象(不误伤:dns_redirect=0 / lan_proxy_mode=disabled /
