@@ -30,6 +30,9 @@ MEM_RESTART_COOLDOWN=600  # 两次内存触发的 restart 全局最小间隔(秒
 MEM_BOOT_GRACE=180        # 开机 3min 内不检查(启动期分配未稳定)
 MEMLOW_COUNT=/tmp/hp_memlow.count    # 连续低水位 tick 计数
 MEMRESTART_TS=/tmp/hp_memrestart.ts  # 上次内存触发 restart 的 epoch
+RSSRESTART_TS=/tmp/hp_rssrestart.ts  # rss_guard 独立冷却戳(与 mem_guard 解耦:共用
+                                    # 会让 warn 水位下的 meow-c 误重启循环永久饿死
+                                    # rss_guard,反向又让 rss restart 冻住 crit 臂)
 
 mkdir -p "$RUN_DIR" 2>/dev/null
 log() { echo "$(date '+%H:%M:%S') [hp-watchdog] $*" >>"$LOG_PATH" 2>/dev/null; }
@@ -175,10 +178,12 @@ mem_guard() {
 #     只留不还(2026-11 实测 meow-los 20h 涨到 305MB,全局 MemAvail 92MB
 #     才触发,且 mem_guard 只会重启 meow-c,打错目标)。按 cmdline 模式找
 #     各实例 pid,读其 VmRSS,超限重启对应 init——绝不动无辜实例。
-#     复用 mem_guard 的开机宽限与全局冷却戳:restart 语义同源防抖。
-RSS_WARN_KB=131072    # 128MB:健康 meow-c ~30-64MB / meow-los ~16-38MB;观测泄漏 305MB
+#     冷却戳独立(RSSRESTART_TS,理由见常量注释);开机宽限与防抖窗口同参。
+RSS_WARN_KB=196608    # 192MB:健康 meow-c ~30-64MB / meow-los ~16-38MB,流量风暴
+                      # 峰值 ~120MB;musl RSS 是终身高水位,阈低了会把"扛过一次
+                      # 大流量"误判成泄漏;观测泄漏 305MB 仍远高此线
 rss_guard() {
-	local up now last spec name pat init pid rss f _k _v
+	local up now last spec name pat init pid rss f _k _v did done_inits
 
 	up=$(cut -d. -f1 /proc/uptime 2>/dev/null)
 	case "$up" in ''|*[!0-9]*) return 0 ;; esac
@@ -187,13 +192,20 @@ rss_guard() {
 
 	now=$(date +%s 2>/dev/null || echo 0)
 	case "$now" in ''|*[!0-9]*) now=0 ;; esac
-	last=$(cat "$MEMRESTART_TS" 2>/dev/null || echo 0)
+	last=$(cat "$RSSRESTART_TS" 2>/dev/null || echo 0)
 	case "$last" in ''|*[!0-9]*) last=0 ;; esac
 	[ "$now" -gt 0 ] && [ "$last" -gt 0 ] \
 		&& [ $((now - last)) -lt "$MEM_RESTART_COOLDOWN" ] && return 0
 
-	for spec in "meow-c meow-c.yaml" "meow-los meow-los.yaml"; do
-		name=${spec%% *}; pat=${spec##* }
+	# spec: 实例名|pgrep ERE(锚 "meow -f " 前缀,挡掉 vi/grep 等 argv 提及者;
+	# `.` 转义防 meow-cXyaml 类形近串误配)。超限的每个实例都处理,不取首个
+	# 就收工——meow-c 与 meow-s 共用 init.d/homeproxy,同 init 每 tick 只
+	# 重启一次,否则第二个实例会把刚拉起的服务再杀一遍。
+	did=""; done_inits=" "
+	for spec in "meow-c|meow -f .*meow-c\.yaml" \
+	            "meow-s|meow -f .*meow-s\.yaml" \
+	            "meow-los|meow -f .*meow-los\.yaml"; do
+		name=${spec%%|*}; pat=${spec##*|}
 		for pid in $(pgrep -f "$pat" 2>/dev/null); do
 			rss=""
 			while read -r _k _v _; do
@@ -202,12 +214,12 @@ rss_guard() {
 			case "$rss" in ''|*[!0-9]*) continue ;; esac
 			[ "$rss" -lt "$RSS_WARN_KB" ] && continue
 			init=""
-			if [ "$name" = meow-c ]; then
-				for f in /etc/init.d/homeproxy /data/other_vol/homeproxy/init.d/homeproxy; do
+			if [ "$name" = meow-los ]; then
+				for f in /etc/init.d/meow-los /data/other_vol/meow-los/init.d/meow-los; do
 					[ -x "$f" ] && { init=$f; break; }
 				done
 			else
-				for f in /etc/init.d/meow-los /data/other_vol/meow-los/init.d/meow-los; do
+				for f in /etc/init.d/homeproxy /data/other_vol/homeproxy/init.d/homeproxy; do
 					[ -x "$f" ] && { init=$f; break; }
 				done
 			fi
@@ -215,15 +227,22 @@ rss_guard() {
 				log "rss guard: $name pid=$pid ${rss}kB over ${RSS_WARN_KB}kB but no init script -- skipped"
 				continue
 			fi
-			logger -t homeproxy-watchdog "rss guard: $name pid=$pid ${rss}kB > ${RSS_WARN_KB}kB, restarting" 2>/dev/null || true
-			echo "$now" >"$MEMRESTART_TS" 2>/dev/null || true
-			mem_restart_service "$init" || log "WARN: $name restart rc=$?"
-			log "rss guard: restarted $name (pid=$pid ${rss}kB > ${RSS_WARN_KB}kB)"
-			mem_persist "$rss" "rss-restart-$name" "pid$pid"
-			return 10
+			case "$done_inits" in
+				*" $init "*)
+					log "rss guard: $name pid=$pid ${rss}kB over ${RSS_WARN_KB}kB; $init already restarted this tick -- skipped" ;;
+				*)
+					logger -t homeproxy-watchdog "rss guard: $name pid=$pid ${rss}kB > ${RSS_WARN_KB}kB, restarting" 2>/dev/null || true
+					done_inits="$done_inits$init "
+					mem_restart_service "$init" || log "WARN: $name restart rc=$?"
+					log "rss guard: restarted $name (pid=$pid ${rss}kB > ${RSS_WARN_KB}kB)"
+					mem_persist "$rss" "rss-restart-$name" "pid$pid"
+					did=1 ;;
+			esac
 		done
 	done
-	return 0
+	[ -z "$did" ] && return 0
+	echo "$now" >"$RSSRESTART_TS" 2>/dev/null || true
+	return 10
 }
 
 # --- degrade(§3.3 撤接管契约顺序:flag -> firewall.sh stop -> dnsmasq)------
