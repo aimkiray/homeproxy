@@ -75,6 +75,7 @@ Open `http://<router>:8910/` (LAN-bound uhttpd, no auth): status badge, node dro
 - UDP tproxy is IPv4-only (meow v0.24.0); IPv6 TCP goes through a separate redirect listener (`infra.v6_port`, default 5334).
 - Router's own outbound traffic is **not** transparently intercepted (meow `routing-mark` only marks DIRECT sockets; capturing OUTPUT would loop). `update_via_proxy=1` routes fetches through the mixed port explicitly.
 - Port-forward / DNAT rules from the stock firewall (`fw3`) are never touched — only homeproxy's own chains/ipsets are managed.
+- **Qualcomm NSS/ECM acceleration is disabled** (`/sys/module/ecm`): besides breaking UDP tproxy (see `firewall.sh` header), its `ecm_sfe_ipv4_workqueue` was observed parking kworkers in `msleep` inside `ecm_sfe_common_tuple_set` for minutes under rule churn, which can starve procd past the 30s hardware watchdog → recurring `Non-Secure Watchdog` reboots. `boot_restore.sh` re-asserts `net.ecm.sfe_fse_enable=0`, `net.ecm.sfe_fast_xmit_enable=0`, `front_end_ipv4/6_stop=1` and a 2s watchdog feed every 5 min; traffic then follows the plain conntrack path, which is fine at typical home bandwidths. To re-enable acceleration, delete that block (§1c) and reboot.
 
 ## License
 
