@@ -103,6 +103,22 @@ fi
 #     anyone noticed (2026-11). Cheap self-heal; harmless if already 755.
 chmod +x "$HP"/scripts/*.sh "$HP"/lib/firewall.sh "$HP"/init.d/* 2>/dev/null
 
+# 1c. ECM wedge mitigation (2026-11): ecm_sfe_common_tuple_set parks
+#     kworkers in msleep for minutes under rule churn; while wedged it can
+#     starve procd past the 30s hardware watchdog -> Non-Secure Watchdog
+#     resets every ~6h. Stop new accelerated front-ends + SFE rule
+#     programming (plain conntrack path remains) and feed the watchdog
+#     more often -- transient wedges then can't kill the box. Idempotent,
+#     no-ops when ECM/debugfs is absent. Note /etc/sysctl.* is volatile
+#     ramfs on MiWiFi, which is why this lives here instead.
+if [ -d /sys/kernel/debug/ecm ]; then
+	sysctl -w net.ecm.sfe_fse_enable=0 >/dev/null 2>&1
+	sysctl -w net.ecm.sfe_fast_xmit_enable=0 >/dev/null 2>&1
+	echo 1 >/sys/kernel/debug/ecm/front_end_ipv4_stop 2>/dev/null
+	echo 1 >/sys/kernel/debug/ecm/front_end_ipv6_stop 2>/dev/null
+fi
+ubus call system watchdog '{"frequency":2,"magicclose":true}' >/dev/null 2>&1
+
 # 2. init.d scripts -> persistent patched copies on /data/other_vol
 need_start=0
 for s in homeproxy homeproxy-web; do
