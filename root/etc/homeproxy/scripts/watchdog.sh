@@ -39,11 +39,11 @@ log() { echo "$(date '+%H:%M:%S') [hp-watchdog] $*" >>"$LOG_PATH" 2>/dev/null; }
 # mem_guard 触发事件持久化到 NAND:homeproxy.log 在 tmpfs,panic_on_oom
 # 重启即丢,宕机归因拿不到"谁因何水位在何时动了 restart"。此文件留证。
 # 256KB 截断保尾;任何写失败静默,绝不影响 restart 语义。
-mem_persist() {  # $1=avail(kB) $2=action $3=trigger
-	local f=/data/other_vol/homeproxy/mem_guard.log
+mem_persist() {  # $1=数值(kB) $2=action $3=trigger $4=字段名(默认 avail)
+	local f=/data/other_vol/homeproxy/mem_guard.log k=${4:-avail}
 	[ -f "$f" ] && [ "$(stat -c%s "$f" 2>/dev/null || echo 0)" -gt 262144 ] \
 		&& tail -50 "$f" >"$f.tmp" 2>/dev/null && mv "$f.tmp" "$f" 2>/dev/null
-	echo "$(date '+%F %T') avail=${1}kB action=$2 trigger=$3" >>"$f" 2>/dev/null || true
+	echo "$(date '+%F %T') $k=${1}kB action=$2 trigger=$3" >>"$f" 2>/dev/null || true
 }
 uci_get() { uci -q get "homeproxy.$1" 2>/dev/null; }
 # config_get_bool 同款"关"词表(W1-6):uci 布尔拼写不只字面 0。
@@ -224,7 +224,12 @@ rss_guard() {
 				done
 			fi
 			if [ -z "$init" ]; then
-				log "rss guard: $name pid=$pid ${rss}kB over ${RSS_WARN_KB}kB but no init script -- skipped"
+				# 无 init 可执行=无救济路径,每 tick 刷日志只剩噪声;
+				# tmpfs 标记使告警每 boot 只记一次(重启自清)。
+				[ -f "$RUN_DIR/rss_noinit.$name" ] || {
+					log "rss guard: $name pid=$pid ${rss}kB over ${RSS_WARN_KB}kB but no init script -- skipped (once per boot)"
+					touch "$RUN_DIR/rss_noinit.$name" 2>/dev/null
+				}
 				continue
 			fi
 			case "$done_inits" in
@@ -235,7 +240,7 @@ rss_guard() {
 					done_inits="$done_inits$init "
 					mem_restart_service "$init" || log "WARN: $name restart rc=$?"
 					log "rss guard: restarted $name (pid=$pid ${rss}kB > ${RSS_WARN_KB}kB)"
-					mem_persist "$rss" "rss-restart-$name" "pid$pid"
+					mem_persist "$rss" "rss-restart-$name" "pid$pid" rss
 					did=1 ;;
 			esac
 		done
