@@ -1,5 +1,8 @@
 # Repository Guidelines
 
+**Workflow**: any code change / audit / device-side deployment goes through the project workflow at `.devin/skills/ctb-flow/SKILL.md` (`协议：ctb-flow v1.0.0`; parent fallback `cto-flow`). Key pins: Lua 5.1 + busybox/ash only, deploy artifacts must keep exec bits (no bare `cat>tmp;mv`), `meow -t` gate before any restart, both meow-c and meow-los instances share hardening keys, ECM mitigation must not regress.
+
+
 `homeproxy` is a meow-rs (mihomo/Clash Meta in Rust) front-end for **LuCI-less, nftables-less routers** (e.g. stock Xiaomi/MiWiFi). The original `luci-app-homeproxy` depended on LuCI (JavaScript view), ucode, and fw4/nftables. This port replaces all three: backend logic is **Lua** (using the on-device `uci` binding + `luci.json`), and traffic steering uses **iptables + ipset**. A shell CLI replaces the web UI. Kernel migration spec: `docs/spec-meow-migration-A.md` (incl. §13 errata).
 
 Target environment verified on a Xiaomi router (OpenWrt 18.06 base, kernel 5.4, busybox/ash, `lua 5.1` + `luci.json` + `uci` binding, `iptables`/`ip6tables`, `ipset`, `xt_TPROXY`; **no** `ucode`, `nft`, `fw4`, or `jq`).
