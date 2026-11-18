@@ -368,12 +368,12 @@ if need_meow; then
     # los truncation incident). A failed probe dies too; no restore_meow --
     # the old binary is still untouched. All math stays in KB (a bytes-side
     # free*1024 could overflow 32-bit arithmetic and misreport), df -Pk gives
-    # one unwrapped line, and +512KB slack absorbs a post-probe shrink (TOCTOU).
+    # one unwrapped line (POSIXLY_CORRECT= keeps -k pinned at 1K blocks against
+    # an inherited env), and +512KB slack absorbs a post-probe shrink (TOCTOU).
     sz=$(wc -c < "$m" | tr -d ' ')
-    free=$(df -Pk "$(dirname "$MEOW_BIN")" | awk 'NR==2{print $4}')
+    free=$(POSIXLY_CORRECT= df -Pk "$(dirname "$MEOW_BIN")" | awk 'NR==2{print $4}')
     case "$sz" in ''|*[!0-9]*) die "cannot measure size of $m" ;; esac
     case "$free" in ''|*[!0-9]*) die "cannot read free space on $(dirname "$MEOW_BIN")" ;; esac
-    free=$((10#$free))   # decimal-normalize: leading zeros must not parse octal
     sz_kb=$(( (sz + 1023) / 1024 ))
     [ "$free" -lt $((sz_kb + 512)) ] && \
         die "not enough space on $(dirname "$MEOW_BIN") for meow ($((sz_kb + 512))KB needed incl. 512KB margin, ${free}KB free)"
@@ -382,6 +382,9 @@ if need_meow; then
     # closed on copy error: a swap with no rollback path must not touch the
     # only working binary.
     if [ -x "$MEOW_BIN" ]; then
+        # Drop any stash a previously died run may have left first: a
+        # truncated leftover must never surface as the rollback source.
+        rm -f "$MEOW_BACKUP"
         cp -f "$MEOW_BIN" "$MEOW_BACKUP" 2>/dev/null \
             || die "meow backup copy to tmpfs failed -- refusing to swap without rollback"
     fi
