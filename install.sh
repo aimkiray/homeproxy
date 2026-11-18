@@ -224,12 +224,29 @@ do_rollback() {
     rm -f "$CONFIRM_FILE" "$BACKUP_META" "$BACKUP_TAR"
 }
 
+# Re-unify the los relay binary onto $MEOW_BIN's inode (see LOS_BIN above):
+# cp -f and a cross-device mv both give the destination a FRESH inode, which
+# silently breaks the bin<->los hardlink. Idempotent; a no-op when los is not
+# installed or MEOW_BIN is absent. A failed ln warns only -- los drift must
+# not fail an otherwise-good install/rollback.
+unify_los() {
+    [ -x "$MEOW_BIN" ] && [ -d "${LOS_BIN%/*}" ] || return 0
+    ln -f "$MEOW_BIN" "$LOS_BIN" \
+        && log "meow hardlink restored: $LOS_BIN -> $MEOW_BIN" \
+        || log "WARN: could not hardlink $LOS_BIN (los binary may drift)"
+}
+
 # Restore the pre-install meow binary if we stashed one.
 restore_meow() {
     if [ -f "$MEOW_BACKUP" ]; then
-        cp -f "$MEOW_BACKUP" "$MEOW_BIN" 2>/dev/null && chmod 755 "$MEOW_BIN" \
-            && log "meow binary restored." \
-            || log "WARN: could not restore meow binary."
+        if cp -f "$MEOW_BACKUP" "$MEOW_BIN" 2>/dev/null && chmod 755 "$MEOW_BIN"; then
+            log "meow binary restored."
+            # cp -f is unlink+create too: MEOW_BIN got a fresh inode, so the
+            # los hardlink must be re-pinned on every rollback path as well.
+            unify_los
+        else
+            log "WARN: could not restore meow binary."
+        fi
         rm -f "$MEOW_BACKUP"
     fi
 }
@@ -349,29 +366,33 @@ if need_meow; then
     # lazily (GC delay), so the room an overwrite frees cannot be counted --
     # require the FULL new size before touching the old binary (the 2026-11-18
     # los truncation incident). A failed probe dies too; no restore_meow --
-    # the old binary is still untouched.
+    # the old binary is still untouched. All math stays in KB (a bytes-side
+    # free*1024 could overflow 32-bit arithmetic and misreport), df -Pk gives
+    # one unwrapped line, and +512KB slack absorbs a post-probe shrink (TOCTOU).
     sz=$(wc -c < "$m" | tr -d ' ')
-    free=$(df -k "$(dirname "$MEOW_BIN")" | awk 'NR==2{print $4}')
+    free=$(df -Pk "$(dirname "$MEOW_BIN")" | awk 'NR==2{print $4}')
     case "$sz" in ''|*[!0-9]*) die "cannot measure size of $m" ;; esac
     case "$free" in ''|*[!0-9]*) die "cannot read free space on $(dirname "$MEOW_BIN")" ;; esac
-    [ $((free * 1024)) -lt "$sz" ] && \
-        die "not enough space on $(dirname "$MEOW_BIN") for meow ($sz bytes needed, $((free * 1024)) free)"
+    free=$((10#$free))   # decimal-normalize: leading zeros must not parse octal
+    sz_kb=$(( (sz + 1023) / 1024 ))
+    [ "$free" -lt $((sz_kb + 512)) ] && \
+        die "not enough space on $(dirname "$MEOW_BIN") for meow ($((sz_kb + 512))KB needed incl. 512KB margin, ${free}KB free)"
     # Keep the working binary on tmpfs so rollback can restore it -- the
-    # backup tarball deliberately excludes it (too large for ubifs).
-    [ -x "$MEOW_BIN" ] && cp -f "$MEOW_BIN" "$MEOW_BACKUP" 2>/dev/null
+    # backup tarball deliberately excludes it (too large for ubifs). Fail
+    # closed on copy error: a swap with no rollback path must not touch the
+    # only working binary.
+    if [ -x "$MEOW_BIN" ]; then
+        cp -f "$MEOW_BIN" "$MEOW_BACKUP" 2>/dev/null \
+            || die "meow backup copy to tmpfs failed -- refusing to swap without rollback"
+    fi
     # mv is a cross-device copy (/tmp tmpfs -> /data ubifs), NOT atomic: a
     # partial copy would leave a truncated binary in place, so on failure
     # restore the stashed previous binary immediately (U8-3).
     mv -f "$m" "$MEOW_BIN" || { restore_meow; die "failed to install meow binary"; }
     chmod 755 "$MEOW_BIN"
     # The mv gave MEOW_BIN a fresh inode -- re-unify the los hardlink (see
-    # LOS_BIN above) so bin/ and meow-los/bin/ stay one binary. A failed ln
-    # warns only: los drift must not fail an otherwise-good install.
-    if [ -d "${LOS_BIN%/*}" ]; then
-        ln -f "$MEOW_BIN" "$LOS_BIN" \
-            && log "meow hardlink restored: $LOS_BIN -> $MEOW_BIN" \
-            || log "WARN: could not hardlink $LOS_BIN (los binary may drift)"
-    fi
+    # LOS_BIN above) so bin/ and meow-los/bin/ stay one binary.
+    unify_los
     "$MEOW_BIN" --version >/dev/null 2>&1 || {
         restore_meow
         die "installed meow fails to execute -- restored previous binary"
@@ -379,6 +400,12 @@ if need_meow; then
     rm -rf /tmp/hp_meow
     log "meow installed: $MEOW_BIN"
 fi
+
+# Idempotent heal: re-unify the bin<->los hardlink even when this run did not
+# swap meow -- a link broken by an older installer's cross-device cp/mv is
+# repaired here on the normal path only (never in trap/rollback-only code).
+# No-op when los or meow is absent.
+unify_los
 
 # -- fetch + extract homeproxy source ---------------------------------------
 [ -n "$SRC" ] || die "no source: pass a URL/path arg or set HP_SRC_URL"
