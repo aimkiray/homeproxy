@@ -43,6 +43,10 @@ WEB=$HP_BASE/web
 INITD_PERSIST=$HP_BASE/init.d
 MEOW_DIR=/data/other_vol/bin
 MEOW_BIN=$MEOW_DIR/meow
+# meow-los shares this binary via a `ln -f` hardlink -- a private copy
+# costs ~14MB ubifs (2026-11-18 unification freed +14MB). A cross-device
+# mv into $MEOW_BIN silently breaks it; the meow swap below re-creates it.
+LOS_BIN=/data/other_vol/meow-los/bin/meow
 BACKUP_TAR=/data/other_vol/.hp_install_backup.tar.gz
 BACKUP_META=/data/other_vol/.hp_install_meta.sh
 # The meow binary is NOT in BACKUP_TAR (too large for ubifs); keep its
@@ -341,6 +345,17 @@ if need_meow; then
     # Sanity-run before swapping: a truncated/corrupt download must never
     # replace a working binary (mv below is a cross-device copy, not atomic).
     "$m" --version >/dev/null 2>&1 || die "downloaded meow fails to execute -- keeping existing binary"
+    # Pre-write space gate (fail-closed): UBIFS reclaims deleted blocks
+    # lazily (GC delay), so the room an overwrite frees cannot be counted --
+    # require the FULL new size before touching the old binary (the 2026-11-18
+    # los truncation incident). A failed probe dies too; no restore_meow --
+    # the old binary is still untouched.
+    sz=$(wc -c < "$m" | tr -d ' ')
+    free=$(df -k "$(dirname "$MEOW_BIN")" | awk 'NR==2{print $4}')
+    case "$sz" in ''|*[!0-9]*) die "cannot measure size of $m" ;; esac
+    case "$free" in ''|*[!0-9]*) die "cannot read free space on $(dirname "$MEOW_BIN")" ;; esac
+    [ $((free * 1024)) -lt "$sz" ] && \
+        die "not enough space on $(dirname "$MEOW_BIN") for meow ($sz bytes needed, $((free * 1024)) free)"
     # Keep the working binary on tmpfs so rollback can restore it -- the
     # backup tarball deliberately excludes it (too large for ubifs).
     [ -x "$MEOW_BIN" ] && cp -f "$MEOW_BIN" "$MEOW_BACKUP" 2>/dev/null
@@ -349,6 +364,14 @@ if need_meow; then
     # restore the stashed previous binary immediately (U8-3).
     mv -f "$m" "$MEOW_BIN" || { restore_meow; die "failed to install meow binary"; }
     chmod 755 "$MEOW_BIN"
+    # The mv gave MEOW_BIN a fresh inode -- re-unify the los hardlink (see
+    # LOS_BIN above) so bin/ and meow-los/bin/ stay one binary. A failed ln
+    # warns only: los drift must not fail an otherwise-good install.
+    if [ -d "${LOS_BIN%/*}" ]; then
+        ln -f "$MEOW_BIN" "$LOS_BIN" \
+            && log "meow hardlink restored: $LOS_BIN -> $MEOW_BIN" \
+            || log "WARN: could not hardlink $LOS_BIN (los binary may drift)"
+    fi
     "$MEOW_BIN" --version >/dev/null 2>&1 || {
         restore_meow
         die "installed meow fails to execute -- restored previous binary"
